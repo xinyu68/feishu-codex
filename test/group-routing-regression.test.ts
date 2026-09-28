@@ -126,18 +126,26 @@ for (const throughAlias of [false, true]) test(`revoking group authorization dur
   const route = conversationKey('dev', 'oc_team');
   const threadId = h.store.conversation(route).threadId!;
   const fileDir = path.join(h.dir, 'files'); fs.mkdirSync(fileDir);
-  const files = ['one.txt', 'two.txt'].map(name => { const file = path.join(fileDir, name); fs.writeFileSync(file, name); return fs.realpathSync(file); });
+  const files = await Promise.all(['one.txt', 'two.txt'].map(async name => {
+    const file = path.join(fileDir, name); fs.writeFileSync(file, name);
+    return fs.promises.realpath(file);
+  }));
   let requestPaths = files;
   if (throughAlias) {
     const aliasDir = path.join(h.dir, 'files-alias');
     fs.symlinkSync(fileDir, aliasDir, process.platform === 'win32' ? 'junction' : 'dir');
     requestPaths = files.map(file => path.join(aliasDir, path.basename(file)));
     assert.notEqual(requestPaths[0], files[0]);
-    assert.deepEqual(requestPaths.map(file => fs.realpathSync(file)), files);
+    assert.deepEqual(await Promise.all(requestPaths.map(file => fs.promises.realpath(file))), files);
   }
   const first = h.gate();
   const release = h.gate();
-  h.filesWith(async (chatId, file) => { h.sent.push({ chatId, file }); if (file === files[0]) { first.resolve(); await release.promise; } return randomUUID(); });
+  let uploads = 0;
+  h.filesWith(async (chatId, file) => {
+    h.sent.push({ chatId, file });
+    if (++uploads === 1) { first.resolve(); await release.promise; }
+    return randomUUID();
+  });
   try {
     h.emit({ method: 'item/completed', threadId, turnId: 'desktop-artifact-revoke', params: { item: {
       id: 'files-revoke', type: 'mcpToolCall', server: 'feishu_completion', tool: 'send_artifact_to_feishu', status: 'completed', arguments: { paths: requestPaths },
