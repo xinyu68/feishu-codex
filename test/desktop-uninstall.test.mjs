@@ -18,7 +18,9 @@ const alive = child => {
 };
 
 async function fixture(mode) {
-  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'feishu-uninstall-test-'));
+  // Windows runners may expose TEMP through an 8.3 alias. Use the same native
+  // path spelling as PowerShell before writing the ownership records.
+  const directory = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'feishu-uninstall-test-')));
   const installDir = path.join(directory, '安装目录'), dataDir = path.join(directory, '用户数据');
   const productRoot = path.join(installDir, 'resources', 'product');
   await fs.mkdir(productRoot, { recursive: true });

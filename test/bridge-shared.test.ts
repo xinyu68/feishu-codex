@@ -170,8 +170,8 @@ test('desktop artifact MCP sends native images and files once to the bound Feish
   fx.bridge.transport = fx.transport;
   await fx.bridge.deliverPendingArtifacts();
   for (let count = 0; count < 100 && !fx.cards.some(card => card.title === '成品已发送'); count++) await new Promise(resolve => setTimeout(resolve, 10));
-  assert.deepEqual(fx.images, [fs.realpathSync(image)]);
-  assert.deepEqual(fx.files, [fs.realpathSync(file)]);
+  assert.deepEqual(fx.images, [fs.realpathSync.native(image)]);
+  assert.deepEqual(fx.files, [fs.realpathSync.native(file)]);
   assert.match(fx.cards.find(card => card.title === '成品已发送')?.text ?? '', /成功 2 个，失败 0 个/);
   assert.equal(Object.values(fx.store.state.artifacts)[0]?.chatId, 'oc_bound');
   fx.notify(event);
