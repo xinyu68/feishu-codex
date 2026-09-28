@@ -25,6 +25,7 @@ function setup(t: test.TestContext) {
   let runner: (input: CodexRunInput) => Promise<{ threadId: string; text: string; turnId?: string }> = async input => {
     const threadId = input.threadId || `thread-${runs.length}`;
     input.onThread?.(threadId);
+    input.prompt = await input.preparePrompt?.(threadId) ?? input.prompt;
     input.onSubmitted?.({ threadId, turnId: `turn-${runs.length}`, mode: 'start', status: 'submitted' });
     return { threadId, text: runs.length === 1 ? '登录需求：验证码五分钟有效，错误三次锁定。' : '开发已完成', turnId: `turn-${runs.length}` };
   };
@@ -210,4 +211,121 @@ test('context is bounded, captures only current project, and persists across a s
   const restored = new Store(h.dir);
   assert.equal(restored.groupContext(other, h.dir), context);
   assert.equal(parseRoute(other.chatId).botId, 'dev');
+});
+
+test('continued group threads receive only new public context and explicit quotes once', async t => {
+  const h = setup(t);
+  h.store.observeGroup(h.message('default', '背景唯一标记 ALPHA'));
+  await h.send('default', '首轮用户问题');
+  const first = h.sent.find(item => item.card.text.includes('五分钟'))!;
+  h.store.observeGroup(h.message('default', '新增唯一标记 BETA'));
+  await h.send('default', '继续用户问题');
+  assert.match(h.runs[0]!.prompt, /ALPHA/);
+  assert.match(h.runs[0]!.prompt, /批次：[a-f0-9]{32}\n\n新增群聊：\n/);
+  assert.doesNotMatch(h.runs[0]!.prompt, /\"sender\":|\"role\":|\\n/);
+  assert.match(h.runs[1]!.prompt, /BETA/);
+  assert.doesNotMatch(h.runs[1]!.prompt, /ALPHA|首轮用户问题|验证码五分钟/);
+  await h.send('default', '按这条进一步解释', { replyTo: first.id });
+  assert.equal(h.runs[2]!.prompt.split('验证码五分钟有效').length - 1, 1);
+  assert.doesNotMatch(h.runs[2]!.prompt, /ALPHA|BETA/);
+  assert.equal(cleanBridgeText(h.runs[2]!.prompt), '按这条进一步解释');
+  await h.send('dev', '独立开发会话');
+  assert.match(h.runs[3]!.prompt, /ALPHA|BETA/);
+});
+
+test('a rejected submission retains background for the next accepted message', async t => {
+  const h = setup(t);
+  h.store.observeGroup(h.message('default', '拒绝后仍需送达的背景 REJECTED'));
+  h.runWith(async input => {
+    const threadId = input.threadId || 'rejected-thread'; input.onThread?.(threadId);
+    input.prompt = await input.preparePrompt?.(threadId) ?? input.prompt;
+    input.onSubmitted?.({ threadId, mode: 'start', status: 'submitting' });
+    input.onSubmitted?.({ threadId, mode: 'start', status: 'rejected' });
+    throw new Error('明确拒绝');
+  });
+  await h.send('default', '第一次提交');
+  assert.equal(Object.keys(h.store.state.groupContextReceipts).length, 0);
+  h.runWith(async input => {
+    const threadId = input.threadId!; input.onThread?.(threadId);
+    input.prompt = await input.preparePrompt?.(threadId) ?? input.prompt;
+    input.onSubmitted?.({ threadId, turnId: 'accepted-turn', mode: 'start', status: 'submitted' });
+    return { threadId, turnId: 'accepted-turn', text: '收到' };
+  });
+  await h.send('default', '重新提问');
+  assert.match(h.runs[1]!.prompt, /REJECTED/);
+  assert.equal(Object.keys(h.store.state.groupContextReceipts).length, 1);
+});
+
+test('uncertain submission is reconciled only by its exact native input, not turn existence', async t => {
+  const h = setup(t);
+  h.store.observeGroup(h.message('default', '不重复的公共背景 UNCERTAIN'));
+  let submittedPrompt = '';
+  h.runWith(async input => {
+    const threadId = input.threadId || 'uncertain-thread'; input.onThread?.(threadId);
+    input.prompt = await input.preparePrompt?.(threadId) ?? input.prompt;
+    submittedPrompt = input.prompt;
+    input.onSubmitted?.({ threadId, turnId: 'native-turn', mode: 'steer', status: 'submitting' });
+    input.onSubmitted?.({ threadId, turnId: 'native-turn', mode: 'steer', status: 'uncertain' });
+    throw new Error('响应丢失');
+  });
+  const first = h.message('default', '原任务只提交一次');
+  await h.bridge.receive(first);
+  assert.equal(Object.keys(h.store.state.groupContextReceipts).length, 0);
+  h.runtime.history = async () => [{ role: 'user', text: submittedPrompt, turnId: 'native-turn' }];
+  h.runWith(async input => {
+    const threadId = input.threadId!; input.onThread?.(threadId);
+    input.prompt = await input.preparePrompt?.(threadId) ?? input.prompt;
+    input.onSubmitted?.({ threadId, turnId: 'next-turn', mode: 'start', status: 'submitted' });
+    return { threadId, turnId: 'next-turn', text: '继续' };
+  });
+  await h.send('default', '后续问题');
+  assert.doesNotMatch(h.runs[1]!.prompt, /UNCERTAIN|原任务只提交一次/);
+  assert.equal(h.store.state.operations[first.id]!.groupContext?.confirmed, true);
+  assert.equal(h.store.state.operations[first.id]!.status, 'uncertain');
+  await h.bridge.receive(first);
+  assert.equal(h.runs.length, 2);
+});
+
+test('unknown native history does not prematurely acknowledge group background', async t => {
+  const h = setup(t);
+  h.store.observeGroup(h.message('default', '背景必须补齐 MISSING'));
+  h.runWith(async input => {
+    const threadId = input.threadId || 'missing-thread'; input.onThread?.(threadId);
+    input.prompt = await input.preparePrompt?.(threadId) ?? input.prompt;
+    input.onSubmitted?.({ threadId, turnId: 'same-turn', mode: 'steer', status: 'submitting' });
+    input.onSubmitted?.({ threadId, turnId: 'same-turn', mode: 'steer', status: 'uncertain' });
+    throw new Error('响应丢失');
+  });
+  const first = h.message('default', '原消息');
+  await h.bridge.receive(first);
+  h.runtime.history = async () => [{ role: 'user', text: '另一条输入', turnId: 'same-turn' }];
+  await h.send('default', '后续消息');
+  assert.match(h.runs[1]!.prompt, /MISSING/);
+  assert.notEqual(h.store.state.operations[first.id]!.groupContext?.confirmed, true);
+});
+
+test('acknowledged input remains known when the subsequent execution fails', async t => {
+  const h = setup(t);
+  h.store.observeGroup(h.message('default', '已经接收过的背景 KNOWN'));
+  h.runWith(async input => {
+    const threadId = input.threadId || 'failed-execution'; input.onThread?.(threadId);
+    input.prompt = await input.preparePrompt?.(threadId) ?? input.prompt;
+    input.onSubmitted?.({ threadId, turnId: 'accepted', mode: 'start', status: 'submitted' });
+    throw new Error('执行过程中断线');
+  });
+  await h.send('default', '开始');
+  await h.send('default', '继续');
+  assert.doesNotMatch(h.runs[1]!.prompt, /KNOWN/);
+});
+
+test('identical user text still has distinct compact context batch markers', async t => {
+  const h = setup(t);
+  await h.send('default', '继续');
+  await h.send('default', '继续');
+  const first = /批次：([a-f0-9]{32})/.exec(h.runs[0]!.prompt)?.[1];
+  const second = /批次：([a-f0-9]{32})/.exec(h.runs[1]!.prompt)?.[1];
+  assert.ok(first && second);
+  assert.notEqual(first, second);
+  assert.equal(cleanBridgeText(h.runs[0]!.prompt), '继续');
+  assert.equal(cleanBridgeText(h.runs[1]!.prompt), '继续');
 });

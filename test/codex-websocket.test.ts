@@ -494,3 +494,94 @@ test('unwatch during the final ownership check cannot resurrect a subscription',
   assert.equal(fx.received.some(row => row.message.method === 'thread/resume'), false);
  } finally { decision.resolve(false); await fx.cleanup(); }
 });
+
+test('dynamic prompt preparation runs after the guard and inside the acknowledged submission lock', async () => {
+  const fx = await fixture();
+  const firstSent = deferred();
+  const releaseFirst = deferred();
+  const secondResumed = deferred();
+  let resumes = 0;
+  let acknowledged = false;
+  const prepared: string[] = [];
+  const events: string[] = [];
+  fx.onResume = () => { if (++resumes === 2) secondResumed.resolve(); return false; };
+  fx.onStart = async (socket, message) => {
+    if (!firstSentSent) { firstSentSent = true; firstSent.resolve(); await releaseFirst.promise; }
+    const turn = fx.begin('thread', String(message.params!.clientUserMessageId));
+    fx.complete('thread', turn);
+    fx.reply(socket, message, { turn });
+  };
+  let firstSentSent = false;
+  try {
+    const first = fx.client.run({ cwd: process.cwd(), threadId: 'thread', prompt: 'stale first',
+      onThread: () => events.push('thread'), onBeforeSubmit: () => { events.push('guard'); },
+      preparePrompt: threadId => { assert.equal(threadId, 'thread'); events.push('prepare'); prepared.push('first'); return 'first with public context'; },
+      onSubmitted: event => { events.push(event.status); if (event.status === 'submitted') acknowledged = true; },
+    });
+    await firstSent.promise;
+    const second = fx.client.run({ cwd: process.cwd(), threadId: 'thread', prompt: 'stale second',
+      preparePrompt: () => { assert.equal(acknowledged, true); prepared.push('second'); return 'second without repeated context'; },
+    });
+    await secondResumed.promise;
+    releaseFirst.resolve();
+    await Promise.all([first, second]);
+    assert.deepEqual(prepared, ['first', 'second']);
+    assert.deepEqual(events, ['thread', 'guard', 'prepare', 'submitting', 'submitted']);
+    assert.deepEqual(fx.received.filter(row => row.message.method === 'turn/start').map(row => (row.message.params!.input as RpcParams[])[0]!.text), [
+      'first with public context', 'second without repeated context',
+    ]);
+  } finally { releaseFirst.resolve(); await fx.cleanup(); }
+});
+
+test('a rejected steer prepares a fresh prompt for the permitted start attempt', async () => {
+  const fx = await fixture();
+  fx.begin('thread', 'native', 'old');
+  fx.onSteer = (socket, message) => {
+    fx.status.set('thread', 'idle');
+    for (const turn of fx.turns.get('thread') ?? []) turn.status = 'completed';
+    fx.send(socket, { id: message.id, error: { code: -32000, message: 'no active turn' } });
+  };
+  let count = 0;
+  const states: string[] = [];
+  try {
+    await fx.client.run({ cwd: process.cwd(), threadId: 'thread', prompt: 'stale',
+      preparePrompt: () => `prepared attempt ${++count}`, onSubmitted: event => states.push(event.status),
+    });
+    assert.equal(count, 2);
+    assert.deepEqual(states, ['submitting', 'rejected', 'submitting', 'submitted']);
+    assert.deepEqual(fx.received.filter(row => ['turn/steer', 'turn/start'].includes(row.message.method ?? '')).map(row => (row.message.params!.input as RpcParams[])[0]!.text), [
+      'prepared attempt 1', 'prepared attempt 2',
+    ]);
+  } finally { await fx.cleanup(); }
+});
+
+test('preparation failure submits no mutation and lost prepared submission never repeats', async t => {
+  for (const lost of [false, true]) await t.test(lost ? 'lost response' : 'preparation failed', async () => {
+    const fx = await fixture();
+    let prepared = 0;
+    const states: string[] = [];
+    fx.onStart = socket => { socket.terminate(); };
+    try {
+      await assert.rejects(fx.client.run({ cwd: process.cwd(), threadId: 'thread', prompt: 'stale',
+        preparePrompt: () => { prepared++; if (!lost) throw new Error('context unavailable'); return 'prepared once'; },
+        onSubmitted: event => states.push(event.status),
+      }), lost ? /连接已断开/ : /context unavailable/);
+      assert.equal(prepared, 1);
+      assert.deepEqual(states, lost ? ['submitting', 'uncertain'] : []);
+      const mutations = fx.received.filter(row => ['turn/start', 'turn/steer'].includes(row.message.method ?? ''));
+      assert.equal(mutations.length, lost ? 1 : 0);
+      if (lost) assert.equal((mutations[0]!.message.params!.input as RpcParams[])[0]!.text, 'prepared once');
+    } finally { await fx.cleanup(); }
+  });
+});
+
+test('native history preserves full user prompt and turn identity for submission receipt reconciliation', async () => {
+  const fx = await fixture();
+  const prompt = '【飞书消息】回复自动转发；请遵循 feishu-codex Skill。\n\n同一句话\n\n<feishu_group_context>\n{"id":"unique-operation","text":"中文\\n引用"}\n</feishu_group_context>';
+  fx.turns.set('thread', [{ id: 'accepted-turn', status: 'completed', items: [{ type: 'userMessage', id: 'accepted-item', content: [{ type: 'text', text: prompt }] }] }]);
+  try {
+    const history = await fx.client.history('thread');
+    assert.deepEqual(history.map(({ role, text, id, turnId }) => ({ role, text, id, turnId })), [{ role: 'user', text: prompt, id: 'accepted-item', turnId: 'accepted-turn' }]);
+    assert.equal(fx.received.some(row => ['thread/resume', 'turn/start', 'turn/steer'].includes(row.message.method ?? '')), false);
+  } finally { await fx.cleanup(); }
+});

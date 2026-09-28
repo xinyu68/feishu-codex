@@ -57,10 +57,13 @@ export type CodexRunInput = {
   onRequest?: (request: RuntimeRequest) => Promise<RuntimeAnswer>;
   onSubmitted?: (event: { threadId: string; turnId?: string; mode: 'start' | 'steer'; status: 'submitting' | 'submitted' | 'uncertain' | 'rejected' }) => void;
   onBeforeSubmit?: () => void | Promise<void>;
+  /** Resolve incremental background inside the runtime submission lock. */
+  preparePrompt?: (threadId: string) => string | Promise<string>;
 };
 export type RuntimeEvent = { method: string; threadId?: string; turnId?: string; params?: Record<string, unknown> };
 export type BridgeEvent = { type: 'state' | 'history' | 'runtime'; chatId?: string; threadId?: string; event?: RuntimeEvent; delta?: { threadId: string; turnId: string; itemId: string; text: string; phase?: string } };
-export type Operation = { id: string; chatId: string; actorId: string; cwd: string; threadId?: string; revision: number; source: 'feishu' | 'management'; status: 'received' | 'submitting' | 'submitted' | 'uncertain' | 'completed' | 'failed'; turnId?: string; mode?: 'start' | 'steer'; at: string; updatedAt: string; error?: string };
+export type GroupContextReceipt = { key: string; seen: Record<string, number>; promptHash: string; confirmed?: boolean };
+export type Operation = { groupContext?: GroupContextReceipt; id: string; chatId: string; actorId: string; cwd: string; threadId?: string; revision: number; source: 'feishu' | 'management'; status: 'received' | 'submitting' | 'submitted' | 'uncertain' | 'completed' | 'failed'; turnId?: string; mode?: 'start' | 'steer'; at: string; updatedAt: string; error?: string };
 export type CompletionNotification = {
   id: string; threadId: string; turnId: string; chatId: string; actorId: string;
   cwd: string; title: string; requestedAt: string;
@@ -127,6 +130,8 @@ export type FeishuOptions = {
 export type GroupMessage = {
   id: string; chatId: string; botId: string; sender: string; role: 'user' | 'assistant';
   text: string; at: string; cwd: string; replyTo?: string;
+  /** Native source thread; only this thread already knows its own result. */
+  threadId?: string;
 };
 
 export type UsageWindow = {

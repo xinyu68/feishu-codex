@@ -88,14 +88,13 @@ test('an automated chain is capped at six handoffs; malformed counters cannot by
   for (const count of [6, 7, -1, 0.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1]) assert.equal(canContinueGroupHandoff(count), false);
 });
 
-test('guidance lists recipients, requires explicit optional final handoff and states the limit', () => {
+test('guidance keeps only current recipients and omits self and static Skill instructions', () => {
   const guidance = buildGroupHandoffGuidance(candidates, 'product');
   assert.match(guidance, /开发人员/);
   assert.match(guidance, /测试人员/);
   assert.doesNotMatch(guidance, /产品经理/);
-  assert.match(guidance, /交接给 @准确角色名：具体任务/);
-  assert.match(guidance, /只有确实要交接时/);
-  assert.match(guidance, /最多自动交接 6 次/);
+  assert.deepEqual(JSON.parse(guidance.slice(guidance.indexOf('：') + 1)), ['开发人员', '测试人员']);
+  assert.doesNotMatch(guidance, /交接给 @|最终回复|最多自动交接|私聊/);
   assert.equal(buildGroupHandoffGuidance([candidates[0]!], 'product'), '');
   assert.equal(buildGroupHandoffGuidance([], 'product'), '');
 });

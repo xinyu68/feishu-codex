@@ -4,6 +4,7 @@ import os from 'node:os';
 import crypto from 'node:crypto';
 import type { ArtifactDelivery, BotProfile, BridgeConfig, ChatMessage, CompletionNotification, Conversation, GroupMessage, InboundMessage, LogEntry, Operation } from './types.js';
 import { conversationKey, DEFAULT_BOT_ID, parseRoute } from './routing.js';
+import { normalizeGroupWorkspace, planGroupContext, type GroupContextPlan } from './group-context.js';
 
 type PendingActor = { actorId: string; chatId: string; botId?: string; lastSeenAt: string };
 type PendingGroup = { botId: string; chatId: string; actorId: string; lastSeenAt: string; title?: string };
@@ -18,6 +19,7 @@ type SavedState = {
   totalTurns: number; dailyMessages: Record<string, number>;
   operations: Record<string, Operation>; deliveries: Record<string, { status: 'sending' | 'sent' | 'uncertain'; at: string }>;
   completedTurns: Record<string, string>;
+  groupContextReceipts: Record<string, { seen: Record<string, number>; updatedAt: string }>;
   notifications: Record<string, CompletionNotification>;
   artifacts: Record<string, ArtifactDelivery>;
   pendingGroups: PendingGroup[]; groupMessages: Record<string, GroupMessage[]>; groupProjects: Record<string, string>;
@@ -45,7 +47,7 @@ export class Store {
     this.state = readJson(path.join(dir, 'state.json'), {
       version: 1, conversations: {}, history: {}, pendingActors: [], seen: {},
       logs: [], totalTurns: 0, dailyMessages: {}, operations: {}, deliveries: {}, completedTurns: {}, notifications: {}, artifacts: {},
-      pendingGroups: [], groupMessages: {}, groupProjects: {}, threadBindings: {}, botIdentities: {}, groupActorIdentities: {}
+      pendingGroups: [], groupMessages: {}, groupProjects: {}, threadBindings: {}, botIdentities: {}, groupActorIdentities: {}, groupContextReceipts: {}
     } satisfies SavedState);
     for (const conversation of Object.values(this.state.conversations)) conversation.revision ??= 0;
     // A process restart cannot prove whether an in-flight mutation reached Codex.
@@ -130,7 +132,8 @@ export class Store {
   operation(id: string, patch: Partial<Operation>): void {
     const existing = this.state.operations[id];
     const at = new Date().toISOString();
-    this.state.operations[id] = { ...existing, ...patch, id, at: existing?.at ?? at, updatedAt: at } as Operation;
+    const operation = this.state.operations[id] = { ...existing, ...patch, id, at: existing?.at ?? at, updatedAt: at } as Operation;
+    if (operation.status === 'submitted' || operation.status === 'completed') this.mergeGroupContextReceipt(operation);
     this.save();
   }
   claimDelivery(key: string): boolean {
@@ -306,27 +309,36 @@ export class Store {
     this.save();
     return true;
   }
-  groupContext(message: InboundMessage, cwd: string): string {
-    if (!this.isGroup(message.chatId) || !this.isAuthorized(message.chatId, message.actorId)) return '';
-    const route = parseRoute(message.chatId);
-    const journal = this.state.groupMessages[route.id] ?? [];
-    const quoted = message.replyTo ? journal.find(item => parseRoute(item.id).id === message.replyTo && item.cwd === cwd) : undefined;
-    const relevant = journal.filter(item => item.cwd === cwd && parseRoute(item.id).id !== parseRoute(message.id).id).slice(-20);
-    let remaining = 16000;
-    const parts: string[] = [];
-    if (message.quotedText || quoted) {
-      const text = message.quotedText || quoted!.text;
-      const part = `明确引用的群消息：\n${text.slice(0, 10000)}`;
-      parts.push(part); remaining -= part.length;
-    }
-    const recent: string[] = [];
-    for (const item of relevant.reverse()) {
-      const part = JSON.stringify({ sender: item.sender, role: item.role, at: item.at, text: item.text.slice(0, Math.min(6000, remaining)) });
-      if (remaining < 200 || part.length > remaining) break;
-      recent.unshift(part); remaining -= part.length;
-    }
-    if (recent.length) parts.push(`近期公开群聊记录：\n${recent.join('\n')}`);
-    return parts.join('\n\n');
+  groupContextKey(chatId: string, cwd: string, threadId: string): string {
+    const route = parseRoute(chatId);
+    return JSON.stringify([route.botId, this.bot(route.botId)?.appId ?? '', route.id, normalizeGroupWorkspace(cwd), threadId]);
+  }
+  planGroupContext(message: InboundMessage, cwd: string, threadId?: string): GroupContextPlan {
+    if (!this.isGroup(message.chatId) || !this.isAuthorized(message.chatId, message.actorId)) return { text: '', seen: {} };
+    const known = threadId ? this.state.groupContextReceipts[this.groupContextKey(message.chatId, cwd, threadId)]?.seen : undefined;
+    return planGroupContext(this.state.groupMessages[parseRoute(message.chatId).id] ?? [], message, cwd, known, threadId);
+  }
+  groupContext(message: InboundMessage, cwd: string, threadId?: string): string {
+    return this.planGroupContext(message, cwd, threadId).text;
+  }
+  confirmGroupContext(operationId: string): void {
+    const operation = this.state.operations[operationId];
+    if (operation && this.mergeGroupContextReceipt(operation)) this.save();
+  }
+  private mergeGroupContextReceipt(operation: Operation): boolean {
+    const receipt = operation.groupContext;
+    if (!receipt || receipt.confirmed || !operation.threadId
+      || receipt.key !== this.groupContextKey(operation.chatId, operation.cwd, operation.threadId)) return false;
+    const current = this.state.groupContextReceipts[receipt.key] ?? { seen: {}, updatedAt: '' };
+    for (const [id, offset] of Object.entries(receipt.seen)) current.seen[id] = Math.max(current.seen[id] ?? 0, offset);
+    // The source journal is bounded; receipts for evicted messages are no longer useful.
+    const retained = new Set((this.state.groupMessages[parseRoute(operation.chatId).id] ?? []).map(item => item.id));
+    current.seen = Object.fromEntries(Object.entries(current.seen).filter(([id]) => retained.has(id)));
+    current.updatedAt = new Date().toISOString();
+    this.state.groupContextReceipts[receipt.key] = current;
+    receipt.confirmed = true;
+    receipt.seen = {}; // The merged per-thread receipt owns confirmed offsets.
+    return true;
   }
 
   rememberBotIdentity(botId: string, identity: { openId: string; name: string }): void {

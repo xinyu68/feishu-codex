@@ -114,3 +114,34 @@ test('status, models and paginated desktop history use read-only requests withou
     assert.equal((await fx.trace()).some(row => row.method === 'thread/resume' || row.method === 'thread/start'), false);
   } finally { await fx.cleanup(); }
 });
+
+test('standalone prepares after thread identity and acknowledges the exact submitted prompt', async () => {
+  const fx = await fixture('early');
+  const events: string[] = [];
+  try {
+    const result = await fx.client.run({ cwd: fx.directory, prompt: 'stale',
+      onThread: threadId => { assert.equal(threadId, 'new-thread'); events.push('thread'); },
+      onBeforeSubmit: () => { events.push('guard'); },
+      preparePrompt: threadId => { assert.equal(threadId, 'new-thread'); events.push('prepare'); return 'current group context'; },
+      onSubmitted: event => { events.push(event.status); if (event.status === 'submitted') assert.equal(event.turnId, 'turn-1'); },
+    });
+    assert.deepEqual(events, ['thread', 'guard', 'prepare', 'submitting', 'submitted']);
+    assert.equal(result.turnId, 'turn-1');
+    assert.equal((await fx.trace()).find(row => row.method === 'turn/start').params.input[0].text, 'current group context');
+  } finally { await fx.cleanup(); }
+});
+
+test('standalone preparation failure is not submitted and a lost mutation stays uncertain', async t => {
+  for (const lost of [false, true]) await t.test(lost ? 'lost response' : 'preparation failed', async () => {
+    const fx = await fixture(lost ? 'crash' : 'early');
+    const states: string[] = [];
+    try {
+      await assert.rejects(fx.client.run({ cwd: fx.directory, prompt: 'stale',
+        preparePrompt: () => { if (!lost) throw new Error('context unavailable'); return 'prepared once'; },
+        onSubmitted: event => states.push(event.status),
+      }), lost ? /进程已退出/ : /context unavailable/);
+      assert.deepEqual(states, lost ? ['submitting', 'uncertain'] : []);
+      assert.equal((await fx.trace()).filter(row => row.method === 'turn/start').length, lost ? 1 : 0);
+    } finally { await fx.cleanup(); }
+  });
+});

@@ -217,6 +217,7 @@ export class CodexClient implements CodexRuntime {
     };
     if (input.threadId) this.active.set(input.threadId, run);
     const tracker = new TurnTracker(input, this.options.idleTimeoutMs ?? 15 * 60_000);
+    let mutationPending = false;
     connection.onNotification = (method, params) => tracker.notification(method, params);
     connection.onFailure = error => tracker.fail(error);
     connection.onRequest = (method, params) => handleRuntimeRequest(input, method, params);
@@ -237,34 +238,44 @@ export class CodexClient implements CodexRuntime {
       input.onThread?.(threadId);
       const generatedBefore = await generatedImageSnapshot(this.options.codexHome, threadId);
       if (run.stopRequested) throw new Error('已停止当前任务');
-      const turnParams = {
-        threadId, cwd: input.cwd,
-        input: [
-          { type: 'text', text: input.prompt, text_elements: [] },
-          ...(input.images ?? []).map(image => ({ type: 'localImage', path: image })),
-        ],
-        approvalPolicy: 'never', sandboxPolicy: { type: 'dangerFullAccess' },
-        ...(input.model ? { model: input.model } : {}),
-        ...(input.effort ? { effort: input.effort } : {}),
-      };
       run.starting = (async () => {
         if (run.stopRequested) throw new Error('已停止当前任务');
         await input.onBeforeSubmit?.();
+        const prompt = input.preparePrompt ? await input.preparePrompt(threadId) : input.prompt;
+        if (run.stopRequested) throw new Error('已停止当前任务');
+        const turnParams = {
+          threadId, cwd: input.cwd,
+          input: [
+            { type: 'text', text: prompt, text_elements: [] },
+            ...(input.images ?? []).map(image => ({ type: 'localImage', path: image })),
+          ],
+          approvalPolicy: 'never', sandboxPolicy: { type: 'dangerFullAccess' },
+          ...(input.model ? { model: input.model } : {}),
+          ...(input.effort ? { effort: input.effort } : {}),
+        };
+        input.onSubmitted?.({ threadId, mode: 'start', status: 'submitting' });
         run.submitted = true;
+        mutationPending = true;
         // Never retry this call: a lost response may still mean the server accepted the message.
         const turnResponse = record(await connection.request('turn/start', turnParams));
+        mutationPending = false;
         const turnId = string(record(turnResponse.turn).id);
-        if (!turnId) throw new Error('Codex 没有返回任务编号');
+        if (!turnId) {
+          input.onSubmitted?.({ threadId, mode: 'start', status: 'uncertain' });
+          throw new Error('Codex 没有返回任务编号');
+        }
         run.turnId = turnId;
         tracker.setTurn(turnId);
+        input.onSubmitted?.({ threadId, turnId, mode: 'start', status: 'submitted' });
         return turnId;
       })();
       await run.starting;
       if (run.stopRequested) await this.stop(threadId);
       const text = await tracker.result;
       const images = await newGeneratedImages(this.options.codexHome, threadId, generatedBefore);
-      return images.length ? { threadId, text, images } : { threadId, text };
+      return images.length ? { threadId, turnId: run.turnId, text, images } : { threadId, turnId: run.turnId, text };
     } catch (error) {
+      if (mutationPending && run.threadId) input.onSubmitted?.({ threadId: run.threadId, turnId: run.turnId, mode: 'start', status: error instanceof CodexRpcError ? 'rejected' : 'uncertain' });
       throw run.stopRequested ? new Error('已停止当前任务') : readableError(error);
     } finally {
       tracker.dispose();
@@ -335,7 +346,6 @@ export class CodexClient implements CodexRuntime {
       tracker.threadId = threadId;
       input.onThread?.(threadId);
       const generatedBefore = await generatedImageSnapshot(this.options.codexHome, threadId);
-      const content = [{ type: 'text', text: input.prompt, text_elements: [] }, ...(input.images ?? []).map(image => ({ type: 'localImage', path: image }))];
       run.submitting = this.serializeSubmission(threadId, async () => {
         if (run.stopped) throw new Error('已停止当前任务');
         // A newly created thread has no turn or persisted rollout yet.
@@ -344,6 +354,11 @@ export class CodexClient implements CodexRuntime {
           if (run.stopped) throw new Error('已停止当前任务');
           if (turn && input.allowSteering === false) throw new Error('目标角色正在桌面或其他入口处理任务，本次交接没有加入该任务。请等它结束后手动 @该机器人继续。');
           await input.onBeforeSubmit?.();
+          // Resolve group context inside the submission lock, after the previous
+          // start/steer acknowledged exactly which messages reached this thread.
+          const prompt = input.preparePrompt ? await input.preparePrompt(threadId) : input.prompt;
+          if (run.stopped) throw new Error('已停止当前任务');
+          const content = [{ type: 'text', text: prompt, text_elements: [] }, ...(input.images ?? []).map(image => ({ type: 'localImage', path: image }))];
           currentMode = turn ? 'steer' : 'start';
           const expectedTurnId = string(turn?.id);
           input.onSubmitted?.({ threadId, turnId: expectedTurnId || undefined, mode: currentMode, status: 'submitting' });
@@ -696,7 +711,7 @@ class RpcConnection {
       if (!pending) return;
       clearTimeout(pending.timer);
       this.pending.delete(message.id);
-      if (message.error) pending.reject(new Error(message.error.message || 'Codex 协议请求失败'));
+      if (message.error) pending.reject(new CodexRpcError(message.error.message || 'Codex 协议请求失败', message.error.code));
       else pending.resolve(message.result);
     });
     this.child.once('close', () => lines.close());

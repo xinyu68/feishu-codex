@@ -5,6 +5,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { randomUUID } from 'node:crypto';
 import { Bridge } from '../src/bridge.js';
+import { cleanBridgeText } from '../src/discovery.js';
 import { Store } from '../src/store.js';
 import { conversationKey, namespaceMessage, parseRoute } from '../src/routing.js';
 import type { CodexRunInput, CodexRuntime, InboundMessage, MessageCard, RuntimeAnswer } from '../src/types.js';
@@ -126,6 +127,13 @@ test('a confirmed group result relays to the linked user in the target role own 
   assert.match(h.runs[1]!.roleInstructions!, /开发人员/);
   assert.match(h.runs[1]!.prompt, /验证码登录/);
   assert.match(h.runs[1]!.prompt, /验证码五分钟有效/);
+  assert.match(h.runs[1]!.prompt, /请遵循 feishu-codex Skill/);
+  const collaboration = h.runs[1]!.prompt.match(/<feishu_group_collaboration>\n([\s\S]*?)\n<\/feishu_group_collaboration>/)![1]!;
+  assert.match(collaboration, /可交接角色：\["产品经理"\]/);
+  assert.match(collaboration, /交接来源："产品经理"；第 1\/6 次/);
+  assert.match(collaboration, /原始用户任务："设计并实现验证码登录。"/);
+  assert.doesNotMatch(collaboration, /最终回复|交接给 @|不会共享|不要再次执行/);
+  assert.equal(cleanBridgeText(h.runs[1]!.prompt), '实现上述验证码登录，并验证过期场景。');
   const target = h.store.conversation(conversationKey('dev', 'oc_team'));
   assert.equal(target.actorId, 'dev-user');
   assert.equal(target.threadId, h.runThreads[1]);
@@ -514,4 +522,25 @@ test('two final handoff lines for the same target dispatch only the last instruc
   assert.equal(h.runs.length, 2);
   assert.equal(h.runs[1]!.prompt.split('\n\n')[1], instruction);
   assert.equal(Object.values(h.store.state.operations).filter(operation => operation.id.startsWith('relay:')).length, 1);
+});
+
+test('existing role threads migrate once to Skill guidance without replacing their history or role', async t => {
+  const h = setup(t);
+  h.runWith(async () => '需求已整理。');
+  await h.send('default', '先整理需求。');
+  const threadId = h.store.conversation('oc_team').threadId!;
+  const binding = h.store.state.threadBindings[threadId]!;
+  binding.groupHandoffPolicyVersion = 1;
+  binding.roleInstructions = '产品经理：保留已有角色与需求历史。';
+  const updates: Array<{ threadId: string; instructions: string }> = [];
+  h.bridge.codex.updateGroupHandoffPolicy = async (id, instructions) => { updates.push({ threadId: id, instructions }); };
+  await h.send('default', '补充验收标准。');
+  await h.send('default', '继续核对边界条件。');
+  assert.equal(updates.length, 1);
+  assert.equal(updates[0]!.threadId, threadId);
+  assert.match(updates[0]!.instructions, /feishu-codex Skill/);
+  assert.equal(binding.groupHandoffPolicyVersion, 2);
+  assert.match(binding.roleInstructions!, /产品经理：保留已有角色与需求历史/);
+  assert.deepEqual(h.runThreads, [threadId, threadId, threadId]);
+  assert.deepEqual(h.stopped, []);
 });

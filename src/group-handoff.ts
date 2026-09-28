@@ -125,11 +125,5 @@ export function canContinueGroupHandoff(completedHandoffs: number): boolean {
 export function buildGroupHandoffGuidance(candidates: readonly GroupHandoffCandidate[], selfBotId: string): string {
   const names = [...new Set(candidates.filter(candidate => candidate.id !== selfBotId).map(candidate => candidate.name.trim()).filter(Boolean))];
   if (!names.length) return '';
-  return [
-    `本群可交接的其他机器人名称：${names.map(name => JSON.stringify(name)).join('、')}。`,
-    '需要另一位机器人接手时，在最终回复的最后一行单独写：交接给 @准确角色名：具体任务。使用上面的完整名称，一次只交给一个机器人。',
-    '交接会由本地应用送入对方独立的会话，同时附带本群公开上下文；不会共享私聊或其他群的会话。',
-    '只有确实要交接时才写这一行；只是提及、引用或讨论其他机器人时不要生成交接行，也不要在示例或代码块里放置交接请求。',
-    `每次用户发起的协作最多自动交接 ${MAX_GROUP_HANDOFFS} 次，到达上限后等待用户继续。无需为了接力而回复或反复互相交接。`,
-  ].join('\n');
+  return `可交接角色：${JSON.stringify(names)}`;
 }
