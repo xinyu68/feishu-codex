@@ -22,6 +22,7 @@ function harness(overrides: Partial<FeishuOptions> = {}, methods: Record<string,
   const logs: string[] = [];
   const created: any[] = [];
   const patched: any[] = [];
+  const recalled: any[] = [];
   const imageUploads: any[] = [];
   const fileUploads: any[] = [];
   let downloads = 0;
@@ -30,6 +31,7 @@ function harness(overrides: Partial<FeishuOptions> = {}, methods: Record<string,
     message: {
       create: async (payload: unknown) => { created.push(payload); return { code: 0, data: { message_id: `om_${created.length}`, chat_id: 'oc_chat' } }; },
       patch: async (payload: unknown) => { patched.push(payload); return { code: 0 }; },
+      delete: async (payload: unknown) => { recalled.push(payload); return { code: 0 }; },
     },
     messageReaction: {
       create: async () => ({ code: 0, data: { reaction_id: 'reaction1' } }),
@@ -57,7 +59,7 @@ function harness(overrides: Partial<FeishuOptions> = {}, methods: Record<string,
     close: () => { wsClosed = true; },
   } });
   return {
-    client, messages, statuses, logs, created, patched, imageUploads, fileUploads,
+    client, messages, statuses, logs, created, patched, recalled, imageUploads, fileUploads,
     get downloads() { return downloads; }, get reactionDeletes() { return reactionDeletes; }, get wsClosed() { return wsClosed; },
     async event(type: string, event: unknown) { return dispatcher.invoke({ schema: '2.0', header: { event_type: type }, event }, { needCheck: false }); },
   };
@@ -321,4 +323,153 @@ test('usage refresh survives card rendering and removed aliases are rejected', (
   assert.equal(parseCardEvent({ ...event, context: { ...event.context, open_chat_id: 'oc_other' } }, 'secret'), undefined);
   assert.equal(parseCardEvent({ ...event, action: { value: { ...value, command: '/usage reset' }, tag: 'button' } }, 'secret'), undefined);
   for (const removed of ['/quota', '/balance', '/bal']) assert.equal(isAllowedCommand(removed), false);
+});
+
+test('recalling a card uses the SDK message path and clears action signing state after success', async () => {
+  const h = harness();
+  const card = { title: '处理中', text: '正在处理', buttons: [{ label: '停止', command: '/stop' }] };
+  const id = await h.client.sendCard('oc_chat', card);
+  await h.client.recallCard(id);
+  assert.deepEqual(h.recalled, [{ path: { message_id: id } }]);
+  await assert.rejects(h.client.updateCard(id, card), /Unknown card destination/);
+  assert.equal(h.patched.length, 0);
+});
+
+test('failed card recall throws and keeps the saved action destination for fallback updates', async () => {
+  let failure: 'api' | 'network' | 'empty' | undefined = 'api';
+  const patches: Array<{ data: { content: string } }> = [];
+  const networkError = new Error('simulated recall connection loss');
+  const h = harness({}, { message: {
+    create: async () => ({ code: 0, data: { message_id: 'om_recall', chat_id: 'oc_chat' } }),
+    patch: async (payload: { data: { content: string } }) => { patches.push(payload); return { code: 0 }; },
+    delete: async () => {
+      if (failure === 'api') return { code: 230011, msg: 'cannot recall local-test-secret' };
+      if (failure === 'network') throw networkError;
+      if (failure === 'empty') return undefined;
+      return { code: 0 };
+    },
+  } });
+  const card = { title: '处理中', text: '正在处理', buttons: [{ label: '停止', command: '/stop' }] };
+  const id = await h.client.sendCard('oc_chat', card);
+  await assert.rejects(h.client.recallCard(id), error => {
+    assert.match(String(error), /撤回卡片失败.*230011/);
+    assert.doesNotMatch(String(error), /local-test-secret/);
+    return true;
+  });
+  await h.client.updateCard(id, card);
+  failure = 'network';
+  await assert.rejects(h.client.recallCard(id), error => error === networkError);
+  await h.client.updateCard(id, card);
+  failure = 'empty';
+  await assert.rejects(h.client.recallCard(id), /撤回卡片失败.*unknown/);
+  await h.client.updateCard(id, card);
+  assert.equal(patches.length, 3);
+  const value = JSON.parse(patches[0]!.data.content).elements[1].actions[0].value;
+  assert.equal(value.signature, actionSignature('local-test-secret', 'oc_chat', '/stop'));
+  failure = undefined;
+  await h.client.recallCard(id);
+  await assert.rejects(h.client.updateCard(id, card), /Unknown card destination/);
+});
+
+test('SDK card recall issues DELETE to the message endpoint with a bounded timeout', async () => {
+  const originalAdapter = Lark.defaultHttpInstance.defaults.adapter;
+  const requests: Array<{ url?: string; method?: string; timeout?: number }> = [];
+  Lark.defaultHttpInstance.defaults.adapter = async config => {
+    requests.push({ url: config.url, method: config.method, timeout: config.timeout });
+    return {
+      config, status: 200, statusText: 'OK', headers: {},
+      data: config.url?.includes('/auth/')
+        ? { code: 0, tenant_access_token: 'mock-recall-token', app_access_token: 'mock-recall-token', expire: 7200 }
+        : { code: 0, data: {} },
+    };
+  };
+  const client = new FeishuClient({
+    appId: 'cli_abcdef0123456780', appSecret: 'mock-recall-secret', attachmentDir: os.tmpdir(),
+    onMessage: async () => {}, onStatus: () => {}, log: () => {},
+  }, { ws: { start: async () => {}, close: () => {} } });
+  try {
+    await client.recallCard('om_progress');
+    const deleted = requests.filter(request => request.method === 'delete');
+    assert.equal(deleted.length, 1);
+    assert.match(deleted[0]!.url!, /\/open-apis\/im\/v1\/messages\/om_progress$/);
+    assert.equal(deleted[0]!.timeout, 20_000);
+  } finally { Lark.defaultHttpInstance.defaults.adapter = originalAdapter; await client.close(); }
+});
+
+test('completion adds official DONE to the original message and survives typing cleanup and shutdown', async () => {
+  const created: any[] = [];
+  const deleted: any[] = [];
+  const h = harness({}, { messageReaction: {
+    create: async (payload: any) => {
+      created.push(payload);
+      return { code: 0, data: { reaction_id: payload.data.reaction_type.emoji_type === 'DONE' ? 'done-id' : 'typing-id' } };
+    },
+    delete: async (payload: unknown) => { deleted.push(payload); return { code: 0 }; },
+  } });
+  const clearTyping = await h.client.startTyping('om_user');
+  await h.client.markCompleted('om_user');
+  assert.deepEqual(created[1], {
+    path: { message_id: 'om_user' }, data: { reaction_type: { emoji_type: 'DONE' } },
+  });
+  await clearTyping();
+  await h.client.close();
+  await clearTyping();
+  assert.deepEqual(deleted, [{ path: { message_id: 'om_user', reaction_id: 'typing-id' } }]);
+});
+
+test('completion failures propagate once without cleanup registration or hidden retries', async () => {
+  const networkError = new Error('completion connection reset');
+  const responses = [
+    () => ({ code: 230001, msg: 'rejected local-test-secret' }),
+    () => undefined,
+    () => { throw networkError; },
+  ];
+  for (const [index, response] of responses.entries()) {
+    let calls = 0;
+    let deletes = 0;
+    const h = harness({}, { messageReaction: {
+      create: async () => { calls++; return response(); },
+      delete: async () => { deletes++; return { code: 0 }; },
+    } });
+    await assert.rejects(h.client.markCompleted('om_user'), error => {
+      if (index === 2) assert.equal(error, networkError);
+      else {
+        assert.match(String(error), index === 0 ? /添加完成表情失败.*230001/ : /添加完成表情失败.*unknown/);
+        assert.doesNotMatch(String(error), /local-test-secret/);
+      }
+      return true;
+    });
+    await h.client.close();
+    assert.equal(calls, 1);
+    assert.equal(deletes, 0);
+    assert.equal(h.logs.length, 0);
+  }
+});
+
+test('SDK completion uses the reaction POST endpoint with DONE and a bounded timeout', async () => {
+  const originalAdapter = Lark.defaultHttpInstance.defaults.adapter;
+  const requests: Array<{ url?: string; method?: string; timeout?: number; data: unknown }> = [];
+  Lark.defaultHttpInstance.defaults.adapter = async config => {
+    requests.push({ url: config.url, method: config.method, timeout: config.timeout, data: config.data });
+    return {
+      config, status: 200, statusText: 'OK', headers: {},
+      data: config.url?.includes('/auth/')
+        ? { code: 0, tenant_access_token: 'mock-done-token', app_access_token: 'mock-done-token', expire: 7200 }
+        : { code: 0, data: { reaction_id: 'done-sdk-id' } },
+    };
+  };
+  const client = new FeishuClient({
+    appId: 'cli_abcdef0123456781', appSecret: 'mock-done-secret', attachmentDir: os.tmpdir(),
+    onMessage: async () => {}, onStatus: () => {}, log: () => {},
+  }, { ws: { start: async () => {}, close: () => {} } });
+  try {
+    await client.markCompleted('om_original');
+    await client.close();
+    const reactions = requests.filter(request => request.url?.includes('/reactions'));
+    assert.equal(reactions.length, 1);
+    assert.equal(reactions[0]!.method, 'post');
+    assert.match(reactions[0]!.url!, /\/open-apis\/im\/v1\/messages\/om_original\/reactions$/);
+    assert.equal(reactions[0]!.timeout, 20_000);
+    assert.deepEqual(JSON.parse(String(reactions[0]!.data)), { reaction_type: { emoji_type: 'DONE' } });
+  } finally { Lark.defaultHttpInstance.defaults.adapter = originalAdapter; await client.close(); }
 });

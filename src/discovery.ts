@@ -175,7 +175,8 @@ function preview(value: string): string { return value.replace(/\s+/g, ' ').trim
 
 /** Presentation only: never rewrite the original Codex rollout or its database. */
 export function cleanBridgeText(input: string): string {
-  let value = input.trim();
+  let value = input.replace(/\n\n<feishu_group_context>[\s\S]*?<\/feishu_group_context>\s*$/, '')
+    .replace(/\n\n<feishu_group_collaboration>[\s\S]*?<\/feishu_group_collaboration>\s*$/, '').trim();
   if (/^(?:【(?:飞书消息|本地预览)】|This message (?:arrived through Feishu \(Lark\)\.|is a local preview of a Feishu conversation\.))/.test(value)) {
     const separator = /\r?\n\s*\r?\n/.exec(value);
     value = separator ? value.slice(separator.index + separator[0].length).trim() : '';

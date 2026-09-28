@@ -2,9 +2,16 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import crypto from 'node:crypto';
-import type { ArtifactDelivery, BridgeConfig, ChatMessage, CompletionNotification, Conversation, LogEntry, Operation } from './types.js';
+import type { ArtifactDelivery, BotProfile, BridgeConfig, ChatMessage, CompletionNotification, Conversation, GroupMessage, InboundMessage, LogEntry, Operation } from './types.js';
+import { conversationKey, DEFAULT_BOT_ID, parseRoute } from './routing.js';
 
-type PendingActor = { actorId: string; chatId: string; lastSeenAt: string };
+type PendingActor = { actorId: string; chatId: string; botId?: string; lastSeenAt: string };
+type PendingGroup = { botId: string; chatId: string; actorId: string; lastSeenAt: string; title?: string };
+type BotIdentity = { appId: string; openId: string; name: string };
+type GroupActorIdentity = {
+  botId: string; appId: string; actorId: string; tenantKey?: string; unionId?: string; userId?: string;
+  messageIds: string[]; updatedAt: string;
+};
 type SavedState = {
   version: 1; conversations: Record<string, Conversation>; history: Record<string, ChatMessage[]>;
   pendingActors: PendingActor[]; seen: Record<string, number>; logs: LogEntry[];
@@ -13,6 +20,9 @@ type SavedState = {
   completedTurns: Record<string, string>;
   notifications: Record<string, CompletionNotification>;
   artifacts: Record<string, ArtifactDelivery>;
+  pendingGroups: PendingGroup[]; groupMessages: Record<string, GroupMessage[]>; groupProjects: Record<string, string>;
+  botIdentities: Record<string, BotIdentity>; groupActorIdentities: Record<string, GroupActorIdentity[]>;
+  threadBindings: Record<string, { chatId: string; actorId: string; cwd: string; chatType: 'p2p' | 'group'; roleManaged?: boolean; roleInstructions?: string; groupHandoffPolicyVersion?: number }>;
 };
 
 export function defaultDataDir(): string {
@@ -34,7 +44,8 @@ export class Store {
     } satisfies BridgeConfig);
     this.state = readJson(path.join(dir, 'state.json'), {
       version: 1, conversations: {}, history: {}, pendingActors: [], seen: {},
-      logs: [], totalTurns: 0, dailyMessages: {}, operations: {}, deliveries: {}, completedTurns: {}, notifications: {}, artifacts: {}
+      logs: [], totalTurns: 0, dailyMessages: {}, operations: {}, deliveries: {}, completedTurns: {}, notifications: {}, artifacts: {},
+      pendingGroups: [], groupMessages: {}, groupProjects: {}, threadBindings: {}, botIdentities: {}, groupActorIdentities: {}
     } satisfies SavedState);
     for (const conversation of Object.values(this.state.conversations)) conversation.revision ??= 0;
     // A process restart cannot prove whether an in-flight mutation reached Codex.
@@ -49,27 +60,35 @@ export class Store {
     for (const artifact of Object.values(this.state.artifacts)) if (artifact.status === 'sending') artifact.status = 'uncertain';
   }
   saveConfig(patch: Partial<BridgeConfig>): void {
+    const previousApps = new Map(this.bots().map(bot => [bot.id, bot.appId]));
     this.config = { ...this.config, ...patch };
+    let identitiesChanged = false;
+    for (const [botId, appId] of previousApps) if (this.bot(botId)?.appId !== appId) identitiesChanged = this.clearBotIdentities(botId) || identitiesChanged;
     this.atomicWrite('config.json', this.config);
+    if (identitiesChanged) this.atomicWrite('state.json', this.state);
     this.emit();
   }
   save(): void { this.atomicWrite('state.json', this.state); this.emit(); }
   subscribe(listener: () => void): () => void { this.listeners.add(listener); return () => this.listeners.delete(listener); }
   private emit(): void { for (const listener of this.listeners) { try { listener(); } catch { /* Persistence must not depend on a UI subscriber. */ } } }
   publicConfig() {
-    const { appSecret, ...safe } = this.config;
+    const { appSecret, bots: _bots, ...safe } = this.config;
     return { ...safe, hasSecret: Boolean(appSecret) };
   }
-  conversation(chatId: string, actorId = '', cwd = this.config.defaultWorkspace): Conversation {
+  conversation(chatId: string, actorId = '', cwd = this.config.defaultWorkspace, chatType?: 'p2p' | 'group'): Conversation {
+    const route = parseRoute(chatId);
+    const group = chatType === 'group' || this.isGroup(chatId);
     let conversation = this.state.conversations[chatId];
     if (!conversation) {
       conversation = {
-        chatId, actorId, cwd, title: '新会话', revision: 0,
+        chatId, actorId, cwd: group ? this.state.groupProjects[route.id] ?? cwd : cwd, title: '新会话', revision: 0,
+        botId: route.botId, rawChatId: route.id, chatType: group ? 'group' : 'p2p',
         updatedAt: new Date().toISOString(), preview: ''
       };
       this.state.conversations[chatId] = conversation;
       this.save();
     }
+    if (chatType && conversation.chatType !== chatType) { conversation.chatType = chatType; this.save(); }
     return conversation;
   }
   message(chatId: string, role: ChatMessage['role'], text: string, expectedRevision?: number): void {
@@ -146,26 +165,28 @@ export class Store {
     this.save();
     return this.state.artifacts[id]!;
   }
-  pendingActor(actorId: string, chatId: string): boolean {
-    const old = this.state.pendingActors.find((item) => item.actorId === actorId);
+  pendingActor(actorId: string, chatId: string, botId = parseRoute(chatId).botId): boolean {
+    const old = this.state.pendingActors.find((item) => item.actorId === actorId && (item.botId ?? DEFAULT_BOT_ID) === botId);
     const notify = !old || Date.now() - Date.parse(old.lastSeenAt) > 5 * 60_000;
     if (old) Object.assign(old, { chatId, lastSeenAt: new Date().toISOString() });
-    else this.state.pendingActors.push({ actorId, chatId, lastSeenAt: new Date().toISOString() });
+    else this.state.pendingActors.push({ actorId, chatId, botId, lastSeenAt: new Date().toISOString() });
     this.state.pendingActors = this.state.pendingActors.slice(-100);
     this.save();
     return notify;
   }
-  authorize(actorId: string, allow: boolean): void {
-    const allowedActors = this.config.allowedActors.filter((id) => id !== actorId);
+  authorize(actorId: string, allow: boolean, botId = DEFAULT_BOT_ID): void {
+    const bot = this.bot(botId);
+    if (!bot) throw new Error('机器人不存在');
+    const allowedActors = bot.allowedActors.filter((id) => id !== actorId);
     if (allow) allowedActors.push(actorId);
-    this.saveConfig({ allowedActors });
-    this.state.pendingActors = this.state.pendingActors.filter((actor) => actor.actorId !== actorId);
+    this.saveBot(botId, { allowedActors });
+    this.state.pendingActors = this.state.pendingActors.filter((actor) => actor.actorId !== actorId || (actor.botId ?? DEFAULT_BOT_ID) !== botId);
     this.save();
     this.log('info', `${allow ? '已授权' : '已撤销授权'} ${actorId}`);
   }
   log(level: LogEntry['level'], text: string): void {
     let safe = text;
-    if (this.config.appSecret) safe = safe.split(this.config.appSecret).join('[已隐藏]');
+    for (const bot of this.bots()) if (bot.appSecret) safe = safe.split(bot.appSecret).join('[已隐藏]');
     safe = safe.replace(/(Bearer\s+)[A-Za-z0-9._-]+/gi, '$1[已隐藏]');
     this.state.logs.unshift({ id: crypto.randomUUID(), at: new Date().toISOString(), level, text: safe.slice(0, 1500) });
     this.state.logs = this.state.logs.slice(0, 200);
@@ -178,6 +199,231 @@ export class Store {
     fs.writeFileSync(temporary, JSON.stringify(value, null, 2) + '\n', { encoding: 'utf8', mode: 0o600 });
     fs.renameSync(temporary, target);
   }
+
+  bots(): BotProfile[] {
+    return [{ id: DEFAULT_BOT_ID, name: this.config.botName || 'Codex', appId: this.config.appId, appSecret: this.config.appSecret,
+      enabled: this.config.enabled, allowedActors: this.config.allowedActors, allowedGroups: this.config.allowedGroups ?? [],
+      roleInstructions: this.config.roleInstructions ?? '', model: this.config.model, effort: this.config.effort }, ...(this.config.bots ?? [])];
+  }
+  bot(id = DEFAULT_BOT_ID): BotProfile | undefined { return this.bots().find(bot => bot.id === id); }
+  botForChat(chatId: string): BotProfile | undefined { return this.bot(parseRoute(chatId).botId); }
+  publicBots() { return this.bots().map(({ appSecret, ...bot }) => ({ ...bot, hasSecret: Boolean(appSecret) })); }
+  saveBot(id: string, patch: Partial<BotProfile>): void {
+    const previous = this.bot(id);
+    const next: BotProfile = { name: 'Codex', appId: '', appSecret: '', enabled: false, allowedActors: [], allowedGroups: [],
+      roleInstructions: '', model: '', effort: '', ...previous, ...patch, id };
+    if (!/^[a-zA-Z0-9_-]{1,80}$/.test(id)) throw new Error('无效的机器人编号');
+    if (next.appId && this.bots().some(bot => bot.id !== id && bot.appId === next.appId)) throw new Error('这个飞书应用已经配置过，每个应用只能连接一次');
+    if (id === DEFAULT_BOT_ID) {
+      this.saveConfig({ botName: next.name, appId: next.appId, appSecret: next.appSecret, enabled: next.enabled,
+        allowedActors: next.allowedActors, allowedGroups: next.allowedGroups, roleInstructions: next.roleInstructions, model: next.model, effort: next.effort });
+    } else this.saveConfig({ bots: [...(this.config.bots ?? []).filter(bot => bot.id !== id), next] });
+  }
+  removeBot(id: string): void {
+    if (id === DEFAULT_BOT_ID) throw new Error('默认机器人不能删除，可以关闭连接');
+    this.saveConfig({ bots: (this.config.bots ?? []).filter(bot => bot.id !== id) });
+    this.state.pendingActors = this.state.pendingActors.filter(actor => actor.botId !== id);
+    this.state.pendingGroups = this.state.pendingGroups.filter(group => group.botId !== id);
+    this.save();
+  }
+  resetBotBindings(botId: string): void {
+    this.clearBotIdentities(botId);
+    for (const [key] of Object.entries(this.state.conversations)) if (key !== 'local-preview' && parseRoute(key).botId === botId) {
+      delete this.state.conversations[key]; delete this.state.history[key];
+    }
+    this.state.pendingActors = this.state.pendingActors.filter(item => (item.botId ?? DEFAULT_BOT_ID) !== botId);
+    this.state.pendingGroups = this.state.pendingGroups.filter(item => item.botId !== botId);
+    for (const key of Object.keys(this.state.groupMessages)) {
+      if (this.state.groupMessages[key]!.some(item => item.botId === botId)) delete this.state.groupMessages[key];
+    }
+    for (const notification of Object.values(this.state.notifications)) if (parseRoute(notification.chatId).botId === botId && notification.status === 'registered') notification.status = 'cancelled';
+    for (const artifact of Object.values(this.state.artifacts)) if (parseRoute(artifact.chatId).botId === botId && artifact.status === 'registered') artifact.status = 'failed';
+    this.save();
+  }
+  rememberThread(conversation: Conversation, roleInstructions?: string): void {
+    if (!conversation.threadId) return;
+    const previous = this.state.threadBindings[conversation.threadId];
+    this.state.threadBindings[conversation.threadId] = { chatId: conversation.chatId, actorId: conversation.actorId, cwd: conversation.cwd,
+      chatType: this.isGroup(conversation.chatId) ? 'group' : 'p2p',
+      roleManaged: previous?.roleManaged || roleInstructions !== undefined,
+      roleInstructions: previous?.roleInstructions ?? roleInstructions,
+      ...(previous?.groupHandoffPolicyVersion !== undefined ? { groupHandoffPolicyVersion: previous.groupHandoffPolicyVersion } : {}) };
+  }
+  isGroup(chatId: string): boolean {
+    const route = parseRoute(chatId);
+    return this.state.conversations[chatId]?.chatType === 'group'
+      || this.bot(route.botId)?.allowedGroups.includes(route.id) === true
+      || this.state.pendingGroups.some(group => group.botId === route.botId && group.chatId === route.id);
+  }
+  isAuthorized(chatId: string, actorId: string, chatType?: 'p2p' | 'group'): boolean {
+    if (chatId === 'local-preview') return true;
+    const route = parseRoute(chatId);
+    const bot = this.bot(route.botId);
+    return Boolean(bot?.allowedActors.includes(actorId) && (!(chatType === 'group' || this.isGroup(chatId)) || bot.allowedGroups.includes(route.id)));
+  }
+  pendingGroup(botId: string, chatId: string, actorId: string): boolean {
+    const old = this.state.pendingGroups.find(group => group.botId === botId && group.chatId === chatId);
+    const notify = !old || Date.now() - Date.parse(old.lastSeenAt) > 5 * 60_000;
+    if (old) Object.assign(old, { actorId, lastSeenAt: new Date().toISOString() });
+    else this.state.pendingGroups.push({ botId, chatId, actorId, lastSeenAt: new Date().toISOString() });
+    this.state.pendingGroups = this.state.pendingGroups.slice(-100);
+    this.save(); return notify;
+  }
+  authorizeGroup(botId: string, chatId: string, allow: boolean): void {
+    const bot = this.bot(botId);
+    if (!bot) throw new Error('机器人不存在');
+    const allowedGroups = bot.allowedGroups.filter(id => id !== chatId);
+    if (allow) allowedGroups.push(chatId);
+    this.saveBot(botId, { allowedGroups });
+    this.state.pendingGroups = this.state.pendingGroups.filter(group => group.botId !== botId || group.chatId !== chatId);
+    this.save();
+  }
+  observeGroup(message: InboundMessage): void {
+    if (message.localOnly || message.chatType !== 'group' || !this.isAuthorized(message.chatId, message.actorId, 'group')) return;
+    const identityChanged = this.recordActorIdentity(message);
+    const route = parseRoute(message.chatId);
+    const persisted = this.rememberGroup({ id: message.id, chatId: route.id, botId: route.botId, sender: message.senderName || message.actorId,
+      role: 'user', text: message.text, at: message.at || new Date().toISOString(), replyTo: message.replyTo,
+      cwd: this.state.groupProjects[route.id] ?? this.state.conversations[message.chatId]?.cwd ?? this.config.defaultWorkspace });
+    if (identityChanged && !persisted) this.save();
+  }
+  rememberGroup(message: GroupMessage): boolean {
+    if (!message.text.trim()) return false;
+    const journal = this.state.groupMessages[message.chatId] ??= [];
+    // A human message may be delivered to every configured bot. Store the shared event once.
+    const id = message.role === 'user' ? parseRoute(message.id).id : message.id;
+    if (journal.some(item => item.id === id)) return false;
+    journal.push({ ...message, id, text: message.text.slice(0, 12000) });
+    if (journal.length > 100) journal.splice(0, journal.length - 100);
+    const groups = Object.entries(this.state.groupMessages).sort((a, b) => (b[1].at(-1)?.at ?? '').localeCompare(a[1].at(-1)?.at ?? ''));
+    for (const [key] of groups.slice(100)) delete this.state.groupMessages[key];
+    let characters = Object.values(this.state.groupMessages).reduce((total, items) => total + items.reduce((sum, item) => sum + item.text.length, 0), 0);
+    for (const [key, items] of groups.reverse()) {
+      if (!this.state.groupMessages[key]) continue;
+      while (characters > 2_000_000 && items.length) characters -= items.shift()!.text.length;
+      if (!items.length) delete this.state.groupMessages[key];
+    }
+    this.save();
+    return true;
+  }
+  groupContext(message: InboundMessage, cwd: string): string {
+    if (!this.isGroup(message.chatId) || !this.isAuthorized(message.chatId, message.actorId)) return '';
+    const route = parseRoute(message.chatId);
+    const journal = this.state.groupMessages[route.id] ?? [];
+    const quoted = message.replyTo ? journal.find(item => parseRoute(item.id).id === message.replyTo && item.cwd === cwd) : undefined;
+    const relevant = journal.filter(item => item.cwd === cwd && parseRoute(item.id).id !== parseRoute(message.id).id).slice(-20);
+    let remaining = 16000;
+    const parts: string[] = [];
+    if (message.quotedText || quoted) {
+      const text = message.quotedText || quoted!.text;
+      const part = `明确引用的群消息：\n${text.slice(0, 10000)}`;
+      parts.push(part); remaining -= part.length;
+    }
+    const recent: string[] = [];
+    for (const item of relevant.reverse()) {
+      const part = JSON.stringify({ sender: item.sender, role: item.role, at: item.at, text: item.text.slice(0, Math.min(6000, remaining)) });
+      if (remaining < 200 || part.length > remaining) break;
+      recent.unshift(part); remaining -= part.length;
+    }
+    if (recent.length) parts.push(`近期公开群聊记录：\n${recent.join('\n')}`);
+    return parts.join('\n\n');
+  }
+
+  rememberBotIdentity(botId: string, identity: { openId: string; name: string }): void {
+    const bot = this.bot(botId);
+    const openId = identityText(identity.openId);
+    if (!bot?.appId || !openId) return;
+    const value: BotIdentity = { appId: bot.appId, openId, name: identity.name.trim().slice(0, 100) };
+    const previous = this.state.botIdentities[botId];
+    if (previous?.appId === value.appId && previous.openId === value.openId && previous.name === value.name) return;
+    this.state.botIdentities[botId] = value;
+    this.save();
+  }
+  botIdentity(botId: string): BotIdentity | undefined {
+    const value = this.state.botIdentities[botId];
+    return value && this.bot(botId)?.appId === value.appId ? { ...value } : undefined;
+  }
+  /** Only the authenticated Feishu event path may supply actor identity evidence. */
+  rememberActorIdentity(message: InboundMessage): void {
+    if (this.recordActorIdentity(message)) this.save();
+  }
+  resolveGroupActor(sourceChatId: string, sourceActorId: string, targetBotId: string): string | undefined {
+    if (!this.isGroup(sourceChatId) || !this.isAuthorized(sourceChatId, sourceActorId, 'group')) return;
+    const sourceRoute = parseRoute(sourceChatId);
+    const sourceBot = this.bot(sourceRoute.botId);
+    const targetBot = this.bot(targetBotId);
+    if (!sourceBot?.appId || !targetBot?.appId || !targetBot.allowedGroups.includes(sourceRoute.id)) return;
+    const identities = this.state.groupActorIdentities[sourceRoute.id] ?? [];
+    const sources = identities.filter(value => value.botId === sourceRoute.botId && value.actorId === sourceActorId && value.appId === sourceBot.appId);
+    if (sources.length !== 1) return;
+    const source = sources[0]!;
+    const matches = identities.filter(value => value.botId === targetBotId && value.appId === targetBot.appId
+      && this.isAuthorized(conversationKey(targetBotId, sourceRoute.id), value.actorId, 'group') && sameActor(source, value));
+    return matches.length === 1 ? matches[0]!.actorId : undefined;
+  }
+  private recordActorIdentity(message: InboundMessage): boolean {
+    if (message.localOnly || message.chatType !== 'group' || !this.isAuthorized(message.chatId, message.actorId, 'group')) return false;
+    const route = parseRoute(message.chatId);
+    const bot = this.bot(route.botId);
+    const eventId = parseRoute(message.id).id;
+    // Synthetic handoffs, menus and card callbacks cannot create identity links.
+    if (!bot?.appId || !/^om_[a-zA-Z0-9_-]{1,180}$/.test(eventId)) return false;
+    const tenantKey = identityText(message.actorTenantKey);
+    const unionId = identityText(message.actorUnionId);
+    const userId = identityText(message.actorUserId);
+    const identities = this.state.groupActorIdentities[route.id] ??= [];
+    const previous = identities.find(value => value.botId === route.botId && value.actorId === message.actorId && value.appId === bot.appId);
+    const changedPrincipal = previous && ((tenantKey && previous.tenantKey && tenantKey !== previous.tenantKey)
+      || (unionId && previous.unionId && unionId !== previous.unionId) || (userId && previous.userId && userId !== previous.userId));
+    const evidence = changedPrincipal ? undefined : previous;
+    const oldEvents = evidence?.messageIds ?? [];
+    const sharedEvents = oldEvents.filter(id => identities.some(other => other.botId !== route.botId
+      && other.appId === this.bot(other.botId)?.appId && other.messageIds.includes(id))).slice(-4);
+    const recentEvents = [...oldEvents.filter(id => id !== eventId && !sharedEvents.includes(id)), eventId].slice(-(8 - sharedEvents.length));
+    const next = {
+      botId: route.botId, appId: bot.appId, actorId: message.actorId,
+      tenantKey: tenantKey ?? evidence?.tenantKey, unionId: unionId ?? evidence?.unionId, userId: userId ?? evidence?.userId,
+      // Preserve a small amount of proven cross-app evidence while bounding
+      // recent samples; normal one-bot conversation should not undo pairing.
+      messageIds: [...new Set([...sharedEvents, ...recentEvents])],
+    };
+    if (previous && previous.tenantKey === next.tenantKey && previous.unionId === next.unionId && previous.userId === next.userId
+      && previous.messageIds.length === next.messageIds.length && previous.messageIds.every(id => next.messageIds.includes(id))) return false;
+    const remaining = identities.filter(value => value.botId !== route.botId || value.actorId !== message.actorId);
+    remaining.push({ ...next, updatedAt: new Date().toISOString() });
+    this.state.groupActorIdentities[route.id] = remaining.slice(-200);
+    const groups = Object.entries(this.state.groupActorIdentities).sort((a, b) => (b[1].at(-1)?.updatedAt ?? '').localeCompare(a[1].at(-1)?.updatedAt ?? ''));
+    for (const [groupId] of groups.slice(100)) delete this.state.groupActorIdentities[groupId];
+    return true;
+  }
+  private clearBotIdentities(botId: string): boolean {
+    let changed = Boolean(this.state.botIdentities[botId]);
+    delete this.state.botIdentities[botId];
+    for (const [groupId, identities] of Object.entries(this.state.groupActorIdentities)) {
+      const next = identities.filter(value => value.botId !== botId);
+      if (next.length === identities.length) continue;
+      changed = true;
+      if (next.length) this.state.groupActorIdentities[groupId] = next;
+      else delete this.state.groupActorIdentities[groupId];
+    }
+    return changed;
+  }
+}
+
+function identityText(value: string | undefined): string | undefined {
+  return value && /^[a-zA-Z0-9_-]{1,200}$/.test(value) ? value : undefined;
+}
+
+function sameActor(source: GroupActorIdentity, target: GroupActorIdentity): boolean {
+  if (source.tenantKey && target.tenantKey && source.tenantKey !== target.tenantKey) return false;
+  const sameTenant = Boolean(source.tenantKey && source.tenantKey === target.tenantKey);
+  if (sameTenant && source.userId && target.userId && source.userId !== target.userId) return false;
+  if (sameTenant && source.unionId && source.unionId === target.unionId) return true;
+  if (sameTenant && source.userId && source.userId === target.userId) return true;
+  // A globally unique message received by both app sockets proves the sender
+  // relationship without guessing from names or one-entry allowlists.
+  if (source.unionId && target.unionId && source.unionId !== target.unionId) return false;
+  return source.messageIds.some(id => target.messageIds.includes(id));
 }
 
 function readJson<T>(file: string, fallback: T): T {

@@ -45,8 +45,9 @@ test('shared input steers without queue; phone and local completion deduplicate 
 
 test('switching while active preserves submitted target; old stop card cannot stop new binding', async t => {
   const fx = fixture(t); const pending = fx.send('旧任务'); await tick();
+  fx.runs[0]!.onProgress?.('正在处理旧任务'); await tick();
   const command = fx.cards.find(card => card.buttons?.length)?.buttons![0]!.command;
-  assert.equal(command, '/stop rev 0');
+  assert.equal(command, `/stop task ${encodeURIComponent(Object.keys(fx.store.state.operations)[0]!)} rev 0`);
   await fx.bridge.bind('chat', fx.dir, 'thread-b', 0);
   await fx.send(command!); assert.deepEqual(fx.stopped, []);
   await fx.bridge.stop('chat', 1); assert.deepEqual(fx.stopped, ['thread-b']);

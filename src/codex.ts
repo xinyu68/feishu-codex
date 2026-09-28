@@ -33,6 +33,14 @@ const WATCH_RECONNECT_DELAY_MS = 2_000;
 const GENERATED_IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp', '.ico', '.tif', '.tiff', '.heic']);
 type GeneratedImageStamp = { size: number; mtimeMs: number };
 
+function threadInstructionOverrides(input: CodexRunInput): { developerInstructions?: string } {
+  // Omitting a role preserves native thread settings. An explicitly empty role
+  // removes a previously configured role while retaining the channel guidance.
+  if (input.threadId && input.roleInstructions === undefined) return {};
+  const role = input.roleInstructions?.trim();
+  return { developerInstructions: role ? `${CHANNEL_INSTRUCTIONS}\n\n${role}` : CHANNEL_INSTRUCTIONS };
+}
+
 /** Each turn owns a connection; only standalone mode also owns its app-server process. */
 export class CodexClient implements CodexRuntime {
   private readonly connections = new Set<CodexConnection>();
@@ -219,7 +227,7 @@ export class CodexClient implements CodexRuntime {
         cwd: input.cwd,
         ...(input.model ? { model: input.model } : {}),
         sandbox: 'danger-full-access', approvalPolicy: 'never', config: ACCESS_CONFIG,
-        developerInstructions: CHANNEL_INSTRUCTIONS,
+        ...threadInstructionOverrides(input),
       }));
       const threadId = string(record(response.thread).id);
       if (!threadId) throw new Error('Codex 没有返回会话编号');
@@ -319,8 +327,8 @@ export class CodexClient implements CodexRuntime {
     try {
       await connection.initialize();
       const response = record(await connection.request(input.threadId ? 'thread/resume' : 'thread/start', input.threadId
-        ? { threadId: input.threadId, excludeTurns: true }
-        : { cwd: input.cwd, ...(input.model ? { model: input.model } : {}), sandbox: 'danger-full-access', approvalPolicy: 'never', config: ACCESS_CONFIG, developerInstructions: CHANNEL_INSTRUCTIONS }));
+        ? { threadId: input.threadId, excludeTurns: true, ...threadInstructionOverrides(input) }
+        : { cwd: input.cwd, ...(input.model ? { model: input.model } : {}), sandbox: 'danger-full-access', approvalPolicy: 'never', config: ACCESS_CONFIG, ...threadInstructionOverrides(input) }));
       const threadId = string(record(response.thread).id);
       if (!threadId) throw new Error('Codex 没有返回会话编号');
       run.threadId = threadId;
@@ -334,6 +342,7 @@ export class CodexClient implements CodexRuntime {
         let current = input.threadId ? await currentSharedTurn(connection, threadId) : undefined;
         const submit = async (turn: RecordValue | undefined): Promise<RecordValue> => {
           if (run.stopped) throw new Error('已停止当前任务');
+          if (turn && input.allowSteering === false) throw new Error('目标角色正在桌面或其他入口处理任务，本次交接没有加入该任务。请等它结束后手动 @该机器人继续。');
           await input.onBeforeSubmit?.();
           currentMode = turn ? 'steer' : 'start';
           const expectedTurnId = string(turn?.id);
@@ -358,7 +367,6 @@ export class CodexClient implements CodexRuntime {
           run.resolveOwnership();
           tracker.setTurn(turnId);
           input.onSubmitted?.({ threadId, turnId, mode: currentMode, status: 'submitted' });
-          if (turn) reportProgress(input, '补充消息已加入当前任务。');
           return acceptedTurn;
         };
         let accepted: RecordValue;
@@ -551,6 +559,20 @@ export class CodexClient implements CodexRuntime {
     const connection = this.connect();
     try { await connection.initialize(); return await work(connection); }
     finally { await this.disconnect(connection); }
+  }
+
+  /** Update only the bridge collaboration policy without replacing a role or its history. */
+  async updateGroupHandoffPolicy(threadId: string, instructions: string): Promise<void> {
+    if (!this.options.websocketUrl) throw new Error('现有群会话的协作升级需要本机 Codex 连接，请新建角色会话。');
+    await this.serializeSubmission(threadId, () => this.withConnection(async connection => {
+      const result = record(await connection.request('thread/resume', { threadId, excludeTurns: true }));
+      if (string(record(record(result.thread).status).type) === 'active' || await currentSharedTurn(connection, threadId)) {
+        throw new Error('当前角色会话正在执行任务，协作升级将在下次空闲时继续。');
+      }
+      await connection.request('thread/inject_items', {
+        threadId, items: [{ type: 'message', role: 'developer', content: [{ type: 'input_text', text: instructions }] }],
+      });
+    }));
   }
 
   async usage(): Promise<CodexUsage> {
@@ -787,21 +809,31 @@ class TurnTracker {
       const previous = this.items.get(itemId) ?? { text: '', phase: '' };
       this.items.set(itemId, { ...previous, text: previous.text + string(params.delta) });
     } else if (method === 'turn/completed') {
+      const snapshotMessages: Array<{ text: string; phase: string }> = [];
       for (const value of array(turn.items)) {
         const completed = record(value);
-        if (completed.type === 'agentMessage') this.items.set(string(completed.id), {
-          text: string(completed.text), phase: string(completed.phase),
-        });
+        if (completed.type === 'agentMessage') {
+          const id = string(completed.id);
+          const previous = this.items.get(id);
+          const message = { text: string(completed.text) || previous?.text || '', phase: string(completed.phase) || previous?.phase || '' };
+          snapshotMessages.push(message);
+          this.items.set(id, message);
+        }
       }
       this.done = true;
       this.dispose();
       if (turn.status === 'failed') this.reject(new Error(string(record(turn.error).message) || 'Codex 执行失败'));
       else if (turn.status === 'interrupted') this.reject(new Error('已停止当前任务'));
       else {
-        const messages = [...this.items.values()];
-        const finals = messages.filter(value => value.phase === 'final_answer' && value.text.trim());
-        const finalText = finals.length ? finals.map(value => value.text).join('\n\n')
-          : [...messages].reverse().find(value => value.phase !== 'commentary' && value.text.trim())?.text;
+        // Steering can produce several final answers in one native turn. Only
+        // the last answer is current. The terminal snapshot establishes order;
+        // replayed item events may have populated the Map in a different order.
+        const snapshot = snapshotMessages.reverse();
+        const streamed = [...this.items.values()].reverse();
+        const isFinal = (value: { text: string; phase: string }) => value.phase === 'final_answer' && value.text.trim();
+        const isReply = (value: { text: string; phase: string }) => value.phase !== 'commentary' && value.text.trim();
+        const finalText = snapshot.find(isFinal)?.text ?? streamed.find(isFinal)?.text
+          ?? snapshot.find(isReply)?.text ?? streamed.find(isReply)?.text;
         this.resolve(finalText?.trim() || '本轮处理已完成，Codex 未返回文本。');
       }
     } else if (method === 'error' && params.willRetry !== true) {
@@ -904,11 +936,6 @@ function readableError(error: unknown): Error {
   return error instanceof Error ? error : new Error(message);
 }
 function delay(ms: number): Promise<void> { return new Promise(resolve => setTimeout(resolve, ms)); }
-
-function reportProgress(input: CodexRunInput, text: string): void {
-  try { void Promise.resolve(input.onProgress?.(text)).catch(() => undefined); }
-  catch { /* Progress rendering cannot fail a turn. */ }
-}
 
 async function generatedImageSnapshot(configuredHome: string | undefined, threadId: string): Promise<Map<string, GeneratedImageStamp>> {
   const snapshot = new Map<string, GeneratedImageStamp>();

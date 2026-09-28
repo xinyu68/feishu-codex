@@ -132,6 +132,42 @@ test('shared resume preserves native settings and early output', async () => {
  } finally {await fx.cleanup();}
 });
 
+test('a role persists in thread instructions and updates while resuming the same thread', async () => {
+ const fx = await fixture(); try {
+  const first = await fx.client.run({ cwd: process.cwd(), prompt: 'analyse', model: 'product-model', effort: 'high', roleInstructions: '你是产品经理，只整理需求和验收标准。' });
+  const start = fx.received.find(row => row.message.method === 'thread/start')!.message.params!;
+  assert.match(String(start.developerInstructions), /Feishu Codex/);
+  assert.match(String(start.developerInstructions), /你是产品经理，只整理需求和验收标准。/);
+  assert.equal(start.model, 'product-model');
+  const next = await fx.client.run({ cwd: process.cwd(), threadId: first.threadId, prompt: 'continue', model: 'review-model', effort: 'medium', roleInstructions: '你是产品经理，本阶段还需要检查交互一致性。' });
+  assert.equal(next.threadId, first.threadId);
+  const resumed = fx.received.find(row => row.message.method === 'thread/resume')!.message.params!;
+  assert.equal(resumed.threadId, first.threadId);
+  assert.equal(resumed.excludeTurns, true);
+  assert.match(String(resumed.developerInstructions), /本阶段还需要检查交互一致性/);
+  assert.doesNotMatch(String(resumed.developerInstructions), /只整理需求和验收标准/);
+  assert.equal(fx.received.filter(row => row.message.method === 'thread/start').length, 1);
+  const submissions = fx.received.filter(row => row.message.method === 'turn/start').map(row => row.message.params!);
+  assert.deepEqual(submissions.map(item => [item.model, item.effort]), [['product-model', 'high'], ['review-model', 'medium']]);
+  assert.equal(submissions[1]!.threadId, first.threadId);
+ } finally { await fx.cleanup(); }
+});
+
+test('explicitly clearing a role updates instructions while a native continuation does not overwrite them', async () => {
+ const fx = await fixture(); try {
+  await fx.client.run({ cwd: process.cwd(), threadId: 'role-thread', prompt: 'clear role', roleInstructions: '' });
+  const cleared = fx.received.find(row => row.message.method === 'thread/resume')!.message.params!;
+  assert.match(String(cleared.developerInstructions), /Feishu Codex/);
+  assert.equal(String(cleared.developerInstructions).includes('\n\n'), false);
+  await fx.client.run({ cwd: process.cwd(), threadId: 'native-thread', prompt: 'continue' });
+  const native = fx.received.filter(row => row.message.method === 'thread/resume').at(-1)!.message.params!;
+  assert.deepEqual(native, { threadId: 'native-thread', excludeTurns: true });
+  await fx.client.watch('role-thread');
+  const watcher = fx.received.filter(row => row.message.method === 'thread/resume').at(-1)!.message.params!;
+  assert.deepEqual(watcher, { threadId: 'role-thread', excludeTurns: true }, 'passive watchers never overwrite role settings');
+ } finally { await fx.cleanup(); }
+});
+
 test('a stale interruption report does not fail a turn that is still running', async () => {
  const fx = await fixture(); let turn!: Turn;
  fx.onStart = (socket, message) => {

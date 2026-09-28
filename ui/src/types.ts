@@ -3,6 +3,7 @@ export type Session = { id: string; title: string; cwd: string; updatedAt: strin
 export type Message = { id: string; role: 'user' | 'assistant' | 'system'; text: string; at?: string; streaming?: boolean; phase?: string; turnId?: string };
 export type Conversation = {
   chatId: string; actorId: string; title: string; cwd: string; threadId?: string;
+  botId?: string; botName?: string; rawChatId?: string; chatType?: 'p2p' | 'group'; chatTitle?: string;
   revision?: number; updatedAt: string; preview: string; busy: boolean; queued?: number;
   progress?: string; model?: string; effort?: string;
   activeTurnId?: string; startedAt?: string; lastActivityAt?: string;
@@ -21,12 +22,20 @@ export type AppState = {
   service: { name: string; version: string; uptimeSeconds: number; startedAt: string };
   config: Config;
   connection: { status: 'stopped' | 'connecting' | 'connected' | 'error'; detail?: string };
+  connectionSummary?: { status: 'stopped' | 'connecting' | 'connected' | 'error'; detail?: string; connected: number; total: number };
   codex: { available: boolean; authenticated?: boolean; version?: string; mode?: string; error?: string };
   runtime?: DesktopStatus;
   conversations: Conversation[];
-  pendingActors: { actorId: string; chatId: string; lastSeenAt: string }[];
+  bots?: BotProfile[];
+  pendingActors: { actorId: string; chatId: string; lastSeenAt: string; botId?: string; botName?: string }[];
+  pendingGroups?: { botId: string; chatId: string; title?: string; actorId?: string; lastSeenAt?: string }[];
   pendingRequests: PendingRequest[];
   logs: { id: string; at: string; level: 'info' | 'warn' | 'error'; text: string }[];
+};
+export type BotProfile = {
+  id: string; name: string; appId: string; hasSecret: boolean; enabled: boolean;
+  allowedActors: string[]; allowedGroups: string[]; roleInstructions: string; model: string; effort: string;
+  connection: AppState['connection'];
 };
 export type DesktopStatus = {
   shellVersion?: string;

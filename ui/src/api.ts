@@ -15,7 +15,7 @@ export async function request<T>(route: string, body?: Record<string, unknown>, 
       method: body === undefined ? 'GET' : method,
       headers: body === undefined ? undefined : { 'Content-Type': 'application/json', 'X-Bridge-Token': token },
       body: body === undefined ? undefined : JSON.stringify(body),
-      signal: AbortSignal.timeout(route === '/api/credentials' ? 60_000 : 20_000)
+      signal: AbortSignal.timeout(route === '/api/credentials' || route === '/api/bots' || /^\/api\/bots\/[^/]+\/credentials$/.test(route) ? 60_000 : 20_000)
     });
   } catch { throw new ApiError(body === undefined ? '暂时无法连接本机服务，正在尝试恢复。' : '提交结果尚未确认，请先查看任务记录，避免重复发送。', 0); }
   const result = await response.json().catch(() => ({}));
@@ -28,6 +28,6 @@ export async function getState(): Promise<AppState> {
   return state;
 }
 export const getProjects = () => request<{ projects: Project[] }>('/api/projects');
-export const getSessions = (cwd: string) => request<{ sessions: Session[] }>(`/api/sessions?cwd=${encodeURIComponent(cwd)}`);
+export const getSessions = (cwd: string, chatId?: string) => request<{ sessions: Session[] }>(`/api/sessions?cwd=${encodeURIComponent(cwd)}${chatId ? `&chatId=${encodeURIComponent(chatId)}` : ''}`);
 export const getHistory = (chatId: string) => request<{ messages: Message[]; threadId?: string; source: string }>(`/api/history?chatId=${encodeURIComponent(chatId)}`);
 export function errorMessage(error: unknown): string { return error instanceof Error ? error.message : '操作未完成，请稍后重试。'; }

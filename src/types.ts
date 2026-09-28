@@ -1,8 +1,13 @@
 export type ConnectionStatus = 'stopped' | 'connecting' | 'connected' | 'error';
+export type BotProfile = {
+  id: string; name: string; appId: string; appSecret: string; enabled: boolean;
+  allowedActors: string[]; allowedGroups: string[]; roleInstructions: string; model: string; effort: string;
+};
 export type BridgeConfig = {
   appId: string; appSecret: string; enabled: boolean; allowedActors: string[];
   defaultWorkspace: string; model: string; effort: string; progress: boolean; autoNotifyDesktop: boolean;
   desktopNotificationMode: 'all' | 'long'; desktopNotificationMinMinutes: number;
+  botName?: string; roleInstructions?: string; allowedGroups?: string[]; bots?: BotProfile[];
 };
 export type Project = { path: string; name: string; threadCount: number; lastActiveAt: string };
 export type ThreadSummary = { id: string; title: string; cwd: string; updatedAt: string; preview: string };
@@ -10,6 +15,7 @@ export type ModelInfo = { id: string; name: string; efforts: string[]; defaultEf
 export type HistoryMessage = { role: 'user' | 'assistant'; text: string; at?: string; id?: string; turnId?: string; phase?: string };
 export type Conversation = {
   chatId: string; actorId: string; title: string; cwd: string; threadId?: string;
+  botId?: string; rawChatId?: string; chatType?: 'p2p' | 'group'; botName?: string;
   revision?: number;
   model?: string; effort?: string; updatedAt: string; preview: string;
 };
@@ -17,6 +23,15 @@ export type LogEntry = { id: string; at: string; level: 'info' | 'warn' | 'error
 export type ChatMessage = { id: string; role: 'user' | 'assistant' | 'system'; text: string; at: string; streaming?: boolean; phase?: string; turnId?: string };
 export type InboundMessage = {
   id: string; chatId: string; actorId: string; text: string; at?: string;
+  botId?: string; rawChatId?: string; chatType?: 'p2p' | 'group'; senderName?: string; replyTo?: string; quotedText?: string;
+  /** Identity fields from the authenticated Feishu event, never parsed from message text. */
+  actorUnionId?: string; actorUserId?: string; actorTenantKey?: string;
+  /** Internal bridge-only relay metadata; never accepted from an IM event or management request. */
+  handoff?: { chainId: string; fromBotId: string; fromName: string; hop: number; sourceMessageId: string; originalTask: string };
+  groupHandoffGuidance?: string;
+  groupHumanGeneration?: number;
+  /** Captured public background for this accepted message, never a live view of future messages. */
+  groupContext?: string;
   images?: string[]; files?: string[]; actionMessageId?: string;
   /** Internal management preview flag; never accepted from Feishu event payloads. */
   localOnly?: boolean;
@@ -33,7 +48,11 @@ export type RuntimeRequest = {
 export type RuntimeAnswer = { decision?: 'accept' | 'decline'; answers?: Record<string, { answers: string[] }> };
 export type CodexRunInput = {
   cwd: string; threadId?: string; prompt: string; images?: string[]; model?: string; effort?: string;
+  roleInstructions?: string;
+  /** Automated relay work must not steer a task already started on the desktop. */
+  allowSteering?: boolean;
   onThread?: (id: string) => void;
+  /** Completed Codex commentary only; transport acknowledgements are not task progress. */
   onProgress?: (text: string) => void;
   onRequest?: (request: RuntimeRequest) => Promise<RuntimeAnswer>;
   onSubmitted?: (event: { threadId: string; turnId?: string; mode: 'start' | 'steer'; status: 'submitting' | 'submitted' | 'uncertain' | 'rejected' }) => void;
@@ -77,10 +96,12 @@ export interface CodexRuntime {
   threadInfo?(threadId: string): Promise<RuntimeThreadInfo>;
   turnStatus?(threadId: string, turnId: string): Promise<'inProgress' | 'completed' | 'failed' | 'interrupted' | 'unknown'>;
   turnTiming?(threadId: string, turnId: string): Promise<TurnTiming>;
+  updateGroupHandoffPolicy?(threadId: string, instructions: string): Promise<void>;
   close(): Promise<void>;
   usage?(): Promise<CodexUsage>;
 }
 export interface FeishuTransport {
+  isAvailable?(chatId: string): boolean;
   start(): Promise<void>;
   close(): Promise<void>;
   sendText(chatId: string, text: string): Promise<string>;
@@ -88,6 +109,8 @@ export interface FeishuTransport {
   sendImage(chatId: string, imagePath: string): Promise<string>;
   sendFile(chatId: string, filePath: string): Promise<string>;
   updateCard(messageId: string, card: MessageCard): Promise<void>;
+  recallCard?(messageId: string): Promise<void>;
+  markCompleted?(messageId: string): Promise<void>;
   startTyping(messageId: string): Promise<() => Promise<void>>;
 }
 export type FeishuOptions = {
@@ -95,7 +118,15 @@ export type FeishuOptions = {
   onMessage: (message: InboundMessage) => Promise<void>;
   onStatus: (status: ConnectionStatus, detail?: string) => void;
   log: (level: LogEntry['level'], text: string) => void;
-  allowAttachments?: (actorId: string) => boolean;
+  allowAttachments?: (actorId: string, chatId?: string, chatType?: 'p2p' | 'group') => boolean;
+  allowGroup?: (chatId: string) => boolean;
+  onGroupMessage?: (message: InboundMessage) => void | Promise<void>;
+  onBotIdentity?: (identity: { openId: string; name: string }) => void;
+};
+
+export type GroupMessage = {
+  id: string; chatId: string; botId: string; sender: string; role: 'user' | 'assistant';
+  text: string; at: string; cwd: string; replyTo?: string;
 };
 
 export type UsageWindow = {

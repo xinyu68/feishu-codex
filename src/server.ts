@@ -10,10 +10,19 @@ import { readRuntimeConfig } from './runtime-config.js';
 import { discoverProjects, discoverThreads } from './discovery.js';
 import { FeishuClient, FeishuCredentialVerificationError, verifyFeishuCredentials } from './feishu.js';
 import { assertWriteAllowed, readDesktopRuntimeStatus } from './write-gate.js';
-import type { BridgeConfig, BridgeEvent, CodexRuntime, ConnectionStatus, FeishuOptions, FeishuTransport, Project, ThreadSummary } from './types.js';
+import { TransportRouter } from './transport-router.js';
+import { namespaceMessage, parseRoute } from './routing.js';
+import type { BotProfile, BridgeConfig, BridgeEvent, CodexRuntime, ConnectionStatus, FeishuOptions, FeishuTransport, Project, ThreadSummary } from './types.js';
+
+const PRODUCT_VERSION = productVersion();
 
 export async function startServer(options: { port?: number; dataDir?: string; codex?: CodexRuntime; staticDir?: string; writeGateFile?: string; discovery?: { projects: () => Promise<Project[]>; threads: (cwd: string) => Promise<ThreadSummary[]> }; feishu?: { verifyCredentials?: (appId: string, appSecret: string) => Promise<void>; createTransport?: (options: FeishuOptions) => FeishuTransport } } = {}) {
   const store = new Store(options.dataDir);
+  const safeText = (text: string, ...extraSecrets: string[]) => {
+    let safe = text;
+    for (const secret of [...store.bots().map(bot => bot.appSecret), ...extraSecrets]) if (secret) safe = safe.split(secret).join('[已隐藏]');
+    return safe.replace(/(Bearer\s+)[A-Za-z0-9._-]+/gi, '$1[已隐藏]').slice(0, 1500);
+  };
   const port = options.port ?? Number(process.env.FEISHU_CODEX_PORT || 8790);
   if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error('无效的服务端口');
   const runtime = readRuntimeConfig(store.dir);
@@ -61,8 +70,29 @@ export async function startServer(options: { port?: number; dataDir?: string; co
   hostHeartbeat?.unref();
   const startedAt = new Date().toISOString();
   const csrfToken = crypto.randomBytes(32).toString('hex');
-  let connection: { status: ConnectionStatus; detail?: string } = { status: 'stopped' };
-  let transport: FeishuTransport | undefined;
+  type BotConnection = { status: ConnectionStatus; detail?: string };
+  const connections = new Map<string, BotConnection>();
+  const router = new TransportRouter();
+  bridge.transport = router;
+  const connectionFor = (botId = 'default'): BotConnection => connections.get(botId) ?? { status: 'stopped' };
+  const connectionSummary = () => {
+    const bots = store.bots().filter(bot => bot.appId);
+    const active = bots.filter(bot => connectionFor(bot.id).status === 'connected').length;
+    const status: ConnectionStatus = active ? 'connected' : bots.some(bot => connectionFor(bot.id).status === 'connecting') ? 'connecting'
+      : bots.some(bot => connectionFor(bot.id).status === 'error') ? 'error' : 'stopped';
+    return { status, connected: active, total: bots.length, detail: `${active} / ${bots.length} 个机器人已连接` };
+  };
+  const publicBots = () => store.publicBots().map(bot => ({ ...bot, connection: connectionFor(bot.id) }));
+  const requireBot = (botId: string): BotProfile => {
+    const bot = store.bot(botId);
+    if (!bot) throw new UserError('这个机器人不存在，请刷新页面。', 404);
+    return bot;
+  };
+  const assertUniqueApp = (botId: string, appId: string) => {
+    if (appId && store.bots().some(bot => bot.id !== botId && bot.appId.toLowerCase() === appId.toLowerCase())) {
+      throw new UserError('这个 App ID 已用于另一个机器人，请使用独立的飞书应用。', 409);
+    }
+  };
   let changingConnection = false;
   let closing = false;
   let codexStatus: Awaited<ReturnType<typeof codex.status>> = { available: false };
@@ -79,33 +109,51 @@ export async function startServer(options: { port?: number; dataDir?: string; co
       .finally(() => { statusPromise = undefined; });
     await statusPromise;
   };
-  const closeTransport = async () => {
-    const previous = transport;
-    transport = undefined;
-    bridge.transport = undefined;
+  const closeTransport = async (botId: string) => {
+    const previous = router.get(botId);
+    router.delete(botId);
     await previous?.close();
   };
-  const startTransport = async (credentials: Pick<BridgeConfig, 'appId' | 'appSecret'>) => {
+  const startTransport = async (bot: BotProfile) => {
+    if (closing) throw new UserError('服务正在关闭。', 503);
+    assertUniqueApp(bot.id, bot.appId);
     let settleReady!: (status: ConnectionStatus) => void;
     const ready = new Promise<ConnectionStatus>((resolve) => { settleReady = resolve; });
     let candidate!: FeishuTransport;
     candidate = (options.feishu?.createTransport ?? ((value) => new FeishuClient(value)))({
-      appId: credentials.appId, appSecret: credentials.appSecret,
-      attachmentDir: path.join(store.dir, 'attachments'),
-      allowAttachments: (actorId) => store.config.allowedActors.includes(actorId),
-      onMessage: (message) => bridge.receive(message),
+      appId: bot.appId, appSecret: bot.appSecret,
+      attachmentDir: path.join(store.dir, 'attachments', bot.id),
+      allowGroup: (chatId) => !closing && router.get(bot.id) === candidate && Boolean(store.bot(bot.id)?.allowedGroups.includes(chatId)),
+      allowAttachments: (actorId, chatId, chatType) => {
+        const current = store.bot(bot.id);
+        return Boolean(!closing && router.get(bot.id) === candidate && current?.allowedActors.includes(actorId) && (chatType !== 'group' || (chatId && current.allowedGroups.includes(chatId))));
+      },
+      onMessage: async (message) => {
+        if (closing || router.get(bot.id) !== candidate) return;
+        await bridge.receive(namespaceMessage(bot.id, message));
+      },
+      onGroupMessage: async (message) => {
+        const current = store.bot(bot.id);
+        if (closing || router.get(bot.id) !== candidate || !current?.allowedGroups.includes(message.chatId) || !current.allowedActors.includes(message.actorId)) return;
+        store.observeGroup(namespaceMessage(bot.id, message));
+      },
+      onBotIdentity: identity => {
+        if (!closing && router.get(bot.id) === candidate) store.rememberBotIdentity(bot.id, identity);
+      },
       onStatus: (status, detail) => {
-        if (transport !== candidate) return;
-        connection = { status, ...(detail ? { detail } : {}) };
-        store.log(status === 'error' ? 'error' : 'info', `飞书连接：${status}${detail ? ' · ' + detail : ''}`);
+        if (router.get(bot.id) !== candidate) return;
+        detail = detail ? safeText(detail, bot.appSecret) : undefined;
+        router.setReady(bot.id, status === 'connected');
+        connections.set(bot.id, { status, ...(detail ? { detail } : {}) });
+        store.log(status === 'error' ? 'error' : 'info', `${bot.name}连接：${status}${detail ? ' · ' + detail : ''}`);
         publish({ type: 'state' });
         if (status === 'connected' || status === 'error') settleReady(status);
+        if (status === 'connected' && !changingConnection) queueMicrotask(deliverPending);
       },
-      log: (level, text) => store.log(level, text)
+      log: (level, text) => store.log(level, safeText(text, bot.appSecret))
     });
-    transport = candidate;
-    bridge.transport = candidate;
-    connection = { status: 'connecting', detail: '正在建立飞书长连接' };
+    router.set(bot.id, candidate, false);
+    connections.set(bot.id, { status: 'connecting', detail: '正在建立飞书长连接' });
     publish({ type: 'state' });
     await candidate.start();
     return { ready };
@@ -121,59 +169,82 @@ export async function startServer(options: { port?: number; dataDir?: string; co
     void bridge.deliverPendingNotifications().catch((error) => store.log('warn', `待发送的桌面任务通知检查失败：${errorText(error)}`));
     void bridge.deliverPendingArtifacts().catch((error) => store.log('warn', `待发送的飞书成品检查失败：${errorText(error)}`));
   };
-  const setConnection = async (enabled: boolean) => {
+  const setConnection = async (enabled: boolean, botId = 'default', initialStart = false) => {
     if (changingConnection) throw new UserError('连接状态正在更新，请稍后重试。', 409);
-    if (bridge.hasActiveWork()) throw new UserError('请先停止正在执行的对话，再调整连接。', 409);
-    if (enabled && (!store.config.appId || !store.config.appSecret)) throw new UserError('请先填写飞书 App ID 和 App Secret。');
+    if (!initialStart && bridge.hasActiveWork()) throw new UserError('请先停止正在执行的对话，再调整连接。', 409);
+    const bot = requireBot(botId);
+    if (enabled && (!bot.appId || !bot.appSecret)) throw new UserError('请先填写飞书 App ID 和 App Secret。');
+    assertUniqueApp(botId, bot.appId);
+    if (bot.enabled === enabled && ((enabled && connectionFor(botId).status === 'connected') || (!enabled && !router.get(botId)))) return;
     changingConnection = true;
     try {
-      await closeTransport();
-      connection = { status: 'stopped' };
-      store.saveConfig({ enabled });
+      await closeTransport(botId);
+      connections.set(botId, { status: 'stopped' });
+      store.saveBot(botId, { enabled });
       if (enabled) {
-        await startTransport(store.config);
+        await startTransport(requireBot(botId));
         deliverPending();
       }
     } catch (error) {
-      connection = { status: 'error', detail: errorText(error) };
-      await closeTransport().catch(() => {});
+      connections.set(botId, { status: 'error', detail: safeText(errorText(error)) });
+      await closeTransport(botId).catch(() => {});
       throw error;
     } finally { changingConnection = false; publish({ type: 'state' }); }
   };
 
-  const activateCredentials = async (appId: string, appSecret: string) => {
+  const activateCredentials = async (appId: string, appSecret: string, botId = 'default', patch: Partial<BotProfile> = {}) => {
     if (changingConnection) throw new UserError('连接状态正在更新，请稍后重试。', 409);
     if (bridge.hasActiveWork()) throw new UserError('请等当前对话完成后再更换应用凭据。', 409);
     if (!/^cli_[\da-f]{16}$/i.test(appId) || !appSecret) throw new UserError('请填写有效的飞书 App ID 和 App Secret。');
+    assertUniqueApp(botId, appId);
     changingConnection = true;
-    const previous = { appId: store.config.appId, appSecret: store.config.appSecret, enabled: store.config.enabled };
+    const previous = store.bot(botId);
+    if (previous && previous.appId !== appId && (previous.allowedActors.length || previous.allowedGroups.length)) {
+      // open_id belongs to an application, so authorizations never carry to a replacement application.
+      patch = { ...patch, allowedActors: [], allowedGroups: [] };
+    }
     let swapped = false;
     try {
       try { await (options.feishu?.verifyCredentials ?? verifyFeishuCredentials)(appId, appSecret); }
       catch (error) {
-        if (error instanceof FeishuCredentialVerificationError) throw new UserError(error.message, error.invalid ? 400 : 503);
+        if (error instanceof FeishuCredentialVerificationError) throw new UserError(safeText(error.message, appSecret), error.invalid ? 400 : 503);
         throw new UserError('暂时无法向飞书验证应用凭据，请检查网络后重试。', 503);
       }
+      if (closing) throw new UserError('服务正在关闭，请重新打开后连接。', 503);
+      if (bridge.hasActiveWork()) throw new UserError('验证期间有对话开始执行，请等任务完成后重试连接。', 409);
       swapped = true;
-      await closeTransport();
-      connection = { status: 'stopped' };
-      store.saveConfig({ appId, appSecret, enabled: true });
-      const { ready } = await startTransport(store.config);
+      await closeTransport(botId);
+      connections.set(botId, { status: 'stopped' });
+      store.saveBot(botId, { ...patch, appId, appSecret, enabled: true });
+      const { ready } = await startTransport(requireBot(botId));
       await waitForConnected(ready);
+      if (previous && previous.appId !== appId) store.resetBotBindings(botId);
       deliverPending();
-      return { config: store.publicConfig(), connection };
+      return { config: store.publicConfig(), connection: connectionFor(botId), bot: publicBots().find(bot => bot.id === botId) };
     } catch (error) {
       if (swapped) {
-        await closeTransport().catch(() => {});
-        store.saveConfig(previous);
-        connection = { status: 'stopped' };
-        if (previous.enabled) {
+        await closeTransport(botId).catch(() => {});
+        if (previous) store.saveBot(botId, previous); else store.removeBot(botId);
+        connections.set(botId, { status: 'stopped' });
+        if (previous?.enabled) {
           try { const { ready } = await startTransport(previous); await waitForConnected(ready); deliverPending(); }
           catch { store.log('error', '原飞书连接恢复失败，请手动重试连接。'); }
         }
       }
       throw error;
     } finally { changingConnection = false; publish({ type: 'state' }); }
+  };
+  const stopUnauthorized = async (botId: string) => {
+    const bot = requireBot(botId);
+    const conversations = bridge.conversations().filter(item => item.chatId !== 'local-preview' && parseRoute(item.chatId).botId === botId);
+    const activeActors = Object.values(store.state.operations)
+      .filter(item => parseRoute(item.chatId).botId === botId && !['completed', 'failed'].includes(item.status)).map(item => item.actorId);
+    for (const actorId of new Set([...conversations.map(item => item.actorId), ...activeActors].filter(actorId => !bot.allowedActors.includes(actorId)))) {
+      await bridge.stopActor(actorId, botId);
+    }
+    for (const conversation of conversations) {
+      if (conversation.busy && !store.isAuthorized(conversation.chatId, conversation.actorId)) await bridge.stop(conversation.chatId);
+    }
   };
 
   const server = http.createServer(async (request, response) => {
@@ -189,7 +260,7 @@ export async function startServer(options: { port?: number; dataDir?: string; co
       response.setHeader('Referrer-Policy', 'no-referrer');
       response.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'self'; base-uri 'none'; form-action 'self'");
       const url = new URL(request.url ?? '/', host);
-      if (url.pathname === '/health' && request.method === 'GET') return json(response, { status: 'ok', name: 'feishu-codex', version: '0.2.4', pid: process.pid });
+      if (url.pathname === '/health' && request.method === 'GET') return json(response, { status: 'ok', name: 'feishu-codex', version: PRODUCT_VERSION, pid: process.pid });
       if (url.pathname.startsWith('/api/')) {
         if (request.method !== 'GET') {
           if (request.headers['x-bridge-token'] !== csrfToken) throw new UserError('页面连接已更新，请刷新后重试。', 403);
@@ -198,11 +269,11 @@ export async function startServer(options: { port?: number; dataDir?: string; co
         if (request.method === 'GET' && url.pathname === '/api/state') {
           void checkCodex();
           return json(response, {
-            csrfToken, service: { name: 'Feishu Codex', version: '0.2.4', startedAt, uptimeSeconds: Math.floor((Date.now() - Date.parse(startedAt)) / 1000) },
-            config: store.publicConfig(), connection, codex: { ...codexStatus, mode: runtime.mode },
+            csrfToken, service: { name: 'Feishu Codex', version: PRODUCT_VERSION, startedAt, uptimeSeconds: Math.floor((Date.now() - Date.parse(startedAt)) / 1000) },
+            config: store.publicConfig(), connection: connectionFor(), connectionSummary: connectionSummary(), bots: publicBots(), codex: { ...codexStatus, mode: runtime.mode },
             runtime: readDesktopRuntimeStatus(gateFile),
             stats: { messagesToday: store.state.dailyMessages[localDay()] ?? 0, totalTurns: store.state.totalTurns },
-            conversations: bridge.conversations(), pendingActors: store.state.pendingActors,
+            conversations: bridge.conversations(), pendingActors: store.state.pendingActors, pendingGroups: store.state.pendingGroups,
             activeWork: bridge.hasActiveWork(),
             pendingRequests: bridge.pendingRequests(), logs: store.state.logs
           });
@@ -217,41 +288,113 @@ export async function startServer(options: { port?: number; dataDir?: string; co
           return;
         }
         if (request.method === 'GET' && url.pathname === '/api/projects') return json(response, { projects: await projects() });
-        if (request.method === 'GET' && url.pathname === '/api/sessions') return json(response, { sessions: await threads(required(url.searchParams.get('cwd'), '项目目录')) });
+        if (request.method === 'GET' && url.pathname === '/api/sessions') {
+          const sessions = await threads(required(url.searchParams.get('cwd'), '项目目录'));
+          const chatId = optional(url.searchParams.get('chatId'));
+          return json(response, { sessions: chatId && store.isGroup(chatId)
+            ? sessions.filter(session => store.state.threadBindings[session.id]?.chatId === chatId)
+            : sessions });
+        }
         if (request.method === 'GET' && url.pathname === '/api/models') return json(response, { models: await codex.models() });
+        if (request.method === 'GET' && url.pathname === '/api/bots') return json(response, { bots: publicBots() });
         if (request.method === 'GET' && url.pathname === '/api/history') {
           const chatId = required(url.searchParams.get('chatId'), '对话 ID');
           void bridge.watch(chatId).catch((error) => store.log('warn', errorText(error)));
           return json(response, await bridge.history(chatId));
         }
         const body = await readBody(request);
+        if (request.method === 'POST' && url.pathname === '/api/bots') {
+          if (store.bots().length >= 20) throw new UserError('最多可配置 20 个机器人。');
+          const patch = validateBot(body);
+          if (!patch.name || !patch.appId || !patch.appSecret) throw new UserError('请填写机器人名称、App ID 和 App Secret。');
+          const botId = `bot-${crypto.randomUUID()}`;
+          return json(response, await activateCredentials(patch.appId, patch.appSecret, botId, patch), 201);
+        }
+        const botRoute = /^\/api\/bots\/([^/]+)(?:\/(credentials|connection))?$/.exec(url.pathname);
+        if (botRoute) {
+          const botId = decodeURIComponent(botRoute[1]!);
+          const current = requireBot(botId);
+          if (request.method === 'POST' && botRoute[2] === 'credentials') {
+            const patch = validateBot(body);
+            const appId = patch.appId ?? current.appId;
+            const appSecret = patch.appSecret ?? (appId === current.appId ? current.appSecret : '');
+            return json(response, await activateCredentials(appId, appSecret, botId, patch));
+          }
+          if (request.method === 'POST' && botRoute[2] === 'connection') {
+            if (typeof body.enabled !== 'boolean') throw new UserError('缺少连接开关');
+            await setConnection(body.enabled, botId);
+            return json(response, { connection: connectionFor(botId), bot: publicBots().find(bot => bot.id === botId) });
+          }
+          if (!botRoute[2] && request.method === 'PATCH') {
+            if (changingConnection) throw new UserError('连接状态正在更新，请稍后重试。', 409);
+            const patch = validateBot(body);
+            const changed = (patch.appId !== undefined && patch.appId !== current.appId) || Boolean(patch.appSecret && patch.appSecret !== current.appSecret);
+            if (changed) {
+              const appId = patch.appId ?? current.appId;
+              const appSecret = patch.appSecret ?? (appId === current.appId ? current.appSecret : '');
+              return json(response, await activateCredentials(appId, appSecret, botId, patch));
+            }
+            store.saveBot(botId, patch);
+            await stopUnauthorized(botId);
+            return json(response, { bot: publicBots().find(bot => bot.id === botId) });
+          }
+          if (!botRoute[2] && request.method === 'DELETE') {
+            if (botId === 'default') throw new UserError('默认机器人不能删除，可以关闭连接。');
+            if (changingConnection || bridge.hasActiveWork()) throw new UserError('请等当前任务和连接操作完成后再删除机器人。', 409);
+            changingConnection = true;
+            try {
+              await closeTransport(botId);
+              store.removeBot(botId);
+              connections.delete(botId);
+            } finally { changingConnection = false; publish({ type: 'state' }); }
+            return json(response, { ok: true });
+          }
+        }
         if (request.method === 'POST' && url.pathname === '/api/credentials') {
           const credentials = validateConfig(body);
-          if (!credentials.appId || !credentials.appSecret) throw new UserError('请填写 App ID 和 App Secret。');
-          return json(response, await activateCredentials(credentials.appId, credentials.appSecret));
+          const appId = credentials.appId ?? store.config.appId;
+          const appSecret = credentials.appSecret ?? (appId === store.config.appId ? store.config.appSecret : '');
+          return json(response, await activateCredentials(appId, appSecret));
         }
         if (request.method === 'PUT' && url.pathname === '/api/config') {
+          if (changingConnection) throw new UserError('连接状态正在更新，请稍后重试。', 409);
           const patch = validateConfig(body);
+          assertUniqueApp('default', patch.appId ?? store.config.appId);
           const credentialsChanged = (patch.appId !== undefined && patch.appId !== store.config.appId) || Boolean(patch.appSecret && patch.appSecret !== store.config.appSecret);
           if (credentialsChanged && bridge.hasActiveWork()) throw new UserError('请等当前对话完成后再更换应用凭据。', 409);
           if (credentialsChanged && store.config.enabled) await setConnection(false);
-          store.saveConfig(patch);
-          if (patch.allowedActors) {
-            for (const actorId of new Set(bridge.conversations().filter(item => item.chatId !== 'local-preview' && !patch.allowedActors!.includes(item.actorId)).map(item => item.actorId))) await bridge.stopActor(actorId);
+          const appChanged = patch.appId !== undefined && patch.appId !== store.config.appId;
+          if (appChanged) {
+            if (!patch.appSecret) patch.appSecret = '';
+            patch.allowedActors = []; patch.allowedGroups = [];
           }
+          store.saveConfig(patch);
+          if (appChanged) store.resetBotBindings('default');
+          if (patch.allowedActors || patch.allowedGroups) await stopUnauthorized('default');
           store.log('info', '已保存连接设置');
           return json(response, { config: store.publicConfig() });
         }
         if (request.method === 'POST' && url.pathname === '/api/connection') {
           if (typeof body.enabled !== 'boolean') throw new UserError('缺少连接开关');
           await setConnection(body.enabled);
-          return json(response, { connection });
+          return json(response, { connection: connectionFor() });
         }
         if (request.method === 'POST' && url.pathname === '/api/actors') {
           const actorId = required(body.actorId, '账号 ID');
+          const botId = optional(body.botId) ?? 'default';
+          requireBot(botId);
           if (typeof body.allow !== 'boolean' || !/^ou_[\w-]+$/.test(actorId)) throw new UserError('飞书账号 ID 或授权操作无效。');
-          store.authorize(actorId, body.allow);
-          if (!body.allow) await bridge.stopActor(actorId);
+          store.authorize(actorId, body.allow, botId);
+          if (!body.allow) await bridge.stopActor(actorId, botId);
+          return json(response, { ok: true });
+        }
+        if (request.method === 'POST' && url.pathname === '/api/groups') {
+          const botId = optional(body.botId) ?? 'default';
+          requireBot(botId);
+          const chatId = required(body.chatId, '群 ID');
+          if (typeof body.allow !== 'boolean' || !/^oc_[\w-]+$/.test(chatId)) throw new UserError('飞书群 ID 或授权操作无效。');
+          store.authorizeGroup(botId, chatId, body.allow);
+          if (!body.allow) await stopUnauthorized(botId);
           return json(response, { ok: true });
         }
         if (request.method === 'POST' && url.pathname === '/api/bind') {
@@ -281,7 +424,7 @@ export async function startServer(options: { port?: number; dataDir?: string; co
           if (expectedRevision !== undefined && expectedRevision !== (existing?.revision ?? 0)) throw new UserError('当前项目或任务已经切换，请确认页面后重新发送。', 409);
           if (chatId !== 'local-preview') {
             if (!existing) throw new UserError('这条飞书对话不存在，请刷新页面。', 404);
-            if (!store.config.allowedActors.includes(existing.actorId)) throw new UserError('这条飞书对话的账号尚未授权。', 403);
+            if (!store.isAuthorized(chatId, existing.actorId)) throw new UserError('这条飞书对话的账号或群尚未授权。', 403);
           }
           const text = required(body.text, '消息');
           if (text.length > 30_000) throw new UserError('消息太长，请缩短后重试。');
@@ -316,7 +459,7 @@ export async function startServer(options: { port?: number; dataDir?: string; co
       response.setHeader('Content-Type', contentTypes[path.extname(asset)]!);
       response.end(request.method === 'HEAD' ? undefined : fs.readFileSync(file));
     } catch (error) {
-      if (!response.headersSent) json(response, { error: errorText(error) }, error instanceof UserError ? error.status : 500);
+      if (!response.headersSent) json(response, { error: safeText(errorText(error)) }, error instanceof UserError ? error.status : 500);
       else response.end();
     }
   });
@@ -330,7 +473,12 @@ export async function startServer(options: { port?: number; dataDir?: string; co
   store.log('info', `管理页已启动：http://127.0.0.1:${actualPort}`);
   store.log('info', runtime.mode === 'shared' ? 'Codex 使用共享会话服务' : 'Codex 使用每轮独立进程');
   void checkCodex();
-  if (store.config.enabled) void setConnection(true).catch((error) => store.log('error', `连接失败：${errorText(error)}`));
+  const startup = (async () => {
+    for (const bot of store.bots()) {
+      if (closing) break;
+      if (bot.enabled) await setConnection(true, bot.id, true).catch((error) => store.log('error', `${bot.name}连接失败：${errorText(error)}`));
+    }
+  })();
   const close = async () => {
     if (closing) return;
     closing = true;
@@ -339,8 +487,9 @@ export async function startServer(options: { port?: number; dataDir?: string; co
     clearInterval(hostHeartbeat);
     for (const subscriber of subscribers) subscriber.end();
     subscribers.clear();
+    await startup;
     await bridge.close();
-    await transport?.close();
+    await router.close().catch(error => store.log('warn', `飞书连接关闭失败：${errorText(error)}`));
     await new Promise<void>((resolve) => {
       server.close(() => resolve());
       // Browsers may keep speculative sockets open without sending an HTTP request.
@@ -356,6 +505,16 @@ function defaultStaticDir(): string {
   const parent = fileURLToPath(new URL('../', import.meta.url));
   const candidates = [path.join(parent, 'ui'), path.join(parent, 'build', 'ui'), path.join(parent, 'public'), path.join(parent, '..', 'public')];
   return candidates.find((directory) => fs.existsSync(path.join(directory, 'index.html')) && (fs.existsSync(path.join(directory, 'assets')) || fs.existsSync(path.join(directory, 'app.js')))) || candidates[0]!;
+}
+
+function productVersion(): string {
+  for (const relative of ['../package.json', '../../package.json']) {
+    try {
+      const manifest = JSON.parse(fs.readFileSync(new URL(relative, import.meta.url), 'utf8'));
+      if (manifest.name === 'feishu-codex' && typeof manifest.version === 'string') return manifest.version;
+    } catch { /* Source and packaged server modules have different parent paths. */ }
+  }
+  return 'unknown';
 }
 
 function revision(value: unknown): number | undefined {
@@ -396,7 +555,32 @@ function validateConfig(body: Record<string, unknown>): Partial<BridgeConfig> {
     if (!Array.isArray(body.allowedActors) || body.allowedActors.length > 100 || body.allowedActors.some((id) => typeof id !== 'string' || !/^ou_[\w-]+$/.test(id))) throw new UserError('授权名单应为飞书 open_id 列表。');
     result.allowedActors = [...new Set(body.allowedActors as string[])];
   }
+  if (body.allowedGroups !== undefined) result.allowedGroups = validateIdList(body.allowedGroups, /^oc_[\w-]+$/, '授权群名单应为飞书 chat_id 列表。');
+  if (body.botName !== undefined) result.botName = validateString(body.botName, '机器人名称', 80, true);
+  if (body.roleInstructions !== undefined) result.roleInstructions = validateString(body.roleInstructions, '角色说明', 12_000);
   return result;
+}
+function validateString(value: unknown, label: string, max: number, nonempty = false): string {
+  if (typeof value !== 'string' || value.length > max || (nonempty && !value.trim())) throw new UserError(`${label}无效`);
+  return value.trim();
+}
+function validateIdList(value: unknown, pattern: RegExp, error: string): string[] {
+  if (!Array.isArray(value) || value.length > 100 || value.some(id => typeof id !== 'string' || !pattern.test(id))) throw new UserError(error);
+  return [...new Set(value as string[])];
+}
+function validateBot(body: Record<string, unknown>): Partial<BotProfile> {
+  const patch: Partial<BotProfile> = {};
+  for (const name of ['name', 'appId', 'appSecret', 'roleInstructions', 'model', 'effort'] as const) {
+    if (body[name] === undefined) continue;
+    const max = name === 'roleInstructions' ? 12_000 : name === 'name' ? 80 : 1500;
+    const value = validateString(body[name], name, max, name === 'name');
+    if (name === 'appSecret' && !value) continue;
+    patch[name] = value;
+  }
+  if (patch.appId !== undefined && !/^cli_[\da-f]{16}$/i.test(patch.appId)) throw new UserError('请填写有效的飞书 App ID。');
+  if (body.allowedActors !== undefined) patch.allowedActors = validateIdList(body.allowedActors, /^ou_[\w-]+$/, '授权名单应为飞书 open_id 列表。');
+  if (body.allowedGroups !== undefined) patch.allowedGroups = validateIdList(body.allowedGroups, /^oc_[\w-]+$/, '授权群名单应为飞书 chat_id 列表。');
+  return patch;
 }
 function validateAnswers(value: unknown): Record<string, { answers: string[] }> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new UserError('回答格式无效');

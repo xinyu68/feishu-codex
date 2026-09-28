@@ -10,13 +10,16 @@ import type { ConnectionStatus, FeishuOptions, FeishuTransport, InboundMessage, 
 const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
 const MAX_OUTBOUND_IMAGE_BYTES = 10 * 1024 * 1024;
 const MAX_OUTBOUND_FILE_BYTES = 30 * 1024 * 1024;
+const MAX_QUOTED_TEXT = 12_000;
+const MAX_POST_ATTACHMENTS = 8;
 const COMMAND_NAMES = new Set(['help', 'project', 'session', 'sessions', 'new', 'stop', 'model', 'effort', 'approve', 'reject', 'deny', 'answer', 'status', 'usage', 'notification']);
 const MENU_COMMANDS: Record<string, string> = {
   'codex.workbench': '/help', 'codex.project': '/project', 'codex.session': '/session',
   'codex.new': '/new', 'codex.stop': '/stop',
 };
 type Attachment = { type: 'image' | 'file'; key: string; name?: string };
-type NormalizedMessage = { message: InboundMessage; attachment?: Attachment };
+type NormalizedMessage = { message: InboundMessage; attachment?: Attachment; attachments?: Attachment[]; observation?: boolean };
+type MessageParsingOptions = { botOpenId?: string; observeGroup?: boolean };
 type Dependencies = {
   api?: Lark.Client;
   ws?: Pick<Lark.WSClient, 'start' | 'close'>;
@@ -95,21 +98,70 @@ export function formatSdkLog(args: unknown[], appSecret: string): string {
   return parts.join(' ').slice(0, 1200) || '[SDK detail omitted]';
 }
 
-export function parseMessageEvent(input: unknown): NormalizedMessage | undefined {
+export function parseMessageEvent(input: unknown, options: MessageParsingOptions = {}): NormalizedMessage | undefined {
   const event = input as Partial<Lark.RawMessageEvent> | undefined;
-  if (event?.message?.chat_type !== 'p2p' || event.sender?.sender_type !== 'user') return;
+  if (!event?.message || !['p2p', 'group'].includes(event.message.chat_type) || event.sender?.sender_type !== 'user') return;
   const actorId = event.sender.sender_id?.open_id;
   const message = event.message;
   if (!actorId || !message.message_id || !message.chat_id) return;
+  const isGroup = message.chat_type === 'group';
+  // Group delivery must never turn into reply-all when bot identity is unavailable.
+  if (isGroup && !options.botOpenId) return;
+  const mentioned = !!options.botOpenId && (message.mentions ?? []).some(mention => mention.id?.open_id === options.botOpenId);
+  const observation = isGroup && !mentioned;
+  if (observation && !options.observeGroup) return;
+  if (observation && !['text', 'post'].includes(message.message_type)) return;
   let content: Record<string, unknown>;
   try { content = JSON.parse(message.content) as Record<string, unknown>; } catch { return; }
   if (!content || typeof content !== 'object' || Array.isArray(content)) return;
-  const base: InboundMessage = { id: message.message_id, chatId: message.chat_id, actorId, text: '' };
+  const base: InboundMessage = { id: message.message_id, chatId: message.chat_id, actorId, text: '', chatType: message.chat_type };
+  // Identity links come only from the authenticated event envelope, never from
+  // message text or quoted content supplied by a participant.
+  const actorUnionId = event.sender.sender_id?.union_id;
+  const actorUserId = event.sender.sender_id?.user_id;
+  const actorTenantKey = event.sender.tenant_key;
+  if (typeof actorUnionId === 'string' && actorUnionId.trim()) base.actorUnionId = actorUnionId.trim();
+  if (typeof actorUserId === 'string' && actorUserId.trim()) base.actorUserId = actorUserId.trim();
+  if (typeof actorTenantKey === 'string' && actorTenantKey.trim()) base.actorTenantKey = actorTenantKey.trim();
+  if (message.parent_id) base.replyTo = message.parent_id;
+  const senderName = (event.sender as typeof event.sender & { name?: unknown }).name;
+  if (typeof senderName === 'string' && senderName.trim()) base.senderName = senderName.trim().slice(0, 100);
   const timestamp = Number(message.create_time);
   if (Number.isFinite(timestamp) && timestamp > 0 && timestamp < 8.64e15) base.at = new Date(timestamp).toISOString();
   if (message.message_type === 'text' && typeof content.text === 'string') {
-    base.text = content.text.trim();
-    return base.text ? { message: base } : undefined;
+    base.text = replaceMentionKeys(content.text, message.mentions, observation ? undefined : options.botOpenId).trim();
+    return base.text ? { message: base, ...(observation ? { observation: true } : {}) } : undefined;
+  }
+  if (message.message_type === 'post') {
+    const post = normalizePost(content);
+    if (!post) return;
+    const attachments: Attachment[] = [];
+    const rows = Array.isArray(post.content) ? post.content : [];
+    const lines = rows.filter(Array.isArray).map(row => row.map((raw: unknown) => {
+      const node = record(raw);
+      if (!node) return '';
+      if (node.tag === 'text' || node.tag === 'md') return stringField(node.text);
+      if (node.tag === 'a') return `${stringField(node.text)}${typeof node.href === 'string' ? ` (${node.href})` : ''}`;
+      if (node.tag === 'at') {
+        const id = stringField(node.user_id);
+        const mention = message.mentions?.find(item => item.key === id || item.id?.open_id === id);
+        if (!observation && options.botOpenId && (id === options.botOpenId || mention?.id?.open_id === options.botOpenId)) return '';
+        return `@${mention?.name || stringField(node.user_name) || id}`;
+      }
+      if (node.tag === 'img' && typeof node.image_key === 'string' && node.image_key.trim()) {
+        attachments.push({ type: 'image', key: node.image_key });
+        return observation ? '[图片]' : '';
+      }
+      if (node.tag === 'file' && typeof node.file_key === 'string' && node.file_key.trim()) {
+        attachments.push({ type: 'file', key: node.file_key, name: stringField(node.file_name) || 'attachment' });
+        return observation ? `[附件：${safeFilename(stringField(node.file_name) || 'attachment')}]` : '';
+      }
+      return '';
+    }).join(''));
+    base.text = replaceMentionKeys([stringField(post.title), ...lines].filter(Boolean).join('\n'), message.mentions, observation ? undefined : options.botOpenId).trim();
+    if (!base.text && attachments.length && !observation) base.text = '请查看附件';
+    if (!base.text) return;
+    return { message: base, ...(observation ? { observation: true } : { attachments: attachments.slice(0, MAX_POST_ATTACHMENTS) }) };
   }
   if (message.message_type === 'image' && typeof content.image_key === 'string' && content.image_key.trim()) {
     base.text = '请查看这张图片';
@@ -120,6 +172,50 @@ export function parseMessageEvent(input: unknown): NormalizedMessage | undefined
     base.text = `请查看附件：${safeFilename(name)}`;
     return { message: base, attachment: { type: 'file', key: content.file_key, name } };
   }
+}
+
+function record(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
+}
+
+function stringField(value: unknown): string { return typeof value === 'string' ? value : ''; }
+
+function normalizePost(content: Record<string, unknown>): Record<string, unknown> | undefined {
+  if (Array.isArray(content.content)) return content;
+  return record(content.zh_cn) ?? record(content.en_us) ?? Object.values(content).map(record).find(value => Array.isArray(value?.content));
+}
+
+function replaceMentionKeys(text: string, mentions: Lark.RawMessageEvent['message']['mentions'], botOpenId?: string): string {
+  // Replace longer keys first: @_user_1 must not corrupt @_user_10.
+  for (const mention of [...(mentions ?? [])].sort((a, b) => b.key.length - a.key.length)) {
+    if (!mention.key) continue;
+    const label = botOpenId && mention.id?.open_id === botOpenId ? '' : `@${mention.name || mention.id?.open_id || '用户'}`;
+    text = text.split(mention.key).join(label);
+  }
+  return text;
+}
+
+export function quotedMessageText(type: string, rawContent: string): string | undefined {
+  let content: Record<string, unknown> | undefined;
+  try { content = record(JSON.parse(rawContent)); } catch { return; }
+  if (!content) return;
+  if (type === 'text') return stringField(content.text).trim().slice(0, MAX_QUOTED_TEXT) || undefined;
+  if (type !== 'post' && type !== 'interactive') return;
+  const parts: string[] = [];
+  let budget = 400;
+  const visit = (value: unknown, depth = 0): void => {
+    if (budget-- <= 0 || depth > 10) return;
+    if (typeof value === 'string') { parts.push(value); return; }
+    if (Array.isArray(value)) { for (const node of value) visit(node, depth + 1); return; }
+    const node = record(value);
+    if (!node || ['action', 'button', 'img', 'image'].includes(stringField(node.tag))) return;
+    // Read display text only, never card action values or unrelated metadata.
+    for (const key of ['title', 'header', 'body', 'elements', 'fields', 'text', 'content']) {
+      if (node[key] !== undefined) visit(node[key], depth + 1);
+    }
+  };
+  visit(type === 'post' ? normalizePost(content) : content);
+  return parts.join('\n').trim().slice(0, MAX_QUOTED_TEXT) || undefined;
 }
 
 export function safeFilename(name: string): string {
@@ -220,6 +316,9 @@ export class FeishuClient implements FeishuTransport {
   private readonly cardChats = new Map<string, string>();
   private readonly pending = new Set<Promise<void>>();
   private readonly reactionCleanups = new Set<() => Promise<void>>();
+  private botOpenId?: string;
+  private identityAttemptAt = 0;
+  private identityPending?: Promise<void>;
 
   constructor(private readonly options: FeishuOptions, dependencies: Dependencies = {}) {
     this.logger = {
@@ -247,8 +346,14 @@ export class FeishuClient implements FeishuTransport {
     this.closed = false;
     this.active = true;
     this.setStatus('connecting', '正在建立飞书长连接');
+    if (this.options.allowGroup || this.options.onGroupMessage || this.options.onBotIdentity) await this.resolveBotIdentity();
+    if (!this.active) return;
     const dispatcher = new Lark.EventDispatcher({ logger: this.logger, loggerLevel: Lark.LoggerLevel.warn }).register({
       'im.message.receive_v1': event => {
+        if (event.message?.chat_type === 'group') {
+          this.dispatch(() => this.receiveGroup(event));
+          return;
+        }
         const normalized = parseMessageEvent(event);
         if (normalized) this.dispatch(() => this.receive(normalized));
       },
@@ -356,6 +461,19 @@ export class FeishuClient implements FeishuTransport {
     this.checkResult(result, '更新卡片');
   }
 
+  async recallCard(messageId: string): Promise<void> {
+    const result = await this.api.im.v1.message.delete({ path: { message_id: messageId } });
+    this.checkResult(result, '撤回卡片');
+    this.cardChats.delete(messageId);
+  }
+
+  async markCompleted(messageId: string): Promise<void> {
+    const result = await this.api.im.v1.messageReaction.create({
+      path: { message_id: messageId }, data: { reaction_type: { emoji_type: 'DONE' } },
+    });
+    this.checkResult(result, '添加完成表情');
+  }
+
   async startTyping(messageId: string): Promise<() => Promise<void>> {
     let reactionId: string | undefined;
     try {
@@ -392,18 +510,82 @@ export class FeishuClient implements FeishuTransport {
 
   private async receive(normalized: NormalizedMessage): Promise<void> {
     const { message, attachment } = normalized;
-    if (attachment && (this.options.allowAttachments?.(message.actorId) ?? true)) {
+    const authorized = (message.chatType !== 'group' || this.options.allowGroup?.(message.chatId) === true)
+      && (this.options.allowAttachments?.(message.actorId, message.chatId, message.chatType) ?? (message.chatType !== 'group'));
+    const attachments = [...(attachment ? [attachment] : []), ...(normalized.attachments ?? [])];
+    if (attachments.length && authorized) {
       try {
-        const file = await this.download(message.id, attachment);
-        if (attachment.type === 'image') message.images = [file];
-        else message.files = [file];
+        for (const item of attachments) {
+          const file = await this.download(message.id, item);
+          if (item.type === 'image') (message.images ??= []).push(file);
+          else (message.files ??= []).push(file);
+        }
       } catch (error) {
         this.options.log('warn', `附件下载失败：${this.errorText(error)}`);
         await this.sendText(message.chatId, `附件未能接收：${this.errorText(error)}。请重新发送，单个附件上限为 20 MB。`);
         return;
       }
     }
+    if (authorized && message.replyTo && this.active) {
+      message.quotedText = await this.readQuotedMessage(message.replyTo, message.chatId);
+    }
     if (this.active) await this.options.onMessage(message);
+  }
+
+  private async resolveBotIdentity(): Promise<void> {
+    if (this.botOpenId) return;
+    if (this.identityPending) return this.identityPending;
+    if (Date.now() - this.identityAttemptAt < 60_000) return;
+    this.identityAttemptAt = Date.now();
+    this.identityPending = (async () => {
+      try {
+        const response = await this.api.request<{ code?: number; msg?: string; bot?: { open_id?: string; app_name?: string } }>({
+          url: '/open-apis/bot/v3/info', method: 'GET',
+        });
+        this.checkResult(response, '识别机器人');
+        if (!response.bot?.open_id?.startsWith('ou_')) throw new Error('飞书未返回机器人 open_id');
+        this.botOpenId = response.bot.open_id;
+        if (this.active) {
+          try { this.options.onBotIdentity?.({ openId: this.botOpenId, name: stringField(response.bot.app_name).trim() }); }
+          catch (error) { this.options.log('warn', `机器人身份信息同步失败：${this.errorText(error)}`); }
+        }
+      } catch (error) {
+        this.options.log('warn', `机器人身份暂未确认，群聊暂不响应，私聊不受影响：${this.errorText(error)}`);
+      }
+    })().finally(() => { this.identityPending = undefined; });
+    return this.identityPending;
+  }
+
+  private async receiveGroup(input: unknown): Promise<void> {
+    const event = input as Partial<Lark.RawMessageEvent>;
+    if (!event.message || event.sender?.sender_type !== 'user' || (!this.options.allowGroup && !this.options.onGroupMessage)) return;
+    await this.resolveBotIdentity();
+    if (!this.active) return;
+    const observedGroup = this.options.allowGroup?.(event.message.chat_id) ?? false;
+    const normalized = parseMessageEvent(event, { botOpenId: this.botOpenId, observeGroup: observedGroup });
+    if (!normalized) return;
+    if (normalized.observation) {
+      const message = normalized.message;
+      if (observedGroup && this.options.allowAttachments?.(message.actorId, message.chatId, 'group')) {
+        await this.options.onGroupMessage?.(message);
+      }
+      return;
+    }
+    await this.receive(normalized);
+  }
+
+  private async readQuotedMessage(messageId: string, chatId: string): Promise<string | undefined> {
+    try {
+      const response = await this.api.im.v1.message.get({ path: { message_id: messageId } });
+      this.checkResult(response, '读取引用消息');
+      // Fail closed: knowing an ID is not permission to import another conversation.
+      const item = response.data?.items?.find(item => item.message_id === messageId && item.chat_id === chatId);
+      if (!item?.body?.content || !item.msg_type || item.deleted) return;
+      return quotedMessageText(item.msg_type, item.body.content);
+    } catch (error) {
+      this.options.log('warn', `引用消息暂时不可读取：${this.errorText(error)}`);
+      return;
+    }
   }
 
   private async download(messageId: string, attachment: Attachment): Promise<string> {
