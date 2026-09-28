@@ -39,7 +39,7 @@ npm run package:win
 
 构建先生成 `build/server` 和 `build/ui`，随后在 `.desktop-package` 准备生产依赖与 Node.js 运行时，再用 electron-builder / NSIS 打包。`afterPack` 会检查依赖文件完整性，并用随包 Node 加载服务入口。
 
-Node.js 运行时来自当前构建机的 `node.exe`；安装包必须在 Windows x64 下构建。依赖和 Node.js 许可证下载需要联网。当前构建没有配置发布者签名证书，不应描述为签名发行版。
+Node.js 运行时来自当前构建机的 `node.exe`；安装包必须在 Windows x64 下构建。依赖和 Node.js 许可证下载需要联网。当前安装包未配置代码签名证书。
 
 GitHub Actions 中的 **Build Windows installer** 支持手动构建，成功后生成带 SHA-256 校验文件的下载产物；它不会自动创建 Release 或发布版本。
 
@@ -54,10 +54,8 @@ GitHub Actions 中的 **Build Windows installer** 支持手动构建，成功后
 
 UI 测试服务使用本机 8795 / 8796 端口及临时数据。Windows 进程测试只操作自己创建的夹具进程。更深的宿主编排测试和安装卸载验收应在测试环境中显式运行，详见 [验收清单](testing.md)。
 
-## 仓库内容
+## 相关文档
 
-公开源码不包含 `node_modules/`、`build/`、安装包、个人配置、真实聊天数据和本机诊断记录。截图来自演示模式。
-
-`DESIGN.md` 介绍架构；`desktop/README.md` 记录宿主细节。部分迁移脚本仅用于开发阶段维护，不是新用户安装步骤。不要把旧脚本写入全局环境变量的操作用于新安装流程。
-
-维护者：**xinyu68 <1693784423@qq.com>**。
+- [架构说明](../DESIGN.md)：模块划分、会话归属和消息流程。
+- [桌面宿主](../desktop/README.md)：Windows 进程管理、本机接口和启动机制。
+- [贡献指南](../CONTRIBUTING.md)：提交约定和验证要求。

@@ -1,10 +1,10 @@
 # Attribution and third-party notices
 
-Feishu Codex is maintained by **xinyu68 <1693784423@qq.com>** and distributed under the [MIT License](LICENSE).
+Feishu Codex is distributed under the [MIT License](LICENSE).
 
 ## Codex Channel Bridge
 
-This implementation references the MIT-licensed [Codex Channel Bridge](https://github.com/lsiten/codex-channel-bridge) by **Xuechao Zou**. Its Feishu adapter and Codex app-server integration informed the implementation. The upstream copyright notice and MIT terms are retained in `LICENSE`. This project focuses on Windows desktop / Feishu conversation continuity; it does not include the upstream taskboard, wiki or multi-platform workbench.
+This implementation references the MIT-licensed [Codex Channel Bridge](https://github.com/lsiten/codex-channel-bridge) by **Xuechao Zou**. Its Feishu adapter and Codex app-server integration informed the implementation. The upstream copyright notice and MIT terms are retained in `LICENSE`.
 
 ## Codex and Feishu
 

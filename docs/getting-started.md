@@ -6,7 +6,7 @@
 - 一个可创建自建应用的飞书账号；组织策略可能要求管理员审批权限和发布。
 - 本机能够连接飞书和你使用的 Codex 模型服务。
 
-安装包见 [Releases](https://github.com/xinyu68/feishu-codex/releases)。如尚无可用安装包，按 [开发指南](development.md) 构建。安装时选择父目录，向导会补上 `Feishu Codex` 文件夹，并显示最终安装路径。
+在 [Releases](https://github.com/xinyu68/feishu-codex/releases/latest) 下载最新的 `Feishu-Codex-版本号-Setup.exe`，双击安装。安装时选择父目录，向导会补上 `Feishu Codex` 文件夹，并显示最终安装路径。
 
 ## 1. 创建飞书机器人
 
@@ -26,7 +26,7 @@
 | 获取、上传图片或文件资源 | `im:resource` |
 | 添加和移除处理中的表情回复 | `im:message.reactions:write_only` |
 
-以开放平台当前显示的权限要求为准，相关接口见 [接收消息](https://open.feishu.cn/document/server-docs/im-v1/message/events/receive)、[发送消息](https://open.feishu.cn/document/server-docs/im-v1/message/create)、[添加表情回复](https://open.feishu.cn/document/server-docs/im-v1/message-reaction/create)。本项目目前处理私聊，不要求读取所有群消息。
+以开放平台当前显示的权限要求为准，相关接口见 [接收消息](https://open.feishu.cn/document/server-docs/im-v1/message/events/receive)、[发送消息](https://open.feishu.cn/document/server-docs/im-v1/message/create)、[添加表情回复](https://open.feishu.cn/document/server-docs/im-v1/message-reaction/create)。
 
 ## 3. 连接应用并订阅事件
 

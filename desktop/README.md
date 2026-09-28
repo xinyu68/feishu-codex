@@ -21,13 +21,9 @@ Windows 首发版。新图标打开管理工作台并按需启动飞书桥接和
 
 桥接启动环境包含 `FEISHU_CODEX_DESKTOP_HOST=1`、`FEISHU_CODEX_WRITE_GATE_FILE`、`FEISHU_CODEX_UI_DIR`。用户指令交给原生 Codex，始终 `danger-full-access` / `never`；Electron 的页面隔离仅限制管理网页自身。
 
-## 首次设置与开发阶段维护
+## 首次设置
 
-首次打开时点击“开始设置”，应用先检查已有数据、端口和后台任务，再注册按需启动的本机宿主，进入“设置 → 飞书连接”填写应用凭据。公开界面不提供迁移入口。`migration.mjs` 和相关脚本仅保留给开发阶段已经运行的本机部署维护；它们先检查原生 Codex 和任务状态，再备份并切换。状态与日志分别在数据目录的 `desktop/migration-status.json` 和 `desktop/migration.log`。
-
-迁移脚本 `scripts/desktop-migrate.ps1` 保存旧部署、当前配置、任务 XML/启用状态和用户环境变量原始类型和值。默认查找 `%USERPROFILE%\.feishu-codex\desktop-baseline` 内带 `baseline-info.json` 的原始 0.1.0 部署，或通过 `-BaselinePath` 指定。它验证旧服务身份及空闲状态，关闭旧服务，禁用两个旧的登录自启任务，移除本项目原先写入的用户级共享地址，注册无触发器的宿主任务，再启动新后台。旧服务目录保留。失败会尝试恢复；状态不能安全确认时保留备份并给出中文说明。
-
-回退执行 `scripts/desktop-rollback.ps1 -BackupDir <接管时打印的目录>`。它先检查原生桌面、任务和新后台均可安全退出，再恢复旧部署、应用配置、运行时配置、环境变量及旧计划任务。`state.json` 和 `.codex` 历史保持现状，接管后新增任务不会被擦除。宿主已死但组件仍活着时，先打开工作台重试并安全退出；回退不会直接强杀它们或启动第二个消费者。
+首次打开时点击“开始设置”，应用先检查已有数据、端口和后台任务，再注册按需启动的本机宿主，进入“设置 → 飞书连接”填写应用凭据。飞书处理进度默认开启，用户修改后保存在应用配置中。
 
 ## 打包
 

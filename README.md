@@ -9,6 +9,7 @@
     <a href="https://github.com/xinyu68/feishu-codex/actions/workflows/ci.yml"><img src="https://github.com/xinyu68/feishu-codex/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
   </p>
   <p>
+    <a href="https://github.com/xinyu68/feishu-codex/releases/latest">下载 Windows 安装包</a> ·
     <a href="docs/getting-started.md">配置指南</a> ·
     <a href="docs/usage.md">使用帮助</a> ·
     <a href="docs/development.md">源码构建</a> ·
@@ -35,7 +36,7 @@ Feishu Codex 是一个本地 Windows 应用，围绕 **桌面与手机接续工�
 
 </details>
 
-截图使用隔离演示数据，不包含真实账号、密钥或聊天记录。
+以上界面使用演示数据。
 
 ## 你可以做什么
 
@@ -43,18 +44,16 @@ Feishu Codex 是一个本地 Windows 应用，围绕 **桌面与手机接续工�
 | --- | --- |
 | **同一会话，双端接续** | 桌面开始任务，在飞书继续提问、补充要求或停止当前任务 |
 | **项目与历史会话选择** | 用 `/project`、`/session` 找到本机项目和任务，随时切换 |
-| **清楚的运行状态** | 在工作台查看历史和最近进度，在飞书接收进度与结果卡片 |
+| **清楚的运行状态** | 在工作台查看历史和最近进度；飞书处理进度默认开启 |
 | **完成后通知手机** | 明确说“做完飞书通知我”，或开启桌面任务自动通知，支持长任务阈值 |
-| **指定成品发送** | 让 Codex 把选定的图片或文件发到飞书，不自动发送修改过的源码 |
+| **指定成品发送** | 按需将图片、报告等成品发到飞书 |
 | **沿用本机 Codex** | 使用已有登录、模型配置、项目和 Skills；内置 Skill 与 MCP 自动配置 |
 | **Windows 桌面体验** | 托盘、可选开机启动、文件夹选择、自动保存偏好和卸载清理选项 |
-
-本项目当前专注 **Windows + Codex + 飞书私聊**，不包含任务看板、知识库、多 Agent 编排或其他聊天平台。
 
 ## 开始使用
 
 1. 在 Windows x64 上安装并登录官方 Codex，确认它能独立使用。
-2. 安装 Feishu Codex。安装包发布在 [Releases](https://github.com/xinyu68/feishu-codex/releases)；没有可用安装包时，可按 [源码构建指南](docs/development.md) 生成 `.exe`。
+2. 在 [Releases](https://github.com/xinyu68/feishu-codex/releases/latest) 下载最新的 `Feishu-Codex-版本号-Setup.exe`，双击安装。
 3. 在 [飞书开放平台](https://open.feishu.cn/app) 创建自建应用，启用机器人与长连接事件。完整步骤见 [配置指南](docs/getting-started.md)。
 4. 在应用“设置 → 飞书连接”填入 App ID 和 App Secret，验证成功后自动连接。
 5. 私聊机器人，再在应用中允许自己的账号。通过 `/project` 和 `/session` 选择要继续的工作。
@@ -113,8 +112,6 @@ npm run package:win
 
 欢迎通过 [Issue](https://github.com/xinyu68/feishu-codex/issues) 或 Pull Request 参与，提交前请阅读 [贡献指南](CONTRIBUTING.md)。
 
-## 作者与许可证
-
-**[xinyu68](https://github.com/xinyu68)** · [1693784423@qq.com](mailto:1693784423@qq.com)
+## 许可证与致谢
 
 采用 [MIT License](LICENSE) 开源。感谢 [Codex Channel Bridge](https://github.com/lsiten/codex-channel-bridge) 为飞书适配与 Codex 集成提供参考；相关版权声明保留在许可证中，详见 [NOTICE.md](NOTICE.md)。
