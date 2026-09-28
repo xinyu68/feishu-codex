@@ -1,0 +1,54 @@
+{
+  "name": "feishu-codex",
+  "version": "0.2.17",
+  "private": true,
+  "type": "module",
+  "description": "Continue the same Codex conversation between your Windows desktop and Feishu",
+  "license": "MIT",
+  "author": { "name": "xinyu68", "email": "1693784423@qq.com" },
+  "repository": { "type": "git", "url": "git+https://github.com/xinyu68/feishu-codex.git" },
+  "homepage": "https://github.com/xinyu68/feishu-codex#readme",
+  "bugs": { "url": "https://github.com/xinyu68/feishu-codex/issues" },
+  "keywords": ["codex", "feishu", "lark", "electron", "mcp", "windows"],
+  "main": "desktop/main.mjs",
+  "scripts": {
+    "dev": "tsx src/server.ts",
+    "dev:ui": "vite --host 127.0.0.1",
+    "dev:desktop": "electron .",
+    "build:server": "tsc -p tsconfig.json",
+    "build:ui": "vite build",
+    "build": "npm run build:server && npm run build:ui",
+    "start": "node build/server/server.js",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.ui.json --noEmit",
+    "test": "node --test --import tsx test/*.test.ts test/*.test.mjs",
+    "test:ui": "playwright test",
+    "package:prepare": "node scripts/prepare-desktop-package.mjs",
+    "package:dir": "npm run build && npm run package:prepare && electron-builder --dir --win --x64",
+    "package:win": "npm run build && npm run package:prepare && electron-builder --win nsis --x64"
+  },
+  "engines": {
+    "node": ">=22.13"
+  },
+  "dependencies": {
+    "@larksuiteoapi/node-sdk": "1.72.0",
+    "ws": "8.21.3"
+  },
+  "devDependencies": {
+    "lucide-react": "1.48.0",
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "react-markdown": "10.1.0",
+    "remark-gfm": "4.0.1",
+    "@playwright/test": "1.63.0",
+    "@types/node": "22.19.15",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@types/ws": "8.18.1",
+    "@vitejs/plugin-react": "6.1.1",
+    "electron": "44.4.5",
+    "electron-builder": "26.15.3",
+    "tsx": "4.21.0",
+    "typescript": "5.8.3",
+    "vite": "8.3.1"
+  }
+}

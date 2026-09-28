@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="light">
+  <meta name="theme-color" content="#f6f6f2">
+  <title>Feishu Codex · 本地工作台</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Crect width='40' height='40' rx='12' fill='%232e665b'/%3E%3Cpath d='m11 14 9-5 9 5v12l-9 5-9-5V14Zm0 0 9 6 9-6M20 20v11' fill='none' stroke='%23fff' stroke-width='2' stroke-linejoin='round'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">跳到主要内容</a>
+  <aside class="sidebar" aria-label="主导航">
+    <a class="brand" href="#overview" aria-label="Feishu Codex 首页">
+      <span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 32 32" fill="none"><path d="m7 10 9-5 9 5v12l-9 5-9-5V10Zm0 0 9 6 9-6M16 16v11" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></svg></span>
+      <span>Feishu Codex<small>飞书里的 Codex</small></span>
+    </a>
+    <div class="nav-label">工作空间</div>
+    <nav>
+      <a href="#overview" class="nav-item active" data-nav="overview"><span data-icon="grid"></span>工作台<span class="nav-key">01</span></a>
+      <a href="#settings" class="nav-item" data-nav="settings"><span data-icon="sliders"></span>连接与设置<span class="nav-key">02</span></a>
+      <a href="#activity" class="nav-item" data-nav="activity"><span data-icon="activity"></span>运行记录<span class="nav-key">03</span></a>
+    </nav>
+    <div class="sidebar-bottom">
+      <div class="local-label"><span class="status-dot" id="server-dot"></span>运行在这台电脑</div>
+      <p id="sidebar-version">正在连接本地服务…</p>
+    </div>
+  </aside>
+
+  <main id="main" class="main" tabindex="-1">
+    <div id="service-error" class="notice error-notice" role="alert" hidden><span data-icon="alert"></span><span id="service-error-text"></span><button class="text-button" id="retry-service">重试</button></div>
+
+    <section id="view-overview" class="view" aria-labelledby="overview-title">
+      <header class="page-header">
+        <div><p class="eyebrow">YOUR LOCAL WORKSPACE</p><h1 id="overview-title">工作台<span class="heading-dot">.</span></h1><p class="page-description">从飞书出发，继续你在 Codex 里的工作。</p></div>
+        <button class="button secondary" id="open-preview"><span data-icon="terminal"></span>本地预览</button>
+      </header>
+
+      <section class="connection-card" aria-label="连接状态">
+        <div class="connection-heading"><div><span class="section-kicker">一条连接，随时继续</span><h2>飞书 <span class="muted-arrow">↔</span> Codex</h2></div><span id="connection-badge" class="badge neutral">读取状态中</span></div>
+        <div class="connection-route">
+          <div class="endpoint"><div class="endpoint-icon feishu-icon"><svg viewBox="0 0 32 32" fill="none" aria-hidden="true"><path d="m5 16 12-9-3 9h13L15 25l3-9H5Z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></div><div><h3>飞书机器人</h3><p id="feishu-detail">等待服务状态</p></div></div>
+          <div class="route-line" aria-hidden="true"><span></span><i></i><span></span></div>
+          <div class="endpoint"><div class="endpoint-icon codex-icon"><span data-icon="terminal"></span></div><div><h3>本机 Codex</h3><p id="codex-detail">等待服务状态</p></div></div>
+        </div>
+        <div class="connection-footer"><p id="connection-detail">正在读取连接信息…</p><button id="connection-toggle" class="button small secondary" disabled>请稍候</button></div>
+      </section>
+
+      <div class="metrics" aria-label="运行概况">
+        <div><span class="metric-label">今日收到消息</span><strong id="metric-messages">—</strong><span class="metric-foot">飞书与本机预览</span></div>
+        <div><span class="metric-label">累计完成轮次</span><strong id="metric-turns">—</strong><span class="metric-foot">每一次提问与回答</span></div>
+        <div><span class="metric-label">接入的飞书对话</span><strong id="metric-conversations">—</strong><span class="metric-foot" id="metric-busy">等待读取</span></div>
+      </div>
+
+      <section id="pending-overview-section" class="section pending-section" hidden><div class="section-heading"><div><h2>等待授权</h2><p>允许你的飞书账号使用这台电脑上的 Codex。</p></div><span class="badge amber" id="pending-count"></span></div><div id="pending-overview"></div></section>
+      <section id="requests-section" class="section" hidden><div class="section-heading"><div><h2>需要你的回复</h2><p>处理后，Codex 会继续当前会话。</p></div></div><div id="requests-list"></div></section>
+
+      <section class="section" aria-labelledby="conversations-title">
+        <div class="section-heading"><div class="heading-with-count"><h2 id="conversations-title">进行中的对话</h2><span id="conversation-count" class="count">0</span></div><span class="subtle-text">项目与会话，在这里接续</span></div>
+        <div id="conversations-list" class="conversations-list"><div class="loading-state"><span class="spinner"></span>正在读取会话…</div></div>
+      </section>
+
+      <section class="commands-strip" aria-label="飞书快捷命令"><div><span data-icon="command"></span><span>点击复制，在飞书使用</span></div><div class="command-chips"><button type="button" data-copy-command="/project" title="切换工作项目" aria-label="复制 /project，切换工作项目"><code>/project</code></button><button type="button" data-copy-command="/session" title="切换历史会话" aria-label="复制 /session，切换历史会话"><code>/session</code></button><button type="button" data-copy-command="/new" title="新建会话" aria-label="复制 /new，新建会话"><code>/new</code></button><button type="button" data-copy-command="/stop" title="停止当前回复" aria-label="复制 /stop，停止当前回复"><code>/stop</code></button><button type="button" data-copy-command="/model" title="选择模型" aria-label="复制 /model，选择模型"><code>/model</code></button><button type="button" data-copy-command="/help" title="查看帮助" aria-label="复制 /help，查看帮助"><code>/help</code></button></div></section>
+      <footer class="page-footer"><span>让连接保持简单，让工作继续。</span><a href="#activity">查看运行记录 <span aria-hidden="true">↗</span></a></footer>
+    </section>
+
+    <section id="view-settings" class="view" aria-labelledby="settings-title" hidden>
+      <header class="page-header"><div><p class="eyebrow">MAKE IT YOURS</p><h1 id="settings-title">连接与设置<span class="heading-dot">.</span></h1><p class="page-description">连接一个机器人，就能随时回到你的工作。</p></div><span id="settings-status" class="badge neutral">尚未读取</span></header>
+      <form id="settings-form" class="settings-form">
+        <section class="settings-section"><div class="settings-intro"><span class="section-number">01</span><h2>飞书应用</h2><p>使用飞书自建应用的机器人能力，通过长连接接收消息。</p><a href="https://open.feishu.cn/app" target="_blank" rel="noreferrer">打开飞书开发者后台 ↗</a></div><div class="settings-fields"><label for="app-id">App ID</label><input id="app-id" name="appId" placeholder="cli_…" autocomplete="off" spellcheck="false"><label for="app-secret">App Secret <span id="secret-status" class="field-tag"></span></label><div class="input-with-icon"><input id="app-secret" name="appSecret" type="password" placeholder="输入应用密钥" autocomplete="new-password" spellcheck="false"><span data-icon="key"></span></div><p class="field-help">已保存的密钥不会回显；留空保留当前密钥。</p></div></section>
+        <section class="settings-section"><div class="settings-intro"><span class="section-number">02</span><h2>默认工作环境</h2><p>新对话从这里开始，也可以随时在飞书里切换。</p></div><div class="settings-fields"><label for="workspace">默认项目目录</label><div class="input-button-group"><input id="workspace" name="defaultWorkspace" placeholder="例如 D:\Projects\my-project" spellcheck="false"><button class="button secondary" type="button" id="choose-default-project">选择项目</button></div><div class="field-pair"><div><label for="model">默认模型</label><select id="model" name="model"><option value="">跟随 Codex 默认</option></select></div><div><label for="effort">思考深度</label><select id="effort" name="effort"><option value="">跟随模型默认</option><option value="low">低</option><option value="medium">中</option><option value="high">高</option><option value="xhigh">很高</option></select></div></div><label class="switch-row" for="progress"><span><strong>向飞书发送进度</strong><small>展示 Codex 工作过程中的简短进展。</small></span><input id="progress" name="progress" type="checkbox" role="switch"><span class="switch" aria-hidden="true"></span></label><div class="environment-note"><span data-icon="monitor"></span>当前 Windows 用户 · 本机完整访问</div></div></section>
+        <section class="settings-section"><div class="settings-intro"><span class="section-number">03</span><h2>谁可以使用</h2><p>只接受已授权账号的消息。第一次向机器人发消息后，账号会出现在待授权列表。</p></div><div class="settings-fields"><label for="allowed-actors">已授权的飞书账号</label><textarea id="allowed-actors" name="allowedActors" rows="3" placeholder="ou_…&#10;每行一个飞书 Open ID" spellcheck="false"></textarea><p class="field-help">每行填写一个账号 Open ID，删除该行即可撤销授权。</p><div id="settings-pending"></div></div></section>
+        <div class="settings-save"><p id="settings-save-note">更改保存后生效。</p><button class="button primary" type="submit" id="save-settings"><span data-icon="check"></span>保存设置</button></div>
+      </form>
+    </section>
+
+    <section id="view-activity" class="view" aria-labelledby="activity-title" hidden>
+      <header class="page-header"><div><p class="eyebrow">BEHIND THE CONVERSATION</p><h1 id="activity-title">运行记录<span class="heading-dot">.</span></h1><p class="page-description">连接、消息和会话的每一个关键状态。</p></div><span class="live-label"><span class="status-dot"></span>每 3 秒更新</span></header>
+      <div class="activity-toolbar"><div class="filter-tabs" role="group" aria-label="日志等级"><button class="active" data-log-level="all" type="button">全部</button><button data-log-level="error" type="button">错误</button><button data-log-level="warn" type="button">提醒</button></div><label class="search-input"><span data-icon="search"></span><input type="search" id="log-search" aria-label="搜索运行记录" placeholder="搜索记录…"></label></div>
+      <div id="logs-list" class="logs-list"><div class="loading-state"><span class="spinner"></span>正在读取记录…</div></div><p class="activity-footnote" id="logs-footnote"></p>
+    </section>
+  </main>
+
+  <dialog id="picker-dialog" class="picker-dialog" aria-labelledby="picker-title"><div class="dialog-header"><div><p class="eyebrow" id="picker-eyebrow">WORKSPACE</p><h2 id="picker-title">选择项目</h2><p id="picker-description"></p></div><button class="icon-button" type="button" data-close="picker-dialog" aria-label="关闭选择窗口"><span data-icon="close"></span></button></div><label class="picker-search search-input"><span data-icon="search"></span><input type="search" id="picker-search" placeholder="搜索名称或路径…" aria-label="搜索项目或会话" autocomplete="off"></label><div id="picker-list" class="picker-list"></div><form id="manual-workspace-form" class="manual-workspace"><label for="manual-workspace">或者输入本机项目目录</label><div class="input-button-group"><input id="manual-workspace" placeholder="D:\Projects\my-project" spellcheck="false" required><button class="button primary small" type="submit">使用目录</button></div></form></dialog>
+
+  <dialog id="history-dialog" class="history-dialog" aria-labelledby="history-title"><div class="history-header"><div><p class="eyebrow" id="history-eyebrow">CONVERSATION</p><h2 id="history-title">对话记录</h2><p id="history-workspace"></p></div><button class="icon-button" type="button" data-close="history-dialog" aria-label="关闭对话窗口"><span data-icon="close"></span></button></div><div class="history-toolbar"><button class="button small secondary" id="history-project"><span data-icon="folder"></span>切换项目</button><button class="button small secondary" id="history-session"><span data-icon="messages"></span>切换会话</button><button class="button small ghost" id="history-new"><span data-icon="plus"></span>新会话</button><button class="button small danger" id="history-stop" hidden><span data-icon="stop"></span>停止</button></div><div id="history-messages" class="history-messages" aria-live="polite"></div><div id="history-status" class="history-status" hidden><span class="spinner"></span><span>Codex 正在处理…</span></div><form id="preview-form" class="preview-form"><label class="sr-only" for="preview-input">发送给本机 Codex</label><textarea id="preview-input" rows="2" placeholder="给 Codex 一条消息…" required></textarea><div class="composer-footer"><span>Enter 发送 · Shift + Enter 换行</span><button class="button primary small" type="submit" id="preview-send"><span data-icon="arrow-up"></span>发送</button></div></form><div id="history-readonly" class="history-readonly" hidden><span data-icon="messages"></span>在飞书中发送消息，回复会在这里同步。</div></dialog>
+
+  <div id="toast-region" class="toast-region" role="status" aria-live="polite"></div>
+</body>
+</html>

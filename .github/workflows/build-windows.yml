@@ -1,0 +1,42 @@
+name: Build Windows installer
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  installer:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run package:win
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+      - name: Create checksum
+        shell: pwsh
+        run: |
+          $lines = Get-ChildItem release -Filter '*-Setup.exe' | ForEach-Object {
+            $hash = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $($_.Name)"
+          }
+          $lines | Set-Content -LiteralPath release/SHA256SUMS.txt -Encoding utf8NoBOM
+      - uses: actions/upload-artifact@v7
+        with:
+          name: Feishu-Codex-Windows-x64
+          path: |
+            release/*-Setup.exe
+            release/SHA256SUMS.txt
+          retention-days: 14
+          if-no-files-found: error

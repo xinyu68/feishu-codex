@@ -1,0 +1,43 @@
+appId: local.feishu-codex.desktop
+productName: Feishu Codex
+copyright: Copyright © 2026 xinyu68
+directories:
+  output: release
+files:
+  - desktop/**
+  - package.json
+  - '!node_modules/**'
+extraResources:
+  - from: .desktop-package/product
+    to: product
+  # The directory copier excludes a source-root node_modules directory.
+  # Copy its contents explicitly so the external Node runtime can resolve them.
+  - from: .desktop-package/product/node_modules
+    to: product/node_modules
+    filter:
+      - '**/*'
+  - from: .desktop-package/node
+    to: node
+afterPack: scripts/verify-desktop-package.mjs
+asar: true
+npmRebuild: false
+win:
+  target: nsis
+  icon: desktop/assets/icon.ico
+  artifactName: Feishu-Codex-${version}-Setup.${ext}
+  requestedExecutionLevel: asInvoker
+  signAndEditExecutable: true
+nsis:
+  include: scripts/nsis-uninstall.nsh
+  oneClick: false
+  perMachine: false
+  allowElevation: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: Feishu Codex
+  runAfterFinish: true
+  deleteAppDataOnUninstall: false
+  installerLanguages:
+    - zh_CN
+  language: '2052'
