@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { randomUUID } from 'node:crypto';
+import { clearTimeout as clearRealTimeout, setTimeout as setRealTimeout } from 'node:timers';
 import { Bridge } from '../src/bridge.js';
 import { Store } from '../src/store.js';
 import { conversationKey, namespaceMessage } from '../src/routing.js';
@@ -11,6 +12,16 @@ import type { CodexRunInput, CodexRuntime, MessageCard, RuntimeEvent } from '../
 
 const tick = () => new Promise<void>(resolve => setImmediate(resolve));
 function deferred() { let resolve!: () => void; const promise = new Promise<void>(done => { resolve = done; }); return { promise, resolve }; }
+async function bounded<T>(promise: Promise<T>, label: string, timeoutMs = 5_000): Promise<T> {
+  let timer: ReturnType<typeof setRealTimeout> | undefined;
+  try {
+    return await Promise.race([promise, new Promise<never>((_, reject) => {
+      timer = setRealTimeout(() => reject(new Error(`Timed out waiting for ${label}`)), timeoutMs);
+    })]);
+  } finally {
+    if (timer) clearRealTimeout(timer);
+  }
+}
 function fixture(t: test.TestContext) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'group-routing-regression-'));
   const store = new Store(dir);
@@ -19,6 +30,8 @@ function fixture(t: test.TestContext) {
   const sent: Array<{ chatId: string; card?: MessageCard; file?: string }> = [];
   const runs: CodexRunInput[] = [];
   const stops: string[] = [];
+  const gates: ReturnType<typeof deferred>[] = [];
+  const gate = () => { const value = deferred(); gates.push(value); return value; };
   let listener: ((event: RuntimeEvent) => void) | undefined;
   let available = true;
   let runner: CodexRuntime['run'] = async input => {
@@ -48,8 +61,13 @@ function fixture(t: test.TestContext) {
   const send = (botId: string, text: string, actorId = 'ou_one', chatId = 'oc_team') => bridge.receive(namespaceMessage(botId, { id: randomUUID(), chatId, chatType: 'group', actorId, text }));
   const emit = (event: RuntimeEvent) => listener?.(event);
   const settle = async () => { for (let i = 0; i < 100 && bridge.hasActiveWork(); i++) await new Promise(resolve => setTimeout(resolve, 2)); assert.equal(bridge.hasActiveWork(), false); };
-  t.after(async () => { await bridge.close(); assert.equal(path.dirname(dir), os.tmpdir()); assert.ok(path.basename(dir).startsWith('group-routing-regression-')); fs.rmSync(dir, { recursive: true, force: true }); });
-  return { dir, store, bridge, sent, runs, stops, send, emit, settle, runWith(fn: typeof runner) { runner = fn; }, filesWith(fn: typeof sendFile) { sendFile = fn; }, available(value: boolean) { available = value; }, onClose(fn: typeof closeRuntime) { closeRuntime = fn; } };
+  t.after(async () => {
+    for (const value of gates) value.resolve();
+    await bounded(bridge.close(), 'bridge fixture cleanup');
+    assert.equal(path.dirname(dir), os.tmpdir()); assert.ok(path.basename(dir).startsWith('group-routing-regression-'));
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+  return { dir, store, bridge, sent, runs, stops, send, emit, settle, gate, runWith(fn: typeof runner) { runner = fn; }, filesWith(fn: typeof sendFile) { sendFile = fn; }, available(value: boolean) { available = value; }, onClose(fn: typeof closeRuntime) { closeRuntime = fn; } };
 }
 
 test('public context is scoped to the group even when both groups share a workspace', async t => {
@@ -102,21 +120,33 @@ test('registered offline files keep their original bot and group after the curre
   assert.deepEqual(h.sent.filter(item => item.file).map(item => item.chatId), [route]);
 });
 
-test('revoking group authorization during an upload prevents subsequent files and the summary card', async t => {
+for (const throughAlias of [false, true]) test(`revoking group authorization during an upload prevents subsequent files and the summary card${throughAlias ? ' through a noncanonical directory alias' : ''}`, async t => {
   const h = fixture(t);
   await h.send('dev', '准备文件');
   const route = conversationKey('dev', 'oc_team');
   const threadId = h.store.conversation(route).threadId!;
-  const files = ['one.txt', 'two.txt'].map(name => { const file = path.join(h.dir, name); fs.writeFileSync(file, name); return file; });
-  const first = deferred();
-  const release = deferred();
+  const fileDir = path.join(h.dir, 'files'); fs.mkdirSync(fileDir);
+  const files = ['one.txt', 'two.txt'].map(name => { const file = path.join(fileDir, name); fs.writeFileSync(file, name); return fs.realpathSync(file); });
+  let requestPaths = files;
+  if (throughAlias) {
+    const aliasDir = path.join(h.dir, 'files-alias');
+    fs.symlinkSync(fileDir, aliasDir, process.platform === 'win32' ? 'junction' : 'dir');
+    requestPaths = files.map(file => path.join(aliasDir, path.basename(file)));
+    assert.notEqual(requestPaths[0], files[0]);
+    assert.deepEqual(requestPaths.map(file => fs.realpathSync(file)), files);
+  }
+  const first = h.gate();
+  const release = h.gate();
   h.filesWith(async (chatId, file) => { h.sent.push({ chatId, file }); if (file === files[0]) { first.resolve(); await release.promise; } return randomUUID(); });
-  h.emit({ method: 'item/completed', threadId, turnId: 'desktop-artifact-revoke', params: { item: {
-    id: 'files-revoke', type: 'mcpToolCall', server: 'feishu_completion', tool: 'send_artifact_to_feishu', status: 'completed', arguments: { paths: files },
-  } } });
-  await first.promise;
-  h.store.authorizeGroup('dev', 'oc_team', false);
-  release.resolve();
+  try {
+    h.emit({ method: 'item/completed', threadId, turnId: 'desktop-artifact-revoke', params: { item: {
+      id: 'files-revoke', type: 'mcpToolCall', server: 'feishu_completion', tool: 'send_artifact_to_feishu', status: 'completed', arguments: { paths: requestPaths },
+    } } });
+    await bounded(first.promise, 'the first file upload');
+    h.store.authorizeGroup('dev', 'oc_team', false);
+  } finally {
+    release.resolve();
+  }
   await h.settle();
   assert.deepEqual(h.sent.filter(item => item.file).map(item => item.file), [files[0]]);
   assert.equal(h.sent.some(item => item.card?.title.includes('成品')), false);
@@ -124,7 +154,7 @@ test('revoking group authorization during an upload prevents subsequent files an
 
 test('a new group thread waits for the previous thread in that same chat to release the project', async t => {
   const h = fixture(t);
-  const finished = deferred();
+  const finished = h.gate();
   h.runWith(async input => {
     const number = h.runs.length; const threadId = input.threadId || `thread-${number}`;
     input.onThread?.(threadId);
@@ -135,31 +165,34 @@ test('a new group thread waits for the previous thread in that same chat to rele
   await h.bridge.newConversation('oc_team');
   const second = h.send('default', '新任务'); await tick();
   try { assert.equal(h.runs.length, 1); }
-  finally { finished.resolve(); await Promise.all([first, second]); }
+  finally { finished.resolve(); await bounded(Promise.all([first, second]), 'both group threads'); }
   assert.equal(h.runs.length, 2);
 });
 
 test('stopping an actor only cancels requests for the chosen bot', async t => {
-  const h = fixture(t); const done = deferred();
+  const h = fixture(t); const done = h.gate();
   h.runWith(async input => { const threadId = input.threadId || `thread-${h.runs.length}`; input.onThread?.(threadId); await done.promise; return { threadId, text: '完成' }; });
   const first = h.send('default', '产品执行'); await tick();
   const second = h.send('dev', '开发等待'); await tick();
-  h.store.authorize('ou_one', false, 'dev');
-  await h.bridge.stopActor('ou_one', 'dev');
-  await second;
-  assert.equal(h.stops.includes('thread-1'), false);
-  assert.equal(h.runs.length, 1);
-  done.resolve(); await first;
+  try {
+    h.store.authorize('ou_one', false, 'dev');
+    await bounded(h.bridge.stopActor('ou_one', 'dev'), 'the actor cancellation');
+    await bounded(second, 'the cancelled group request');
+    assert.equal(h.stops.includes('thread-1'), false);
+    assert.equal(h.runs.length, 1);
+  } finally {
+    done.resolve(); await bounded(Promise.all([first, second]), 'the group requests after cancellation');
+  }
 });
 
 test('closing cancels a waiting group request without starting it after the active runtime exits', async t => {
-  const h = fixture(t); const done = deferred();
+  const h = fixture(t); const done = h.gate();
   h.onClose(async () => { done.resolve(); });
   h.runWith(async input => { input.onThread?.('thread-active'); await done.promise; return { threadId: 'thread-active', text: '已关闭' }; });
   const first = h.send('default', '执行'); await tick();
   const second = h.send('dev', '等待'); await tick();
-  await h.bridge.close();
-  await Promise.all([first, second]);
+  await bounded(h.bridge.close(), 'bridge shutdown');
+  await bounded(Promise.all([first, second]), 'the group requests after shutdown');
   assert.equal(h.runs.length, 1);
   assert.equal(h.bridge.hasActiveWork(), false);
 });
