@@ -2,9 +2,9 @@ import { useEffect, useRef, useState } from 'react';
 import { ApiError, errorMessage, request } from './api';
 import type { Config } from './types';
 
-export type ConfigPatch = Partial<Pick<Config, 'appId' | 'defaultWorkspace' | 'model' | 'effort' | 'progress' | 'autoNotifyDesktop' | 'desktopNotificationMode' | 'desktopNotificationMinMinutes'> & { appSecret: string }>;
+export type ConfigPatch = Partial<Pick<Config, 'defaultWorkspace' | 'progress' | 'autoNotifyDesktop' | 'desktopNotificationMode' | 'desktopNotificationMinMinutes' | 'desktopNotificationTarget'>>;
 type Key = keyof ConfigPatch;
-type Job = { patch: ConfigPatch; revision: number; route: string; method: string; resolve: (saved: boolean) => void };
+type Job = { patch: ConfigPatch; revision: number; resolve: (saved: boolean) => void };
 type Feedback = { phase: 'idle' | 'saving' | 'saved' | 'error'; error?: string };
 
 // Kept in App so saves and failed drafts survive navigation away from Settings.
@@ -36,7 +36,7 @@ export function useConfigAutosave(onSaved: (config: Config) => void) {
       const keys = Object.keys(job.patch) as Key[];
       let saved = false;
       try {
-        const result = await request<{ config: Config }>(job.route, job.patch, job.method);
+        const result = await request<{ config: Config }>('/api/config', job.patch, 'PUT');
         commit.current(result.config);
         for (const key of keys) {
           if (revisions.current.get(key) !== job.revision) continue;
@@ -47,7 +47,7 @@ export function useConfigAutosave(onSaved: (config: Config) => void) {
       } catch (caught) {
         const message = caught instanceof ApiError && caught.status === 0
           ? '保存结果尚未确认，请检查本机连接后重试。'
-          : `${job.route === '/api/credentials' ? '验证或连接失败' : '自动保存失败'}：${errorMessage(caught)}`;
+          : `自动保存失败：${errorMessage(caught)}`;
         for (const key of keys) {
           if (revisions.current.get(key) === job.revision) failed.current.set(key, message);
         }
@@ -60,7 +60,7 @@ export function useConfigAutosave(onSaved: (config: Config) => void) {
     setFeedback(error ? { phase: 'error', error } : { phase: 'saved' });
   }
 
-  function enqueue(patch: ConfigPatch, route: string, method: string): Promise<boolean> {
+  function save(patch: ConfigPatch): Promise<boolean> {
     const keys = Object.keys(patch) as Key[];
     if (!keys.length) return Promise.resolve(true);
     const revision = ++sequence.current;
@@ -72,26 +72,18 @@ export function useConfigAutosave(onSaved: (config: Config) => void) {
     setDraft({ ...pendingDraft.current });
     setFeedback({ phase: 'saving', error: failureMessage() });
     return new Promise(resolve => {
-      queue.current.push({ patch, revision, route, method, resolve });
+      queue.current.push({ patch, revision, resolve });
       void drain();
     });
   }
 
-  const save = (patch: ConfigPatch) => enqueue(patch, '/api/config', 'PUT');
-  const saveCredentials = (patch: Pick<ConfigPatch, 'appId' | 'appSecret'>) => enqueue(patch, '/api/credentials', 'POST');
-
   async function retry() {
     const keys = [...failed.current.keys()];
-    const configKeys = keys.filter(key => key !== 'appId' && key !== 'appSecret');
-    const credentialKeys = keys.filter(key => key === 'appId' || key === 'appSecret');
-    const configPatch = Object.fromEntries(configKeys.map(key => [key, pendingDraft.current[key]])) as ConfigPatch;
-    const credentialPatch = Object.fromEntries(credentialKeys.map(key => [key, pendingDraft.current[key]])) as Pick<ConfigPatch, 'appId' | 'appSecret'>;
-    const configSaved = configKeys.length ? await save(configPatch) : true;
-    const credentialsSaved = credentialKeys.length ? await saveCredentials(credentialPatch) : true;
-    return configSaved && credentialsSaved;
+    const patch = Object.fromEntries(keys.map(key => [key, pendingDraft.current[key]])) as ConfigPatch;
+    return keys.length ? save(patch) : true;
   }
 
-  return { draft, feedback, save, saveCredentials, retry };
+  return { draft, feedback, save, retry };
 }
 
 export type ConfigAutosave = ReturnType<typeof useConfigAutosave>;

@@ -104,13 +104,14 @@ test('login startup and close behavior are editable; old Codex icon row is remov
   expect(await page.evaluate(() => ({ outer: document.documentElement.scrollHeight > innerHeight, settings: document.querySelector('.application-settings')!.scrollHeight > document.querySelector('.application-settings')!.clientHeight }))).toEqual({ outer: false, settings: false });
 });
 
-test('Feishu settings link and help describe the current behavior', async ({ page }) => {
+test('bot connection link and help describe the current behavior', async ({ page }) => {
   await page.setViewportSize({ width: 1024, height: 680 });
   await fixture(page);
-  await page.getByRole('button', { name: '设置', exact: true }).click();
+  await page.getByRole('button', { name: '机器人', exact: true }).click();
+  await page.getByRole('tab', { name: '连接设置', exact: true }).click();
   const link = page.getByRole('link', { name: /飞书开发者后台/ });
   await expect(link).toHaveAttribute('href', 'https://open.feishu.cn/app');
-  expect(await page.evaluate(() => ({ outer: document.documentElement.scrollHeight > innerHeight, settings: document.querySelector('.settings-content')!.scrollHeight > document.querySelector('.settings-content')!.clientHeight }))).toEqual({ outer: false, settings: false });
+  expect(await page.evaluate(() => ({ x: document.documentElement.scrollWidth > innerWidth, y: document.documentElement.scrollHeight > innerHeight }))).toEqual({ x: false, y: false });
   await page.getByRole('button', { name: '使用帮助' }).click();
   const help = page.getByRole('dialog', { name: '如何使用' });
   await expect(help).toContainText('/usage 套餐余量');
@@ -127,7 +128,7 @@ test('browser workbench does not offer a native startup setting', async ({ page 
 test('desktop folder picker saves the selected workspace and ignores cancellation', async ({ page }) => {
   await fixture(page);
   await page.getByRole('button', { name: '设置', exact: true }).click();
-  await page.getByRole('button', { name: 'Codex 偏好', exact: true }).click();
+  await page.getByRole('button', { name: '对话与通知', exact: true }).click();
   await expect(page.getByRole('textbox', { name: '本机项目目录' })).toHaveCount(0);
   await page.getByRole('button', { name: '选择文件夹' }).click();
   await expect(page.locator('.workspace-folder-path')).toHaveText('D:\\fixture\\selected');
@@ -152,7 +153,7 @@ test('independent desktop offers one connect action; cancelled native confirmati
   await fixture(page, { ...ready, state: 'paused', canWrite: false, desktop: { mode: 'independent' } });
   await expect(page.getByText('Codex 已打开，但尚未连接飞书', { exact: true })).toBeVisible();
   await expect(page.locator('.capability-status')).toHaveText('Codex 未接入飞书，飞书发送已暂停');
-  await expect(page.locator('textarea')).toBeDisabled();
+  await expect(page.getByRole('textbox', { name: '发送给 Codex 的消息', exact: true })).toBeDisabled();
   await page.evaluate(() => (window as unknown as { cancelNativeSwitch: () => void }).cancelNativeSwitch());
   await page.locator('.desktop-guidance').getByRole('button', { name: '连接飞书', exact: true }).click();
   await expect(page.getByText('Codex 已打开，但尚未连接飞书', { exact: true })).toBeVisible();
@@ -165,7 +166,7 @@ test('independent desktop offers one connect action; cancelled native confirmati
   await page.evaluate(value => (window as unknown as { updateNative: (value: DesktopStatus) => void }).updateNative(value), { ...ready, desktop: { mode: 'shared' } });
   await expect(page.locator('.desktop-guidance')).toHaveCount(0);
   await expect(page.locator('.capability-status')).toHaveText('飞书与桌面可共同操作');
-  await expect(page.locator('textarea')).toBeEnabled();
+  await expect(page.getByRole('textbox', { name: '发送给 Codex 的消息', exact: true })).toBeEnabled();
   expect(await page.evaluate(() => ({ x: document.documentElement.scrollWidth > innerWidth, y: document.documentElement.scrollHeight > innerHeight }))).toEqual({ x: false, y: false });
 });
 

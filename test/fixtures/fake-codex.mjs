@@ -33,7 +33,7 @@ lines.on('line', line => {
   const message = JSON.parse(line);
   fs.appendFileSync(trace, `${JSON.stringify(message)}\n`);
   const params = message.params ?? {};
-  if (message.method === 'initialize') response(message.id, { userAgent: 'fake-codex/1', codexHome: process.env.CODEX_HOME });
+  if (message.method === 'initialize') response(message.id, { userAgent: scenario === 'channel-context' ? 'feishu_codex/0.158.0-alpha.2.1 (Windows 10.0.26100; x86_64)' : 'fake-codex/1', codexHome: process.env.CODEX_HOME });
   else if (message.method === 'thread/start' || message.method === 'thread/resume') {
     if (scenario === 'busy') { write({ id: message.id, error: { code: -32000, message: 'thread writer lock held by another process' } }); return; }
     if (scenario === 'active-writer') { write({ id: message.id, error: { code: -32000, message: 'Cannot resume thread: it already has an active writer' } }); return; }

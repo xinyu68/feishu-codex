@@ -8,7 +8,7 @@ export class ApiError extends Error {
   constructor(message: string, readonly status: number) { super(message); }
 }
 export async function request<T>(route: string, body?: Record<string, unknown>, method = 'POST'): Promise<T> {
-  if (isDemo) return demoRequest(route, body) as Promise<T>;
+  if (isDemo) return demoRequest(route, body, method) as Promise<T>;
   let response: Response;
   try {
     response = await fetch(route, {

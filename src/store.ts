@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import crypto from 'node:crypto';
-import type { ArtifactDelivery, BotProfile, BridgeConfig, ChatMessage, CompletionNotification, Conversation, GroupMessage, InboundMessage, LogEntry, Operation } from './types.js';
+import type { ArtifactDelivery, BotProfile, BridgeConfig, ChatMessage, CompletionNotification, Conversation, DesktopNotificationTargetOption, GroupMessage, InboundMessage, LogEntry, Operation } from './types.js';
 import { conversationKey, DEFAULT_BOT_ID, parseRoute } from './routing.js';
 import { normalizeGroupWorkspace, planGroupContext, type GroupContextPlan } from './group-context.js';
 
@@ -42,7 +42,7 @@ export class Store {
     this.config = readJson(path.join(dir, 'config.json'), {
       appId: '', appSecret: '', enabled: false, allowedActors: [],
       defaultWorkspace: process.cwd(), model: '', effort: '', progress: true, autoNotifyDesktop: false,
-      desktopNotificationMode: 'all', desktopNotificationMinMinutes: 1
+      desktopNotificationMode: 'all', desktopNotificationMinMinutes: 1, includeGroupContext: true, privateRoleInstructions: ''
     } satisfies BridgeConfig);
     this.state = readJson(path.join(dir, 'state.json'), {
       version: 1, conversations: {}, history: {}, pendingActors: [], seen: {},
@@ -60,17 +60,23 @@ export class Store {
     this.state.notifications ??= {};
     this.state.artifacts ??= {};
     for (const artifact of Object.values(this.state.artifacts)) if (artifact.status === 'sending') artifact.status = 'uncertain';
+    if (this.initializeNotificationTarget()) this.atomicWrite('config.json', this.config);
   }
   saveConfig(patch: Partial<BridgeConfig>): void {
     const previousApps = new Map(this.bots().map(bot => [bot.id, bot.appId]));
     this.config = { ...this.config, ...patch };
     let identitiesChanged = false;
     for (const [botId, appId] of previousApps) if (this.bot(botId)?.appId !== appId) identitiesChanged = this.clearBotIdentities(botId) || identitiesChanged;
+    this.initializeNotificationTarget();
     this.atomicWrite('config.json', this.config);
     if (identitiesChanged) this.atomicWrite('state.json', this.state);
     this.emit();
   }
-  save(): void { this.atomicWrite('state.json', this.state); this.emit(); }
+  save(): void {
+    this.atomicWrite('state.json', this.state);
+    if (this.initializeNotificationTarget()) this.atomicWrite('config.json', this.config);
+    this.emit();
+  }
   subscribe(listener: () => void): () => void { this.listeners.add(listener); return () => this.listeners.delete(listener); }
   private emit(): void { for (const listener of this.listeners) { try { listener(); } catch { /* Persistence must not depend on a UI subscriber. */ } } }
   publicConfig() {
@@ -203,10 +209,12 @@ export class Store {
     fs.renameSync(temporary, target);
   }
 
-  bots(): BotProfile[] {
-    return [{ id: DEFAULT_BOT_ID, name: this.config.botName || 'Codex', appId: this.config.appId, appSecret: this.config.appSecret,
-      enabled: this.config.enabled, allowedActors: this.config.allowedActors, allowedGroups: this.config.allowedGroups ?? [],
-      roleInstructions: this.config.roleInstructions ?? '', model: this.config.model, effort: this.config.effort }, ...(this.config.bots ?? [])];
+  bots(config = this.config): BotProfile[] {
+    return [{ id: DEFAULT_BOT_ID, name: config.botName || 'Codex', appId: config.appId, appSecret: config.appSecret,
+      enabled: config.enabled, allowedActors: config.allowedActors, allowedGroups: config.allowedGroups ?? [],
+      roleInstructions: config.roleInstructions ?? '', privateRoleInstructions: config.privateRoleInstructions ?? '', model: config.model, effort: config.effort,
+      includeGroupContext: config.includeGroupContext ?? true },
+      ...(config.bots ?? []).map(bot => ({ ...bot, privateRoleInstructions: bot.privateRoleInstructions ?? '', includeGroupContext: bot.includeGroupContext ?? true }))];
   }
   bot(id = DEFAULT_BOT_ID): BotProfile | undefined { return this.bots().find(bot => bot.id === id); }
   botForChat(chatId: string): BotProfile | undefined { return this.bot(parseRoute(chatId).botId); }
@@ -214,12 +222,15 @@ export class Store {
   saveBot(id: string, patch: Partial<BotProfile>): void {
     const previous = this.bot(id);
     const next: BotProfile = { name: 'Codex', appId: '', appSecret: '', enabled: false, allowedActors: [], allowedGroups: [],
-      roleInstructions: '', model: '', effort: '', ...previous, ...patch, id };
+      roleInstructions: '', privateRoleInstructions: '', model: '', effort: '', ...previous, ...patch, id };
+    next.includeGroupContext ??= true;
+    next.privateRoleInstructions ??= '';
     if (!/^[a-zA-Z0-9_-]{1,80}$/.test(id)) throw new Error('无效的机器人编号');
     if (next.appId && this.bots().some(bot => bot.id !== id && bot.appId === next.appId)) throw new Error('这个飞书应用已经配置过，每个应用只能连接一次');
     if (id === DEFAULT_BOT_ID) {
       this.saveConfig({ botName: next.name, appId: next.appId, appSecret: next.appSecret, enabled: next.enabled,
-        allowedActors: next.allowedActors, allowedGroups: next.allowedGroups, roleInstructions: next.roleInstructions, model: next.model, effort: next.effort });
+        allowedActors: next.allowedActors, allowedGroups: next.allowedGroups, roleInstructions: next.roleInstructions, privateRoleInstructions: next.privateRoleInstructions, model: next.model, effort: next.effort,
+        includeGroupContext: next.includeGroupContext });
     } else this.saveConfig({ bots: [...(this.config.bots ?? []).filter(bot => bot.id !== id), next] });
   }
   removeBot(id: string): void {
@@ -248,14 +259,15 @@ export class Store {
     const previous = this.state.threadBindings[conversation.threadId];
     this.state.threadBindings[conversation.threadId] = { chatId: conversation.chatId, actorId: conversation.actorId, cwd: conversation.cwd,
       chatType: this.isGroup(conversation.chatId) ? 'group' : 'p2p',
-      roleManaged: previous?.roleManaged || roleInstructions !== undefined,
-      roleInstructions: previous?.roleInstructions ?? roleInstructions,
+      // An existing snapshot also pins the absence of a role, including native threads.
+      roleManaged: previous ? previous.roleManaged : roleInstructions !== undefined,
+      roleInstructions: previous ? previous.roleInstructions : roleInstructions,
       ...(previous?.groupHandoffPolicyVersion !== undefined ? { groupHandoffPolicyVersion: previous.groupHandoffPolicyVersion } : {}) };
   }
-  isGroup(chatId: string): boolean {
+  isGroup(chatId: string, config = this.config): boolean {
     const route = parseRoute(chatId);
     return this.state.conversations[chatId]?.chatType === 'group'
-      || this.bot(route.botId)?.allowedGroups.includes(route.id) === true
+      || this.bots(config).find(bot => bot.id === route.botId)?.allowedGroups.includes(route.id) === true
       || this.state.pendingGroups.some(group => group.botId === route.botId && group.chatId === route.id);
   }
   isAuthorized(chatId: string, actorId: string, chatType?: 'p2p' | 'group'): boolean {
@@ -316,7 +328,8 @@ export class Store {
   planGroupContext(message: InboundMessage, cwd: string, threadId?: string): GroupContextPlan {
     if (!this.isGroup(message.chatId) || !this.isAuthorized(message.chatId, message.actorId)) return { text: '', seen: {} };
     const known = threadId ? this.state.groupContextReceipts[this.groupContextKey(message.chatId, cwd, threadId)]?.seen : undefined;
-    return planGroupContext(this.state.groupMessages[parseRoute(message.chatId).id] ?? [], message, cwd, known, threadId);
+    return planGroupContext(this.state.groupMessages[parseRoute(message.chatId).id] ?? [], message, cwd, known, threadId,
+      this.botForChat(message.chatId)?.includeGroupContext ?? true);
   }
   groupContext(message: InboundMessage, cwd: string, threadId?: string): string {
     return this.planGroupContext(message, cwd, threadId).text;
@@ -419,6 +432,28 @@ export class Store {
       else delete this.state.groupActorIdentities[groupId];
     }
     return changed;
+  }
+  /** Known private recipients remain selectable during a temporary connection outage. */
+  notificationTargets(config = this.config): DesktopNotificationTargetOption[] {
+    const bots = new Map(this.bots(config).map(bot => [bot.id, bot]));
+    return Object.values(this.state.conversations).flatMap(conversation => {
+      const route = parseRoute(conversation.chatId);
+      const bot = bots.get(route.botId);
+      if (!/^oc_[\w-]+$/.test(route.id) || conversationKey(route.botId, route.id) !== conversation.chatId
+        || !/^ou_[\w-]+$/.test(conversation.actorId) || this.isGroup(conversation.chatId, config)
+        || !bot?.appId.trim() || !bot.appSecret.trim() || !bot.allowedActors.includes(conversation.actorId)) return [];
+      return [{ chatId: conversation.chatId, actorId: conversation.actorId, botAppId: bot.appId, botId: bot.id, botName: bot.name }];
+    });
+  }
+  private initializeNotificationTarget(): boolean {
+    // A saved choice, including an explicit clear or a now-invalid recipient,
+    // must never be replaced when another robot or authorization is added.
+    if (this.config.desktopNotificationTarget !== undefined) return false;
+    const candidates = this.notificationTargets();
+    if (candidates.length !== 1) return false;
+    const { chatId, actorId, botAppId } = candidates[0]!;
+    this.config.desktopNotificationTarget = { chatId, actorId, botAppId };
+    return true;
   }
 }
 

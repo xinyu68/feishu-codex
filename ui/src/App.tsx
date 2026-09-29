@@ -1,9 +1,10 @@
+import { Select } from './Select';
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import { Activity, ArrowDown, ArrowUp, Check, ChevronDown, ChevronRight, CircleHelp, Code2, Copy, ExternalLink, Folder, LoaderCircle, MessageSquare, Monitor, MoreHorizontal, Plus, RefreshCw, Search, Settings2, ShieldCheck, Square, Terminal, Unplug, Wifi, X } from 'lucide-react';
+import { Activity, ArrowDown, ArrowUp, Bot, Check, ChevronDown, ChevronRight, CircleHelp, Code2, Copy, ExternalLink, Folder, LoaderCircle, MessageSquare, Monitor, MoreHorizontal, Plus, RefreshCw, Search, Settings2, Square, Terminal, Wifi, X } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { errorMessage, getHistory, getProjects, getSessions, getState, isDemo, request } from './api';
-import type { AppState, Config, Conversation, DesktopAction, DesktopPreferences, DesktopResult, DesktopStatus, Message, PendingRequest, Project, Session } from './types';
+import type { AppState, Config, Conversation, DesktopAction, DesktopNotificationTarget, DesktopPreferences, DesktopResult, DesktopStatus, Message, NotificationTarget, PendingRequest, Project, Session } from './types';
 import { useConfigAutosave, type ConfigAutosave, type ConfigPatch } from './useConfigAutosave';
 import { BotManager, botsFromState } from './BotManager';
 
@@ -79,7 +80,8 @@ export function App() {
   const [state, setState] = useState<AppState>();
   const configSave = useConfigAutosave(config => setState(previous => previous ? { ...previous, config } : previous));
   const [desktop, setDesktop] = useState<DesktopStatus>();
-  const [page, setPage] = useState<'chat' | 'settings'>(() => new URLSearchParams(window.location.search).get('setup') === 'feishu' ? 'settings' : 'chat');
+  const [page, setPage] = useState<'chat' | 'bots' | 'settings'>(() => new URLSearchParams(window.location.search).get('setup') === 'feishu' ? 'bots' : 'chat');
+  const [notificationBotFocus, setNotificationBotFocus] = useState<{ id: string }>();
   const firstStateSeen = useRef(false);
   const [projects, setProjects] = useState<Project[]>([]);
   const [sessions, setSessions] = useState<Session[]>([]);
@@ -140,7 +142,12 @@ export function App() {
       setState(next); setOffline(false); setEpoch((value) => value + 1);
       if (!firstStateSeen.current) {
         firstStateSeen.current = true;
-        if (!isDemo && !next.config.appId && !next.config.hasSecret) setPage('settings');
+        if (!isDemo) {
+          const configured = botsFromState(next).filter(bot => bot.appId && bot.hasSecret);
+          const needsAccess = !next.conversations.some(item => item.chatId !== 'local-preview')
+            && (next.pendingActors.length > 0 || Boolean(next.pendingGroups?.length) || configured.every(bot => !bot.allowedActors.length));
+          if (!configured.length || needsAccess) setPage('bots');
+        }
       }
       setError((previous) => previous === '暂时无法连接本机服务，正在尝试恢复。' ? '' : previous);
       if (next.runtime && !window.feishuCodex) setDesktop(next.runtime);
@@ -340,13 +347,14 @@ export function App() {
       <div className="rail-brand" title="Feishu Codex"><Brand /></div>
       <div className="rail-items">
         <button className={`rail-button ${page === 'chat' ? 'selected' : ''}`} onClick={() => setPage('chat')} title="对话"><MessageSquare size={21} /><span>对话</span></button>
-        <button className={`rail-button ${page === 'settings' ? 'selected' : ''}`} onClick={() => setPage('settings')} title="设置"><Settings2 size={21} /><span>设置</span>{Boolean(state && (state.pendingActors.length + (state.pendingGroups?.length || 0))) && <i className="notification-dot" />}</button>
+        <button className={`rail-button ${page === 'bots' ? 'selected' : ''}`} onClick={() => setPage('bots')} title="机器人"><Bot size={21} /><span>机器人</span>{Boolean(state && (state.pendingActors.length + (state.pendingGroups?.length || 0))) && <i className="notification-dot" />}</button>
+        <button className={`rail-button ${page === 'settings' ? 'selected' : ''}`} onClick={() => setPage('settings')} title="设置"><Settings2 size={21} /><span>设置</span></button>
       </div>
       <div className="rail-bottom"><IconButton title="使用帮助" onClick={() => setHelpOpen(true)}><CircleHelp size={20} /></IconButton><span className="rail-version">{isDemo ? '演示' : 'FC'}</span></div>
     </nav>
 
     <div className="workspace">
-      <header className="app-header"><div className="wordmark">Feishu <strong>Codex</strong><span className="wordmark-divider" /><span className="app-section">{page === 'chat' ? '对话工作台' : '偏好设置'}</span></div>
+      <header className="app-header"><div className="wordmark">Feishu <strong>Codex</strong><span className="wordmark-divider" /><span className="app-section">{page === 'chat' ? '对话工作台' : page === 'bots' ? '机器人管理' : '偏好设置'}</span></div>
         <div className="header-status"><span className="connection-pill" title={state ? globalConnection(state).detail || '飞书消息连接状态' : '正在启动'}><StatusDot good={state && globalConnection(state).status === 'connected'} busy={state && globalConnection(state).status === 'connecting'} />{state ? globalConnectionLabel(state) : '正在启动'}</span><button className="subtle-button status-trigger" onClick={() => setLogsOpen(true)} title="查看运行状态和日志"><Activity size={15} /><span>{state?.codex.available ? 'Codex 可用' : offline ? '正在重连' : '连接 Codex 中'}</span></button></div>
       </header>
 
@@ -358,8 +366,15 @@ export function App() {
         : desktop?.launch?.state === 'error' ? <div className="notice-bar warning desktop-guidance"><span>{desktop.launch.message || 'Codex 尚未打开，可以重试。'}</span><button disabled={Boolean(action)} onClick={() => void desktopAction(canOpenDesktop ? 'openCodex' : 'retry')}>{canOpenDesktop ? '重试打开' : '重试连接'}</button></div>
         : desktop?.canWrite === false && <div className="notice-bar warning"><span>{String(desktop.reason || '当前暂不能发送消息，请查看连接状态。')}</span><button onClick={() => setLogsOpen(true)}>查看状态<ChevronRight size={14} /></button></div>}
 
+      {state && <div className="robot-page-slot" hidden={page !== 'bots'}><BotManager state={state} action={action} perform={perform} refresh={refresh} configSave={configSave} focusBot={notificationBotFocus} /></div>}
       {!state ? <div className="startup"><Brand /><h1>{offline ? '正在恢复连接' : '正在准备工作台'}</h1><p>{offline ? '连接恢复后可继续使用。' : '正在读取项目、任务和飞书连接状态…'}</p><button className="secondary-button" onClick={() => { void desktopAction('retry'); void refresh(); }}><RefreshCw size={15} />重新连接</button></div>
-        : page === 'settings' ? <Settings state={state} configSave={configSave} desktop={desktop} action={action} perform={perform} desktopAction={desktopAction} openLogs={() => setLogsOpen(true)} />
+        : page === 'bots' ? null
+        : page === 'settings' ? <Settings state={state} configSave={configSave} openBots={() => {
+          const target = configSave.draft.desktopNotificationTarget !== undefined ? configSave.draft.desktopNotificationTarget : state.config.desktopNotificationTarget;
+          const bot = target && botsFromState(state).find(item => item.appId === target.botAppId);
+          if (bot) setNotificationBotFocus({ id: bot.id });
+          setPage('bots');
+        }} desktop={desktop} action={action} perform={perform} desktopAction={desktopAction} openLogs={() => setLogsOpen(true)} />
         : <main className="workbench">
           <aside className="task-sidebar">
             <div className="sidebar-heading"><span className="eyebrow">工作空间</span><IconButton title="刷新项目与任务" disabled={Boolean(action)} onClick={() => void refreshLists()}><RefreshCw size={14} /></IconButton></div>
@@ -377,7 +392,7 @@ export function App() {
               {!visibleSessions.length && search && <div className="small-empty">没有匹配的任务</div>}
               {!sessionsLoading && !sessions.length && threadId && <div className="small-empty">这里会显示当前项目的历史任务</div>}
             </div>
-            <div className="binding-footer"><span className="small-icon"><Wifi size={15} /></span><div><strong>{active ? conversationLabel(active, state) : '本地工作区'}</strong>{state.conversations.length > 1 ? <select aria-label="飞书对话" value={chatId} onChange={(event) => setChatId(event.target.value)}>{state.conversations.map((item) => <option key={item.chatId} value={item.chatId}>{conversationLabel(item, state)}</option>)}</select> : <small>{chatId === 'local-preview' ? '连接飞书后即可双端使用' : '选择的项目与任务同步到飞书'}</small>}</div><StatusDot good={chatId !== 'local-preview'} /></div>
+            <div className="binding-footer"><span className="small-icon"><Wifi size={15} /></span><div><strong>{active ? conversationLabel(active, state) : '本地工作区'}</strong>{state.conversations.length > 1 ? <Select aria-label="飞书对话" value={chatId} onChange={(event) => setChatId(event.target.value)}>{state.conversations.map((item) => <option key={item.chatId} value={item.chatId}>{conversationLabel(item, state)}</option>)}</Select> : <small>{chatId === 'local-preview' ? '连接飞书后即可双端使用' : '选择的项目与任务同步到飞书'}</small>}</div><StatusDot good={chatId !== 'local-preview'} /></div>
           </aside>
 
           <section className="conversation-pane" aria-label="当前任务">
@@ -402,7 +417,7 @@ export function App() {
     </div>
     {toast && <div className="toast" role="status"><Check size={16} />{toast}</div>}
     {logsOpen && <div className="overlay" onMouseDown={(event) => { if (event.target === event.currentTarget) setLogsOpen(false); }}><aside className="logs-drawer" aria-label="运行状态和日志"><div className="drawer-title"><div><span className="eyebrow">DIAGNOSTICS</span><h2>运行状态与日志</h2></div><IconButton title="关闭日志" onClick={() => setLogsOpen(false)}><X size={20} /></IconButton></div><div className="runtime-overview"><StatusRow label="Codex 后台" value={state?.codex.available ? '已就绪' : '未连接'} good={state?.codex.available} /><StatusRow label="飞书消息" value={state ? globalConnectionLabel(state) : '等待连接'} good={state && globalConnection(state).status === 'connected'} /><StatusRow label="桌面运行模式" value={desktopModeLabel(desktop)} good={desktop?.desktop?.mode === 'shared'} />{Boolean(desktop?.reason || desktop?.error) && <p className="runtime-detail">{String(desktop?.reason || desktop?.error)}</p>}<div className="row-buttons"><button className="secondary-button" onClick={() => void desktopAction('retry')}><RefreshCw size={14} />重试连接</button><button className="secondary-button" onClick={() => void desktopAction('openLogs')}><Folder size={14} />日志目录</button></div></div><div className="log-heading"><span>最近事件</span><span>{state?.logs.length || 0} 条</span></div><div className="log-list">{state?.logs.map((entry) => <div key={entry.id} className={`log-entry ${entry.level}`}><span>{shortTime(entry.at)}</span><p>{entry.text}</p></div>)}{!state?.logs.length && <div className="small-empty">还没有运行日志</div>}</div><div className="drawer-footer">日志只保存在本机。应用密钥不会在这里展示。</div></aside></div>}
-    {helpOpen && <div className="overlay modal-overlay" onMouseDown={(event) => { if (event.target === event.currentTarget) setHelpOpen(false); }}><div className="help-dialog" role="dialog" aria-modal="true" aria-label="如何使用"><div className="drawer-title"><h2>飞书与 Codex，随时接续</h2><IconButton title="关闭帮助" onClick={() => setHelpOpen(false)}><X size={20} /></IconButton></div><p>连接飞书机器人后，在这里或飞书选择项目与会话，就能接着同一项工作。</p><div className="help-item"><span>01</span><div><strong>先连接飞书</strong><p>在“设置 → 飞书连接”填写应用凭据并允许自己的账号。每个机器人使用独立飞书应用，可在这里添加多个机器人。</p></div></div><div className="help-item"><span>02</span><div><strong>选择项目和会话</strong><p>先选择机器人与聊天，再选择项目和会话。每个机器人在每个聊天中保存独立上下文，桌面切换标签不会改变飞书绑定。</p></div></div><div className="help-item"><span>@</span><div><strong>在群里协作</strong><p>把机器人加入同一个群，在群里 @ 它，再到设置允许该群及操作账号。只有手动 @ 才触发工作；引用消息可明确交接内容。同群机器人共用项目、各自保留会话；同项目的机器人任务会排队执行。</p></div></div><div className="help-item"><span>03</span><div><strong>控制通知与运行</strong><p>桌面任务可在“Codex 偏好”开启完成通知，或单次说“做完飞书通知我”。开机自启和关闭窗口方式在“应用与运行”设置。</p></div></div><div className="help-commands"><strong>飞书快捷命令</strong><p>/project 项目　/session 会话　/new 新建<br />/stop 停止　/model 模型　/effort 推理强度<br />/usage 套餐余量　/status 当前状态　/help 帮助</p></div><button className="primary-button full-width" onClick={() => setHelpOpen(false)}>开始使用</button></div></div>}
+    {helpOpen && <div className="overlay modal-overlay" onMouseDown={(event) => { if (event.target === event.currentTarget) setHelpOpen(false); }}><div className="help-dialog" role="dialog" aria-modal="true" aria-label="如何使用"><div className="drawer-title"><h2>飞书与 Codex，随时接续</h2><IconButton title="关闭帮助" onClick={() => setHelpOpen(false)}><X size={20} /></IconButton></div><p>连接飞书机器人后，在这里或飞书选择项目与会话，就能接着同一项工作。</p><div className="help-item"><span>01</span><div><strong>先连接飞书</strong><p>打开“机器人”连接飞书应用，再到“访问权限”允许自己的账号。每个机器人使用独立的飞书应用。</p></div></div><div className="help-item"><span>02</span><div><strong>选择项目和会话</strong><p>先选择机器人与聊天，再选择项目和会话。每个机器人在每个聊天中保存独立上下文，桌面切换标签不会改变飞书绑定。</p></div></div><div className="help-item"><span>@</span><div><strong>在群里协作</strong><p>把机器人加入同一个群，在群里 @ 它，再到“机器人 → 访问权限”允许该群及操作账号。手动 @ 分配工作；引用消息可明确交接内容。同群机器人共用项目、各自保留会话；同项目的机器人任务会排队执行。</p></div></div><div className="help-item"><span>03</span><div><strong>控制通知与运行</strong><p>桌面任务可在“对话与通知”开启完成通知，或单次说“做完飞书通知我”。开机自启和关闭窗口方式在“应用与运行”设置。</p></div></div><div className="help-commands"><strong>飞书快捷命令</strong><p>/project 项目　/session 会话　/new 新建<br />/stop 停止　/model 模型　/effort 推理强度<br />/usage 套餐余量　/status 当前状态　/help 帮助</p></div><button className="primary-button full-width" onClick={() => setHelpOpen(false)}>开始使用</button></div></div>}
   </div>;
 }
 
@@ -427,29 +442,14 @@ function QuestionCard({ request: pending, disabled, answer }: { request: Pending
 }
 
 type Perform = (name: string, operation: () => Promise<unknown>, success?: string) => Promise<void>;
-function Settings({ state, configSave, desktop, action, perform, desktopAction, openLogs }: { state: AppState; configSave: ConfigAutosave; desktop?: DesktopStatus; action: string; perform: Perform; desktopAction: (method: DesktopAction) => Promise<void>; openLogs: () => void }) {
-  const [tab, setTab] = useState<'connection' | 'defaults' | 'application'>('connection');
+function Settings({ state, configSave, openBots, desktop, action, perform, desktopAction, openLogs }: { state: AppState; configSave: ConfigAutosave; openBots: () => void; desktop?: DesktopStatus; action: string; perform: Perform; desktopAction: (method: DesktopAction) => Promise<void>; openLogs: () => void }) {
+  const [tab, setTab] = useState<'defaults' | 'application'>('defaults');
   const [form, setForm] = useState<Config>({ ...state.config, ...configSave.draft });
-  useEffect(() => {
-    setForm(previous => ({ ...previous, model: configSave.draft.model ?? state.config.model, effort: configSave.draft.effort ?? state.config.effort }));
-  }, [state.config.model, state.config.effort, configSave.draft.model, configSave.draft.effort]);
+  const notificationTarget = configSave.draft.desktopNotificationTarget !== undefined
+    ? configSave.draft.desktopNotificationTarget : state.config.desktopNotificationTarget;
+
   const [notificationMinutes, setNotificationMinutes] = useState(String(configSave.draft.desktopNotificationMinMinutes ?? state.config.desktopNotificationMinMinutes ?? 1));
   const [notificationMinutesError, setNotificationMinutesError] = useState('');
-  const [secret, setSecret] = useState(configSave.draft.appSecret || '');
-  const [credentialsHint, setCredentialsHint] = useState('');
-  const [credentialSaving, setCredentialSaving] = useState(false);
-  const credentials = useRef({ appId: form.appId, secret });
-  credentials.current = { appId: form.appId, secret };
-  const credentialSave = useRef<{ appId: string; secret: string; promise: Promise<boolean> } | undefined>(undefined);
-  const previousSecretDraft = useRef(configSave.draft.appSecret);
-  useEffect(() => {
-    const previous = previousSecretDraft.current;
-    previousSecretDraft.current = configSave.draft.appSecret;
-    if (previous && configSave.draft.appSecret === undefined && form.appId.trim() === state.config.appId && state.config.hasSecret) {
-      setSecret(value => value.trim() === previous ? '' : value);
-    }
-  }, [configSave.draft.appSecret, form.appId, state.config.appId, state.config.hasSecret]);
-  const [models, setModels] = useState<{ id: string; name: string; efforts: string[]; defaultEffort: string }[]>([]);
   const [preferences, setPreferences] = useState<DesktopPreferences>();
   const [preferencesError, setPreferencesError] = useState('');
   const [workspacePicking, setWorkspacePicking] = useState(false);
@@ -464,7 +464,6 @@ function Settings({ state, configSave, desktop, action, perform, desktopAction, 
     const value = await window.feishuCodex!.setPreferences({ ...preferences, ...patch });
     setPreferences(value); setPreferencesError('');
   }, success);
-  useEffect(() => { if (tab === 'defaults') void request<{ models: typeof models }>('/api/models').then((value) => setModels(value.models)).catch(() => {}); }, [tab]);
   const savePreference = (patch: ConfigPatch) => {
     setForm(previous => ({ ...previous, ...patch }));
     void configSave.save(patch);
@@ -491,43 +490,27 @@ function Settings({ state, configSave, desktop, action, perform, desktopAction, 
     setNotificationMinutes(String(minutes));
     if (minutes !== state.config.desktopNotificationMinMinutes || configSave.draft.desktopNotificationMinMinutes !== undefined) savePreference({ desktopNotificationMinMinutes: minutes });
   };
-  const saveCredentials = (): Promise<boolean> => {
-    const appId = credentials.current.appId.trim();
-    const appSecret = credentials.current.secret.trim();
-    if (!appId) { setCredentialsHint('填好 App ID 和 App Secret 后会自动保存。'); return Promise.resolve(false); }
-    if (!/^cli_[a-zA-Z0-9]+$/.test(appId)) { setCredentialsHint('App ID 应为 cli_ 开头的字母和数字。'); return Promise.resolve(false); }
-    if ((appId !== state.config.appId || !state.config.hasSecret || (configSave.draft.appId !== undefined && configSave.draft.appId !== appId)) && !appSecret) {
-      setCredentialsHint('请填写这个 App ID 对应的 App Secret，两项将一起自动保存。');
-      return Promise.resolve(false);
-    }
-    setCredentialsHint('');
-    const pending = credentialSave.current;
-    if (pending?.appId === appId && pending.secret === appSecret) return pending.promise;
-    if (appId === state.config.appId && !appSecret) return Promise.resolve(true);
-    setCredentialSaving(true);
-    const promise = configSave.saveCredentials({ appId, appSecret });
-    credentialSave.current = { appId, secret: appSecret, promise };
-    void promise.then(saved => {
-      if (saved && credentials.current.appId.trim() === appId && credentials.current.secret.trim() === appSecret) setSecret('');
-      if (credentialSave.current?.promise === promise) credentialSave.current = undefined;
-    }).finally(() => setCredentialSaving(false));
-    return promise;
-  };
   const busy = Boolean(action);
-  const credentialsEdited = form.appId.trim() !== state.config.appId || Boolean(secret.trim()) || !state.config.hasSecret;
-  return <main className="settings-page"><aside className="settings-nav"><span className="eyebrow">偏好设置</span><h1>按你的方式连接</h1><p>管理连接、访问权限和应用偏好。</p><button className={tab === 'connection' ? 'active' : ''} onClick={() => setTab('connection')}><Wifi size={17} />飞书连接{state.pendingActors.length + (state.pendingGroups?.length || 0) > 0 && <span className="count-badge">{state.pendingActors.length + (state.pendingGroups?.length || 0)}</span>}</button><button className={tab === 'defaults' ? 'active' : ''} onClick={() => setTab('defaults')}><Code2 size={17} />Codex 偏好</button><button className={tab === 'application' ? 'active' : ''} onClick={() => setTab('application')}><Monitor size={17} />应用与运行</button><div className={`settings-save-status ${configSave.feedback.phase}`} role="status" aria-live="polite">{configSave.feedback.phase === 'saving' ? <><LoaderCircle size={13} className="spin" />正在保存…</> : configSave.feedback.phase === 'saved' ? <><Check size={13} />已保存</> : configSave.feedback.phase === 'error' ? '尚未保存，请重试' : '修改后自动保存'}</div></aside><div className={`settings-content ${tab === 'application' ? 'application-settings' : tab === 'defaults' ? 'defaults-settings' : ''}`}>
-    {tab === 'connection' && <><div className="settings-title"><span className="section-icon"><Wifi size={21} /></span><div><h2>飞书连接</h2><p>连接飞书机器人，私聊接续工作，群聊按角色协作。</p></div></div><BotManager state={state} action={action} perform={perform} defaultCredentials={<section className="settings-section"><div className="section-heading"><h3>应用凭据</h3><span className="inline-status"><StatusDot good={state.connection.status === 'connected'} />{connectionLabel[state.connection.status]}</span></div><div className="form-grid credential-fields" onBlur={(event) => { if (!event.currentTarget.contains(event.relatedTarget)) void saveCredentials(); }}><label className="field-label">App ID<input disabled={credentialSaving} value={form.appId} placeholder="cli_…" autoComplete="off" spellCheck={false} onChange={(event) => { setForm({ ...form, appId: event.target.value }); setCredentialsHint(''); }} /></label><label className="field-label">App Secret<span className="field-hint">{state.config.hasSecret ? '已保存，留空保留现有密钥' : '只保存在本机'}</span><input disabled={credentialSaving} value={secret} type="password" placeholder={state.config.hasSecret ? '••••••••••••••••' : '填写应用密钥'} autoComplete="new-password" onChange={(event) => { setSecret(event.target.value); setCredentialsHint(''); }} /></label></div><p className="section-description">{credentialSaving ? "正在验证并连接…" : "离开输入框后自动验证并连接。"}</p><a className="settings-external-link" href="https://open.feishu.cn/app" target="_blank" rel="noopener noreferrer">飞书开发者后台：open.feishu.cn/app<ExternalLink size={12} /></a>{credentialsHint && <p className="field-error" role="alert">{credentialsHint}</p>}<div className="settings-action-row"><button className="secondary-button" disabled={busy || credentialSaving || !form.appId.trim() || (!secret.trim() && !state.config.hasSecret)} onClick={() => { if (credentialsEdited) { void saveCredentials(); return; } void perform('connection', () => request('/api/connection', { enabled: state.connection.status !== 'connected' && state.connection.status !== 'connecting' })); }}>{credentialsEdited || (state.connection.status !== 'connected' && state.connection.status !== 'connecting') ? <Wifi size={14} /> : <Unplug size={14} />}{credentialsEdited ? '验证并连接' : state.connection.status === 'connected' || state.connection.status === 'connecting' ? '断开连接' : '连接飞书'}</button></div>{state.connection.detail && <p className="field-error">{state.connection.detail}</p>}</section>} /></>}
-    {tab === 'defaults' && <><div className="settings-title"><span className="section-icon"><Code2 size={22} /></span><div><h2>Codex 偏好</h2><p>没有单独指定时，新的任务会使用这些设置。</p></div></div><section className="settings-section"><h3>默认工作空间</h3>{window.feishuCodex?.chooseWorkspace && !isDemo ? <div className="field-label">本机项目目录<div className="workspace-folder-picker"><span className="workspace-folder-path" title={form.defaultWorkspace || '尚未选择文件夹'}>{form.defaultWorkspace || '尚未选择文件夹'}</span><button className="secondary-button" type="button" disabled={workspacePicking} onClick={() => void chooseWorkspace()}><Folder size={14} />{workspacePicking ? '正在选择…' : '选择文件夹'}</button></div>{workspaceError && <p className="field-error" role="alert">{workspaceError}</p>}</div> : <label className="field-label">本机项目目录<input value={form.defaultWorkspace} placeholder="D:\\projectdemo\\my-project" onChange={(event) => setForm({ ...form, defaultWorkspace: event.target.value })} onBlur={(event) => { const defaultWorkspace = event.target.value.trim(); if (defaultWorkspace !== state.config.defaultWorkspace || configSave.draft.defaultWorkspace !== undefined) savePreference({ defaultWorkspace }); }} onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.blur(); }} /></label>}<p className="section-description">历史项目会自动发现。默认目录用于尚未选择项目的新对话。</p></section><section className="settings-section"><h3>模型与思考</h3><div className="form-grid"><label className="field-label">默认模型<select value={form.model} onChange={(event) => { const model = models.find((item) => item.id === event.target.value); savePreference({ model: event.target.value, effort: model?.defaultEffort || '' }); }}><option value="">使用 Codex 默认模型</option>{form.model && !models.some((item) => item.id === form.model) && <option value={form.model}>{form.model}</option>}{models.map((model) => <option key={model.id} value={model.id}>{model.name}</option>)}</select></label><label className="field-label">思考深度<select value={form.effort} onChange={(event) => savePreference({ effort: event.target.value })}><option value="">使用默认深度</option>{(models.find((item) => item.id === form.model)?.efforts || ['low', 'medium', 'high', 'xhigh']).map((effort) => <option key={effort} value={effort}>{effortLabel(effort)}</option>)}</select></label></div></section><section className="settings-section"><label className="toggle-row"><span><strong>在飞书显示处理进度</strong><small>有中途说明时显示进度，完成后原卡展示结果。</small></span><input type="checkbox" checked={form.progress} onChange={(event) => savePreference({ progress: event.target.checked })} /><span className={`toggle ${form.progress ? 'on' : ''}`} /></label><label className="toggle-row desktop-notification-preference"><span><strong>桌面任务完成后通知飞书</strong><small>{form.autoNotifyDesktop ? "仅通知从本应用打开的 Codex；飞书任务不重复通知。" : "需要时可说“做完飞书通知我”，仅通知本轮。"}</small></span><input type="checkbox" aria-label="桌面任务完成后通知飞书" checked={form.autoNotifyDesktop === true} onChange={(event) => savePreference({ autoNotifyDesktop: event.target.checked })} /><span className={`toggle ${form.autoNotifyDesktop ? 'on' : ''}`} /></label>{form.autoNotifyDesktop && <div className="notification-options"><div className="notification-options-row"><label>通知范围<select aria-label="桌面通知范围" value={form.desktopNotificationMode || 'all'} onChange={(event) => savePreference({ desktopNotificationMode: event.target.value as 'all' | 'long' })}><option value="all">每轮都通知</option><option value="long">仅通知长任务</option></select></label>{form.desktopNotificationMode === 'long' && <label className="notification-duration">耗时超过<input type="number" aria-label="长任务通知阈值（分钟）" min="1" max="1440" step="1" value={notificationMinutes} aria-invalid={Boolean(notificationMinutesError)} aria-describedby="notification-duration-hint" onChange={(event) => { setNotificationMinutes(event.target.value); setNotificationMinutesError(''); }} onBlur={saveNotificationMinutes} onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.blur(); }} />分钟</label>}</div><p id="notification-duration-hint" className="notification-duration-hint">从本轮开始执行到结束计时；明确要求的通知不受时长限制。</p>{form.desktopNotificationMode === 'long' && notificationMinutesError && <p className="field-error" role="alert">{notificationMinutesError}</p>}</div>}</section></>}
+  return <main className="settings-page"><aside className="settings-nav"><span className="eyebrow">偏好设置</span><h1>通用偏好</h1><p>管理对话通知和应用运行方式。</p><button className={tab === 'defaults' ? 'active' : ''} onClick={() => setTab('defaults')}><Code2 size={17} />对话与通知</button><button className={tab === 'application' ? 'active' : ''} onClick={() => setTab('application')}><Monitor size={17} />应用与运行</button><div className={`settings-save-status ${configSave.feedback.phase}`} role="status" aria-live="polite">{configSave.feedback.phase === 'saving' ? <><LoaderCircle size={13} className="spin" />正在保存…</> : configSave.feedback.phase === 'saved' ? <><Check size={13} />已保存</> : configSave.feedback.phase === 'error' ? '尚未保存，请重试' : '修改后自动保存'}</div></aside><div className={`settings-content ${tab === 'application' ? 'application-settings' : tab === 'defaults' ? 'defaults-settings' : ''}`}>
+    {tab === 'defaults' && <><div className="settings-title"><span className="section-icon"><Code2 size={22} /></span><div><h2>对话与通知</h2><p>这些设置对所有机器人生效。模型与角色在各机器人中设置。</p></div></div><section className="settings-section"><h3>默认工作空间</h3>{window.feishuCodex?.chooseWorkspace && !isDemo ? <div className="field-label">本机项目目录<div className="workspace-folder-picker"><span className="workspace-folder-path" title={form.defaultWorkspace || '尚未选择文件夹'}>{form.defaultWorkspace || '尚未选择文件夹'}</span><button className="secondary-button" type="button" disabled={workspacePicking} onClick={() => void chooseWorkspace()}><Folder size={14} />{workspacePicking ? '正在选择…' : '选择文件夹'}</button></div>{workspaceError && <p className="field-error" role="alert">{workspaceError}</p>}</div> : <label className="field-label">本机项目目录<input value={form.defaultWorkspace} placeholder="D:\\projectdemo\\my-project" onChange={(event) => setForm({ ...form, defaultWorkspace: event.target.value })} onBlur={(event) => { const defaultWorkspace = event.target.value.trim(); if (defaultWorkspace !== state.config.defaultWorkspace || configSave.draft.defaultWorkspace !== undefined) savePreference({ defaultWorkspace }); }} onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.blur(); }} /></label>}<p className="section-description">历史项目会自动发现。默认目录用于尚未选择项目的新对话。</p></section><section className="settings-section"><div className="toggle-row"><span><strong>在飞书显示处理进度</strong><small>有中途说明时显示进度，完成后原卡展示结果。</small></span><label className="toggle-control"><input type="checkbox" aria-label="在飞书显示处理进度" checked={form.progress} onChange={(event) => savePreference({ progress: event.target.checked })} /><span aria-hidden="true" className={`toggle ${form.progress ? 'on' : ''}`} /></label></div><div className="toggle-row desktop-notification-preference"><span><strong>桌面任务完成后通知飞书</strong><small>{form.autoNotifyDesktop ? "仅通知从本应用打开的 Codex；飞书任务不重复通知。" : "需要时可说“做完飞书通知我”，仅通知本轮。"}</small></span><label className="toggle-control"><input type="checkbox" aria-label="桌面任务完成后通知飞书" checked={form.autoNotifyDesktop === true} onChange={(event) => savePreference({ autoNotifyDesktop: event.target.checked })} /><span aria-hidden="true" className={`toggle ${form.autoNotifyDesktop ? 'on' : ''}`} /></label></div><NotificationTargetSummary targets={state.notificationTargets || []} value={notificationTarget} pending={configSave.draft.desktopNotificationTarget !== undefined} openBots={openBots} />{form.autoNotifyDesktop && <div className="notification-options"><div className="notification-options-row"><label>通知范围<Select aria-label="桌面通知范围" value={form.desktopNotificationMode || 'all'} onChange={(event) => savePreference({ desktopNotificationMode: event.target.value as 'all' | 'long' })}><option value="all">每轮都通知</option><option value="long">仅通知长任务</option></Select></label>{form.desktopNotificationMode === 'long' && <label className="notification-duration">耗时超过<input type="number" aria-label="长任务通知阈值（分钟）" min="1" max="1440" step="1" value={notificationMinutes} aria-invalid={Boolean(notificationMinutesError)} aria-describedby="notification-duration-hint" onChange={(event) => { setNotificationMinutes(event.target.value); setNotificationMinutesError(''); }} onBlur={saveNotificationMinutes} onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.blur(); }} />分钟</label>}</div><p id="notification-duration-hint" className="notification-duration-hint">从本轮开始执行到结束计时；明确要求的通知不受时长限制。</p>{form.desktopNotificationMode === 'long' && notificationMinutesError && <p className="field-error" role="alert">{notificationMinutesError}</p>}</div>}</section></>}
     {tab === 'application' && <>
       <div className="settings-title"><span className="section-icon"><Monitor size={21} /></span><div><h2>应用与运行</h2><p>打开即连接，关闭窗口时按你的偏好处理。</p></div></div>
       <section className="settings-section"><h3>运行状态</h3><StatusRow label="Codex 服务" value={state.codex.available ? '已就绪' : '未连接'} good={state.codex.available} /><StatusRow label="飞书连接" value={globalConnectionLabel(state)} good={globalConnection(state).status === 'connected'} /><StatusRow label="当前桌面" value={desktopModeLabel(desktop)} good={desktop?.desktop?.mode === 'shared'} /><div className="row-buttons"><button className="secondary-button" disabled={busy} onClick={() => void desktopAction('retry')}><RefreshCw size={14} />重试连接</button><button className="secondary-button" onClick={openLogs}><Terminal size={14} />查看日志</button></div></section>
       <section className="settings-section"><h3>启动与关闭</h3>{window.feishuCodex?.getPreferences && !isDemo ? <div className="launch-preference">
-        <label className="toggle-row"><span><strong>启动应用时同时打开 Codex</strong><small>关闭后仍可在飞书使用 Codex；下次启动生效。</small></span><input type="checkbox" aria-label="启动应用时同时打开 Codex" checked={preferences?.openCodexOnLaunch ?? true} disabled={busy || !preferences} onChange={(event) => void saveDesktopPreferences({ openCodexOnLaunch: event.target.checked }, '启动偏好已保存，下次启动或重新双击应用图标时生效')} /><span className={preferences?.openCodexOnLaunch !== false ? 'toggle on' : 'toggle'} /></label>
-        <label className="toggle-row"><span><strong>开机自动启动</strong><small>登录 Windows 后启动 Feishu Codex；是否打开 Codex 由上方设置决定。</small></span><input type="checkbox" aria-label="开机自动启动" checked={preferences?.openAtLogin ?? false} disabled={busy || !preferences} onChange={(event) => void saveDesktopPreferences({ openAtLogin: event.target.checked }, '开机自启设置已保存')} /><span className={preferences?.openAtLogin ? 'toggle on' : 'toggle'} /></label>
-        <label className="preference-row close-window-preference"><span><strong>点击窗口关闭按钮</strong><small>{preferences?.closeWindowAction === 'quit' ? '退出前会检查运行中的任务。' : '收起到托盘，任务和飞书连接继续运行。'}</small></span><select aria-label="点击窗口关闭按钮" className="preference-select" value={preferences?.closeWindowAction || 'tray'} disabled={busy || !preferences} onChange={(event) => void saveDesktopPreferences({ closeWindowAction: event.target.value as 'tray' | 'quit' }, '关闭窗口方式已保存')}><option value="tray">收起到托盘</option><option value="quit">退出全部服务</option></select></label>
+        <div className="toggle-row"><span><strong>启动应用时同时打开 Codex</strong><small>关闭后仍可在飞书使用 Codex；下次启动生效。</small></span><label className="toggle-control"><input type="checkbox" aria-label="启动应用时同时打开 Codex" checked={preferences?.openCodexOnLaunch ?? true} disabled={busy || !preferences} onChange={(event) => void saveDesktopPreferences({ openCodexOnLaunch: event.target.checked }, '启动偏好已保存，下次启动或重新双击应用图标时生效')} /><span aria-hidden="true" className={preferences?.openCodexOnLaunch !== false ? 'toggle on' : 'toggle'} /></label></div>
+        <div className="toggle-row"><span><strong>开机自动启动</strong><small>登录 Windows 后启动 Feishu Codex；是否打开 Codex 由上方设置决定。</small></span><label className="toggle-control"><input type="checkbox" aria-label="开机自动启动" checked={preferences?.openAtLogin ?? false} disabled={busy || !preferences} onChange={(event) => void saveDesktopPreferences({ openAtLogin: event.target.checked }, '开机自启设置已保存')} /><span aria-hidden="true" className={preferences?.openAtLogin ? 'toggle on' : 'toggle'} /></label></div>
+        <label className="preference-row close-window-preference"><span><strong>点击窗口关闭按钮</strong><small>{preferences?.closeWindowAction === 'quit' ? '退出前会检查运行中的任务。' : '收起到托盘，任务和飞书连接继续运行。'}</small></span><Select aria-label="点击窗口关闭按钮" className="preference-select" value={preferences?.closeWindowAction || 'tray'} disabled={busy || !preferences} onChange={(event) => void saveDesktopPreferences({ closeWindowAction: event.target.value as 'tray' | 'quit' }, '关闭窗口方式已保存')}><option value="tray">收起到托盘</option><option value="quit">退出全部服务</option></Select></label>
         {preferencesError && <p className="field-error">无法读取桌面设置：{preferencesError}</p>}
       </div> : <p className="section-description">启动与关闭设置仅在桌面应用中可用。</p>}</section>
       <section className="settings-section about-section"><Brand small /><div><strong>Feishu Codex</strong><p>版本 {desktop?.shellVersion || state.service.version} · 本机运行</p></div><button className="secondary-button" disabled={busy} onClick={() => void desktopAction('quit')}>退出应用</button></section>
     </>}
   </div></main>;
+}
+
+const notificationTargetKey = (target: DesktopNotificationTarget) => JSON.stringify([target.botAppId, target.chatId, target.actorId]);
+
+function NotificationTargetSummary({ targets, value, pending, openBots }: { targets: NotificationTarget[]; value?: DesktopNotificationTarget | null; pending: boolean; openBots: () => void }) {
+  const selected = value && targets.find(target => notificationTargetKey(target) === notificationTargetKey(value));
+  const label = value && !selected ? '已失效，请重新设置' : selected ? `${selected.botName} · 私聊` : '未指定（唯一私聊时自动选择）';
+  return <div className="notification-target-summary"><div><span>默认通知机器人</span><strong className={value && !selected ? 'unavailable' : ''}>{label}{pending && <small>（尚未保存）</small>}</strong></div><button type="button" className="text-button" onClick={openBots}>管理默认机器人<ChevronRight size={13} /></button></div>;
 }

@@ -5,7 +5,7 @@ const getConfig = async (page: Page) => (await (await page.request.get(`${base}/
 async function defaults(page: Page, url = base) {
   await page.goto(url);
   await page.getByRole('button', { name: '设置', exact: true }).click();
-  await page.getByRole('button', { name: 'Codex 偏好', exact: true }).click();
+  await page.getByRole('button', { name: '对话与通知', exact: true }).click();
 }
 
 test('notification mode and minutes auto-save, retain choices when off and survive reload', async ({ page }) => {

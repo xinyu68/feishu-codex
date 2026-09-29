@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { createInterface } from 'node:readline';
 import { randomUUID } from 'node:crypto';
+import { CHANNEL_INSTRUCTIONS, channelContextParameters } from './channel-context.js';
 import { readTurnTiming } from './turn-timing.js';
 import { isThreadInitializationRace, isThreadWriterConflict, THREAD_WRITER_MESSAGE } from './codex-errors.js';
 import { CodexRpcError, IGNORE_SERVER_REQUEST, WebsocketCodexConnection, validateCodexWebsocketUrl, type CodexConnection } from './codex-websocket.js';
@@ -26,18 +27,20 @@ export type CodexClientOptions = {
 };
 
 const ACCESS_CONFIG = { sandbox_mode: 'danger-full-access', approval_policy: 'never' };
-const CHANNEL_INSTRUCTIONS = '你由 Feishu Codex 本地桥接调用，用户通常通过飞书与你对话。沿用当前会话上下文，按用户要求直接处理工作。渠道是飞书，不是微信。';
 const SNAPSHOT_INITIALIZATION_RETRY_DELAYS_MS = [75, 200, 500, 1_000] as const;
 const WATCH_INITIALIZATION_RETRY_DELAYS_MS = [100, 250, 500, 1_000] as const;
 const WATCH_RECONNECT_DELAY_MS = 2_000;
 const GENERATED_IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp', '.ico', '.tif', '.tiff', '.heic']);
 type GeneratedImageStamp = { size: number; mtimeMs: number };
 
-function threadInstructionOverrides(input: CodexRunInput): { developerInstructions?: string } {
+function threadInstructionOverrides(input: CodexRunInput, channelContextProvided = false): { developerInstructions?: string } {
   // Omitting a role preserves native thread settings. An explicitly empty role
   // removes a previously configured role while retaining the channel guidance.
   if (input.threadId && input.roleInstructions === undefined) return {};
   const role = input.roleInstructions?.trim();
+  // The request-level application context already supplies these rules. Keep only
+  // an explicit role here, leaving native/configured instructions alone otherwise.
+  if (channelContextProvided) return input.roleInstructions === undefined ? {} : { developerInstructions: role ?? '' };
   return { developerInstructions: role ? `${CHANNEL_INSTRUCTIONS}\n\n${role}` : CHANNEL_INSTRUCTIONS };
 }
 
@@ -223,12 +226,14 @@ export class CodexClient implements CodexRuntime {
     connection.onRequest = (method, params) => handleRuntimeRequest(input, method, params);
     try {
       await connection.initialize();
+      const channelContext = channelContextParameters(connection.initialized, input.channel !== undefined);
+      const compactChannelHeader = Boolean(channelContext.additionalContext);
       const response = record(await connection.request(input.threadId ? 'thread/resume' : 'thread/start', {
         ...(input.threadId ? { threadId: input.threadId, excludeTurns: true } : {}),
         cwd: input.cwd,
         ...(input.model ? { model: input.model } : {}),
         sandbox: 'danger-full-access', approvalPolicy: 'never', config: ACCESS_CONFIG,
-        ...threadInstructionOverrides(input),
+        ...threadInstructionOverrides(input, compactChannelHeader),
       }));
       const threadId = string(record(response.thread).id);
       if (!threadId) throw new Error('Codex 没有返回会话编号');
@@ -241,10 +246,10 @@ export class CodexClient implements CodexRuntime {
       run.starting = (async () => {
         if (run.stopRequested) throw new Error('已停止当前任务');
         await input.onBeforeSubmit?.();
-        const prompt = input.preparePrompt ? await input.preparePrompt(threadId) : input.prompt;
+        const prompt = input.preparePrompt ? await input.preparePrompt(threadId, { compactChannelHeader }) : input.prompt;
         if (run.stopRequested) throw new Error('已停止当前任务');
         const turnParams = {
-          threadId, cwd: input.cwd,
+          threadId, cwd: input.cwd, ...channelContext,
           input: [
             { type: 'text', text: prompt, text_elements: [] },
             ...(input.images ?? []).map(image => ({ type: 'localImage', path: image })),
@@ -337,9 +342,11 @@ export class CodexClient implements CodexRuntime {
     };
     try {
       await connection.initialize();
+      const channelContext = channelContextParameters(connection.initialized, input.channel !== undefined);
+      const compactChannelHeader = Boolean(channelContext.additionalContext);
       const response = record(await connection.request(input.threadId ? 'thread/resume' : 'thread/start', input.threadId
-        ? { threadId: input.threadId, excludeTurns: true, ...threadInstructionOverrides(input) }
-        : { cwd: input.cwd, ...(input.model ? { model: input.model } : {}), sandbox: 'danger-full-access', approvalPolicy: 'never', config: ACCESS_CONFIG, ...threadInstructionOverrides(input) }));
+        ? { threadId: input.threadId, excludeTurns: true, ...threadInstructionOverrides(input, compactChannelHeader) }
+        : { cwd: input.cwd, ...(input.model ? { model: input.model } : {}), sandbox: 'danger-full-access', approvalPolicy: 'never', config: ACCESS_CONFIG, ...threadInstructionOverrides(input, compactChannelHeader) }));
       const threadId = string(record(response.thread).id);
       if (!threadId) throw new Error('Codex 没有返回会话编号');
       run.threadId = threadId;
@@ -356,7 +363,7 @@ export class CodexClient implements CodexRuntime {
           await input.onBeforeSubmit?.();
           // Resolve group context inside the submission lock, after the previous
           // start/steer acknowledged exactly which messages reached this thread.
-          const prompt = input.preparePrompt ? await input.preparePrompt(threadId) : input.prompt;
+          const prompt = input.preparePrompt ? await input.preparePrompt(threadId, { compactChannelHeader }) : input.prompt;
           if (run.stopped) throw new Error('已停止当前任务');
           const content = [{ type: 'text', text: prompt, text_elements: [] }, ...(input.images ?? []).map(image => ({ type: 'localImage', path: image }))];
           currentMode = turn ? 'steer' : 'start';
@@ -364,8 +371,8 @@ export class CodexClient implements CodexRuntime {
           input.onSubmitted?.({ threadId, turnId: expectedTurnId || undefined, mode: currentMode, status: 'submitting' });
           mutationPending = true;
           const result = record(await connection.request(turn ? 'turn/steer' : 'turn/start', turn
-            ? { threadId, expectedTurnId, input: content }
-            : { threadId, cwd: input.cwd, input: content, approvalPolicy: 'never', sandboxPolicy: { type: 'dangerFullAccess' }, clientUserMessageId: run.clientId,
+            ? { threadId, expectedTurnId, input: content, ...channelContext }
+            : { threadId, cwd: input.cwd, input: content, ...channelContext, approvalPolicy: 'never', sandboxPolicy: { type: 'dangerFullAccess' }, clientUserMessageId: run.clientId,
                 ...(input.model ? { model: input.model } : {}), ...(input.effort ? { effort: input.effort } : {}) }));
           mutationPending = false;
           const acceptedTurn = record(result.turn);

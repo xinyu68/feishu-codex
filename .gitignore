@@ -10,6 +10,7 @@ release/
 .desktop-package/
 playwright-report/
 test-results/
+task-work/
 
 # Local credentials, runtime state, and development-only records
 .env.*

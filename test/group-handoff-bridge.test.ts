@@ -544,3 +544,21 @@ test('existing role threads migrate once to Skill guidance without replacing the
   assert.deepEqual(h.runThreads, [threadId, threadId, threadId]);
   assert.deepEqual(h.stopped, []);
 });
+
+test('automatic handoff retains source quote and original task when target supplementation is disabled', async t => {
+  const h = setup(t);
+  h.store.saveBot('dev', { includeGroupContext: false });
+  h.store.observeGroup(h.message('dev', 'Unrelated recent discussion must not supplement the handoff'));
+  await h.send('default', '设计并实现验证码登录。');
+  await h.idle();
+  assert.equal(h.runs.length, 2);
+  const target = h.runs[1]!;
+  assert.match(target.prompt, /明确引用[\s\S]*验证码五分钟有效/);
+  assert.match(target.prompt, /交接来源："产品经理"/);
+  assert.match(target.prompt, /原始用户任务："设计并实现验证码登录。"/);
+  assert.equal(cleanBridgeText(target.prompt), '实现上述验证码登录，并验证过期场景。');
+  assert.doesNotMatch(target.prompt, /Unrelated recent discussion|新增群聊/);
+  assert.notEqual(h.runThreads[0], h.runThreads[1]);
+  assert.equal(target.allowSteering, false);
+  assert.equal(h.store.bot('default')!.includeGroupContext, true);
+});

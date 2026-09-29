@@ -261,3 +261,157 @@ test('transport router routes message updates, files and typing to their origina
   assert.equal(router.isAvailable(conversationKey('developer', 'oc_group')), true);
   await router.close();
 });
+
+test('group supplementation APIs persist per bot without reconnecting or changing thread bindings', async t => {
+  const h = await fixture(t);
+  const bot = await h.create();
+  assert.equal(bot.includeGroupContext, true);
+  assert.ok((await h.state()).bots.every((item: any) => item.includeGroupContext === true));
+  const chatId = conversationKey(bot.id, 'oc_existing');
+  h.app.store.conversation(chatId, 'ou_user').threadId = 'existing-thread';
+  const initialStarts = [...h.starts];
+  for (const id of ['default', bot.id]) {
+    const response = await h.request(`/api/bots/${id}`, { includeGroupContext: false }, 'PATCH');
+    assert.equal(response.status, 200);
+    assert.equal((await response.json() as any).bot.includeGroupContext, false);
+    assert.equal(new Store(h.app.store.dir).bot(id)!.includeGroupContext, false);
+    if (id === 'default') assert.equal(h.app.store.bot(bot.id)!.includeGroupContext, true);
+  }
+  assert.equal(h.app.store.config.includeGroupContext, false);
+  assert.equal(h.app.store.state.conversations[chatId]!.threadId, 'existing-thread');
+  assert.deepEqual(h.starts, initialStarts);
+  assert.deepEqual(h.closes, []);
+  assert.deepEqual(h.sends, []);
+  const enabled = await h.request('/api/config', { includeGroupContext: true }, 'PUT');
+  assert.equal(enabled.status, 200);
+  assert.equal((await enabled.json() as any).config.includeGroupContext, true);
+  assert.equal(new Store(h.app.store.dir).bot('default')!.includeGroupContext, true);
+  assert.equal(new Store(h.app.store.dir).bot(bot.id)!.includeGroupContext, false);
+  const created = await h.request('/api/bots', { name: 'Reviewer', appId: otherApp, appSecret: 'test-secret', includeGroupContext: false });
+  assert.equal(created.status, 201);
+  assert.equal((await created.json() as any).bot.includeGroupContext, false);
+});
+
+test('group supplementation only accepts boolean API values for default and additional bots', async t => {
+  const h = await fixture(t);
+  const bot = await h.create();
+  for (const includeGroupContext of ['false', 'true', 0, 1, null, [], {}]) {
+    for (const [endpoint, method] of [
+      ['/api/bots/default', 'PATCH'], [`/api/bots/${bot.id}`, 'PATCH'], ['/api/config', 'PUT'],
+    ]) {
+      const response = await h.request(endpoint!, { includeGroupContext }, method!);
+      assert.equal(response.status, 400, `${endpoint}: ${JSON.stringify(includeGroupContext)}`);
+      assert.match((await response.json() as any).error, /补充群聊背景/);
+    }
+  }
+  assert.ok(h.app.store.publicBots().every(item => item.includeGroupContext === true));
+  assert.equal((await h.request(`/api/bots/${bot.id}`, { name: 'Renamed' }, 'PATCH')).status, 200);
+  assert.equal(h.app.store.bot(bot.id)!.includeGroupContext, true);
+  assert.deepEqual(h.starts, [developerApp]);
+  assert.deepEqual(h.closes, []);
+});
+
+test('private role APIs default empty and persist independently of group roles and other bots', async t => {
+  const h = await fixture(t);
+  const bot = await h.create();
+  const starts = [...h.starts];
+  assert.ok((await h.state()).bots.every((item: any) => item.privateRoleInstructions === ''));
+  for (const [id, role] of [['default', '个人写作助手'], [bot.id, '个人代码助手']]) {
+    const groupRole = h.app.store.bot(id)!.roleInstructions;
+    const response = await h.request(`/api/bots/${id}`, { privateRoleInstructions: `  ${role}  ` }, 'PATCH');
+    assert.equal(response.status, 200);
+    const saved = (await response.json() as any).bot;
+    assert.equal(saved.privateRoleInstructions, role);
+    assert.equal(saved.roleInstructions, groupRole);
+    assert.equal(new Store(h.app.store.dir).bot(id)!.privateRoleInstructions, role);
+  }
+  assert.equal(h.app.store.bot('default')!.privateRoleInstructions, '个人写作助手');
+  assert.equal((await h.request('/api/config', { roleInstructions: '群聊产品经理' }, 'PUT')).status, 200);
+  assert.equal(h.app.store.bot('default')!.privateRoleInstructions, '个人写作助手');
+  assert.equal((await h.request('/api/config', { privateRoleInstructions: '  ' }, 'PUT')).status, 200);
+  assert.equal(h.app.store.bot('default')!.privateRoleInstructions, '');
+  assert.equal(h.app.store.bot('default')!.roleInstructions, '群聊产品经理');
+  assert.equal(h.app.store.bot(bot.id)!.privateRoleInstructions, '个人代码助手');
+  const created = await h.request('/api/bots', {
+    name: '测试', appId: otherApp, appSecret: 'fixture-secret', roleInstructions: '群聊测试', privateRoleInstructions: '私聊教练',
+  });
+  assert.equal(created.status, 201);
+  const newBot = (await created.json() as any).bot;
+  assert.equal(newBot.privateRoleInstructions, '私聊教练');
+  assert.equal(newBot.roleInstructions, '群聊测试');
+  assert.deepEqual(h.starts, [...starts, otherApp]);
+  assert.deepEqual(h.closes, []);
+  assert.deepEqual(h.sends, []);
+});
+
+test('private role APIs reject invalid values without changing saved roles', async t => {
+  const h = await fixture(t);
+  const bot = await h.create();
+  for (const privateRoleInstructions of [null, 0, false, [], {}, 'x'.repeat(12_001)]) {
+    for (const [endpoint, method] of [['/api/bots/default', 'PATCH'], [`/api/bots/${bot.id}`, 'PATCH'], ['/api/config', 'PUT']]) {
+      const response = await h.request(endpoint!, { privateRoleInstructions }, method!);
+      assert.equal(response.status, 400);
+      assert.match((await response.json() as any).error, /私聊角色说明/);
+    }
+  }
+  assert.ok((await h.state()).bots.every((item: any) => item.privateRoleInstructions === ''));
+  assert.equal(h.app.store.bot(bot.id)!.roleInstructions, '你是开发');
+  assert.equal((await h.request(`/api/bots/${bot.id}`, { privateRoleInstructions: 'x'.repeat(12_000) }, 'PATCH')).status, 200);
+});
+
+test('notification target API lists only configured authorized private chats and persists a complete app-scoped selection', async t => {
+  const h = await fixture(t); const bot = await h.create();
+  await h.request('/api/actors', { actorId: 'ou_owner', allow: true });
+  await h.request('/api/actors', { botId: bot.id, actorId: 'ou_reviewer', allow: true });
+  const defaultChat = h.app.store.conversation('oc_default', 'ou_owner', undefined, 'p2p');
+  const botChat = h.app.store.conversation(conversationKey(bot.id, 'oc_review'), 'ou_reviewer', undefined, 'p2p');
+  defaultChat.threadId = 'current-default'; botChat.threadId = 'current-review';
+  h.app.store.conversation('oc_not_allowed', 'ou_other', undefined, 'p2p');
+  h.app.store.conversation('local-preview', 'ou_owner');
+  await h.request('/api/groups', { botId: bot.id, chatId: 'oc_group', allow: true });
+  h.app.store.conversation(conversationKey(bot.id, 'oc_group'), 'ou_reviewer', undefined, 'group');
+  h.app.store.saveBot('unconfigured', { name: 'Unconfigured', allowedActors: ['ou_missing'] });
+  h.app.store.conversation(conversationKey('unconfigured', 'oc_missing'), 'ou_missing', undefined, 'p2p');
+  const state = await h.state();
+  const candidates = state.notificationTargets;
+  assert.equal(candidates.length, 2);
+  assert.deepEqual(candidates.find((item: any) => item.botId === bot.id), {
+    chatId: botChat.chatId, actorId: 'ou_reviewer', botAppId: developerApp, botId: bot.id, botName: bot.name,
+  });
+  const target = { chatId: botChat.chatId, actorId: botChat.actorId, botAppId: developerApp };
+  const starts = [...h.starts];
+  const selected = await h.request('/api/config', { desktopNotificationTarget: target }, 'PUT');
+  assert.equal(selected.status, 200, await selected.clone().text());
+  assert.deepEqual((await h.state()).config.desktopNotificationTarget, target);
+  assert.deepEqual(new Store(h.app.store.dir).config.desktopNotificationTarget, target);
+  assert.deepEqual(h.starts, starts, 'changing recipient does not reconnect bots');
+  assert.equal(defaultChat.threadId, 'current-default'); assert.equal(botChat.threadId, 'current-review');
+  const cleared = await h.request('/api/config', { desktopNotificationTarget: null }, 'PUT');
+  assert.equal(cleared.status, 200);
+  assert.equal((await h.state()).config.desktopNotificationTarget, null);
+  assert.equal(new Store(h.app.store.dir).config.desktopNotificationTarget, null);
+});
+
+test('invalid or revoked notification selections reject the whole patch without guessing or mutating configuration', async t => {
+  const h = await fixture(t); const bot = await h.create();
+  await h.request('/api/actors', { botId: bot.id, actorId: 'ou_reviewer', allow: true });
+  const chatId = conversationKey(bot.id, 'oc_review');
+  h.app.store.conversation(chatId, 'ou_reviewer', undefined, 'p2p');
+  const target = { chatId, actorId: 'ou_reviewer', botAppId: developerApp };
+  assert.equal((await h.request('/api/config', { desktopNotificationTarget: target }, 'PUT')).status, 200);
+  const initialProgress = h.app.store.config.progress;
+  for (const invalid of [false, '', [], {}, { chatId }, { ...target, actorId: 'ou_other' },
+    { ...target, chatId: 'oc_unknown' }, { ...target, botAppId: defaultApp }, { ...target, botId: bot.id }]) {
+    const response = await h.request('/api/config', { desktopNotificationTarget: invalid, progress: !initialProgress }, 'PUT');
+    assert.equal(response.status, 400, JSON.stringify(invalid));
+    assert.match((await response.json() as any).error, /通知|接收/);
+    assert.deepEqual(h.app.store.config.desktopNotificationTarget, target);
+    assert.equal(h.app.store.config.progress, initialProgress);
+  }
+  await h.request('/api/actors', { botId: bot.id, actorId: 'ou_reviewer', allow: false });
+  assert.deepEqual((await h.state()).notificationTargets, []);
+  const revoked = await h.request('/api/config', { desktopNotificationTarget: target }, 'PUT');
+  assert.equal(revoked.status, 400);
+  assert.deepEqual((await h.state()).config.desktopNotificationTarget, target, 'retain stale selection so the UI can explain why it is invalid');
+  assert.equal((await h.request('/api/config', { desktopNotificationTarget: null }, 'PUT')).status, 200);
+});

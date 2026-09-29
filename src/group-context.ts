@@ -9,7 +9,7 @@ export const normalizeGroupWorkspace = (cwd: string): string => path.resolve(cwd
 
 /** Receipts count original text characters, so an omitted tail remains eligible next time. */
 export function planGroupContext(journal: GroupMessage[], message: InboundMessage, cwd: string,
-  known: Record<string, number> = {}, threadId?: string): GroupContextPlan {
+  known: Record<string, number> = {}, threadId?: string, includeGroupContext = true): GroupContextPlan {
   const route = parseRoute(message.chatId);
   const currentId = parseRoute(message.id).id;
   const quoteId = message.replyTo ? parseRoute(message.replyTo).id : undefined;
@@ -29,6 +29,8 @@ export function planGroupContext(journal: GroupMessage[], message: InboundMessag
     // External quoted text is not necessarily identical to our journal entry.
     if (quoted && quoted.text.startsWith(excerpt)) seen[quoted.id] = Math.max(known[quoted.id] ?? 0, excerpt.length);
   }
+  // Explicit quotations and current-input receipts remain active when supplementation is off.
+  if (!includeGroupContext) return { text: parts.join('\n\n'), seen };
   const recent: string[] = [];
   let remaining = GROUP_CONTEXT_LIMIT - parts.join('\n\n').length - 100;
   const previous = scoped.filter(item => parseRoute(item.id).id !== currentId);

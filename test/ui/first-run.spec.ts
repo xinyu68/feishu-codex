@@ -1,6 +1,6 @@
 import { expect, test } from '@playwright/test';
 
-test('empty installation opens Feishu connection settings without an old service', async ({ page }) => {
+test('empty installation opens bot connection setup without an old service', async ({ page }) => {
   const now = new Date().toISOString();
   await page.route('**/api/**', async route => {
     const pathname = new URL(route.request().url()).pathname;
@@ -15,7 +15,12 @@ test('empty installation opens Feishu connection settings without an old service
     else await route.fulfill({ json: {} });
   });
   await page.goto('/');
-  await expect(page.getByRole('heading', { name: '飞书连接', exact: true })).toBeVisible();
+  await expect(page.getByRole('tab', { name: '连接设置', exact: true })).toHaveAttribute('aria-selected', 'true');
+  await expect(page.getByRole('button', { name: '机器人', exact: true })).toHaveClass(/selected/);
   await expect(page.getByRole('textbox', { name: 'App ID' })).toBeVisible();
   await expect(page.getByRole('link', { name: /飞书开发者后台/ })).toHaveAttribute('href', 'https://open.feishu.cn/app');
+  await page.getByRole('button', { name: '设置', exact: true }).click();
+  await expect(page.getByRole('heading', { name: '对话与通知', exact: true })).toBeVisible();
+  await expect(page.getByRole('textbox', { name: 'App ID' })).toHaveCount(0);
+  await expect(page.getByRole('combobox', { name: /模型|思考深度/ })).toHaveCount(0);
 });

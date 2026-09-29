@@ -7,7 +7,7 @@ test('real management API, binding revision and SSE drive the rendered conversat
   await page.getByRole('button', { name: '对话', exact: true }).click();
   await expect(page.getByRole('heading', { name: 'API 集成测试任务' })).toBeVisible();
   await expect(page.getByText('这是隔离后台的测试任务。', { exact: true })).toBeVisible();
-  await page.locator('textarea').fill('通过真实 HTTP 接口发消息');
+  await page.getByRole('textbox', { name: '发送给 Codex 的消息', exact: true }).fill('通过真实 HTTP 接口发消息');
   await page.getByRole('button', { name: '发送消息', exact: true }).click();
   await expect(page.getByText('正在运行命令', { exact: true })).toBeVisible();
   await expect(page.locator('.working-meta')).toContainText('已运行');

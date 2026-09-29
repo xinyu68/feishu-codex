@@ -120,7 +120,8 @@ test('current task exposes real activity without leaking it across bound session
 
 test('desktop MCP request sends one completion card and switches only after button action', async t => {
   const fx = fixture(t);
-  fx.store.conversation('oc_notify', 'actor', fx.dir);
+  fx.store.saveConfig({ appId: 'cli_1234567890abcdef', appSecret: 'fixture-secret', allowedActors: ['actor', 'ou_notify'] });
+  fx.store.conversation('oc_notify', 'ou_notify', fx.dir);
   fx.runtime.threadInfo = async threadId => ({ threadId, cwd: fx.dir, title: '桌面开发会话' });
   fx.notify({ method: 'item/completed', threadId: 'thread-b', turnId: 'desktop-turn', params: { item: {
     id: 'notify-call', type: 'mcpToolCall', server: 'feishu_completion', tool: 'request_feishu_completion_notification',
@@ -133,7 +134,7 @@ test('desktop MCP request sends one completion card and switches only after butt
   assert.equal(fx.store.state.conversations.oc_notify?.threadId, undefined);
   const command = card?.buttons?.[0]?.command;
   assert.match(command ?? '', /^\/notification /);
-  await fx.bridge.receive({ id: randomUUID(), chatId: 'oc_notify', actorId: 'actor', text: command!, actionMessageId: 'om_notification' });
+  await fx.bridge.receive({ id: randomUUID(), chatId: 'oc_notify', actorId: 'ou_notify', text: command!, actionMessageId: 'om_notification' });
   assert.equal(fx.store.state.conversations.oc_notify?.threadId, 'thread-b');
   assert.equal(fx.cards.at(-1)?.title, '已切换到通知对应的会话');
   assert.equal(Object.values(fx.store.state.notifications)[0]?.status, 'sent');

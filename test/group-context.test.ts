@@ -324,3 +324,128 @@ test('explicit quote with many newlines remains within the rendered context budg
   const next = planGroupContext([entry('om_quote_lines', content, cwd)], message(), cwd, plan.seen);
   assert.ok(next.seen.om_quote_lines! > plan.seen.om_quote_lines!);
 });
+
+test('new and legacy bot profiles default to group supplementation and persist independent preferences', t => {
+  const { store, dir } = setup(t);
+  assert.equal(store.config.includeGroupContext, true);
+  assert.equal(store.bot('default')!.includeGroupContext, true);
+  assert.equal(store.bot('dev')!.includeGroupContext, true);
+  const legacy = JSON.parse(fs.readFileSync(path.join(dir, 'config.json'), 'utf8'));
+  delete legacy.includeGroupContext;
+  for (const bot of legacy.bots) delete bot.includeGroupContext;
+  fs.writeFileSync(path.join(dir, 'config.json'), JSON.stringify(legacy), 'utf8');
+  const migrated = new Store(dir);
+  assert.equal(migrated.publicConfig().includeGroupContext, true);
+  assert.ok(migrated.publicBots().every(bot => bot.includeGroupContext === true));
+  migrated.rememberGroup(entry('om_legacy_background', 'Legacy background remains enabled', dir));
+  assert.match(migrated.planGroupContext(message(), dir).text, /Legacy background remains enabled/);
+  assert.match(migrated.planGroupContext(namespaceMessage('dev', message({ actorId: 'dev-user' })), dir).text,
+    /Legacy background remains enabled/);
+
+  migrated.saveBot('default', { includeGroupContext: false });
+  assert.equal(new Store(dir).bot('default')!.includeGroupContext, false);
+  assert.equal(new Store(dir).bot('dev')!.includeGroupContext, true);
+  migrated.saveBot('dev', { includeGroupContext: false });
+  migrated.saveBot('default', { name: 'Renamed default' });
+  migrated.saveBot('dev', { roleInstructions: 'Updated role' });
+  const disabled = new Store(dir);
+  assert.ok(disabled.publicBots().every(bot => bot.includeGroupContext === false));
+  disabled.saveBot('default', { includeGroupContext: true });
+  disabled.saveBot('dev', { includeGroupContext: true });
+  assert.ok(new Store(dir).publicBots().every(bot => bot.includeGroupContext === true));
+});
+
+test('disabled supplementation keeps explicit quotes and current-input receipts without consuming background', t => {
+  const { store, dir } = setup(t);
+  store.saveBot('default', { includeGroupContext: false });
+  store.rememberGroup(entry('om_background', 'Automatic background stays pending', dir));
+  store.rememberGroup(entry('om_quote', 'Explicitly requested quote', dir));
+  const input = message({ text: 'Current direct instruction', replyTo: 'om_quote' });
+  store.observeGroup(input);
+  const plan = store.planGroupContext(input, dir, 'thread-a');
+  assert.match(plan.text, /Explicitly requested quote/);
+  assert.doesNotMatch(plan.text, /Automatic background|Current direct instruction|新增群聊/);
+  assert.deepEqual(plan.seen, { om_current: input.text.length, om_quote: 'Explicitly requested quote'.length });
+  submit(store, 'op-disabled', input, dir, 'thread-a', plan);
+  const key = store.groupContextKey(input.chatId, dir, 'thread-a');
+  assert.equal(store.state.groupContextReceipts[key]!.seen.om_background, undefined);
+  assert.equal(store.state.groupContextReceipts[key]!.seen.om_current, input.text.length);
+  assert.match(store.planGroupContext(message({ quotedText: 'External quote without journal record' }), dir, 'thread-a').text,
+    /External quote without journal record/);
+  store.saveBot('default', { includeGroupContext: true });
+  const resumed = store.planGroupContext(message({ id: 'om_next' }), dir, 'thread-a');
+  assert.match(resumed.text, /Automatic background stays pending/);
+  assert.doesNotMatch(resumed.text, /Current direct instruction|Explicitly requested quote/);
+});
+
+test('on off on preserves receipts, shared collection and each bot independent context', t => {
+  const { store, dir } = setup(t);
+  store.rememberGroup(entry('om_before', 'Previously submitted background', dir));
+  const initial = message({ id: 'om_initial' });
+  submit(store, 'op-initial', initial, dir, 'thread-a', store.planGroupContext(initial, dir, 'thread-a'));
+  const key = store.groupContextKey(initial.chatId, dir, 'thread-a');
+  const receipt = structuredClone(store.state.groupContextReceipts[key]);
+  store.saveBot('default', { includeGroupContext: false });
+  assert.deepEqual(store.state.groupContextReceipts[key], receipt);
+  const during = message({ id: 'om_during', text: 'Ordinary discussion collected while disabled' });
+  store.observeGroup(during);
+  const direct = message({ id: 'om_direct', text: 'Direct instruction while disabled' });
+  store.observeGroup(direct);
+  const offPlan = store.planGroupContext(direct, dir, 'thread-a');
+  assert.equal(offPlan.text, '');
+  submit(store, 'op-off', direct, dir, 'thread-a', offPlan);
+  const dev = namespaceMessage('dev', message({ id: 'om_dev', actorId: 'dev-user' }));
+  const otherBot = store.planGroupContext(dev, dir, 'thread-dev');
+  assert.match(otherBot.text, /Previously submitted background/);
+  assert.match(otherBot.text, /Ordinary discussion collected while disabled/);
+  assert.match(otherBot.text, /Direct instruction while disabled/);
+  submit(store, 'op-dev', dev, dir, 'thread-dev', otherBot);
+
+  store.saveBot('default', { includeGroupContext: true });
+  const restarted = new Store(dir);
+  const next = message({ id: 'om_next' });
+  const resumed = restarted.planGroupContext(next, dir, 'thread-a');
+  assert.match(resumed.text, /Ordinary discussion collected while disabled/);
+  assert.doesNotMatch(resumed.text, /Previously submitted background|Direct instruction while disabled/);
+  submit(restarted, 'op-resumed', next, dir, 'thread-a', resumed);
+  assert.equal(restarted.planGroupContext(next, dir, 'thread-a').text, '');
+  assert.equal(restarted.planGroupContext(dev, dir, 'thread-dev').text, '');
+});
+
+
+test('legacy bots default to empty private instructions and persist independent roles', t => {
+  const { store, dir } = setup(t);
+  const legacy = JSON.parse(fs.readFileSync(path.join(dir, 'config.json'), 'utf8'));
+  delete legacy.privateRoleInstructions;
+  for (const bot of legacy.bots) delete bot.privateRoleInstructions;
+  fs.writeFileSync(path.join(dir, 'config.json'), JSON.stringify(legacy), 'utf8');
+  const migrated = new Store(dir);
+  assert.equal(migrated.publicConfig().privateRoleInstructions, '');
+  assert.ok(migrated.publicBots().every(bot => bot.privateRoleInstructions === ''));
+  migrated.saveBot('default', { roleInstructions: 'Default group', privateRoleInstructions: 'Default private' });
+  migrated.saveBot('dev', { roleInstructions: 'Developer group', privateRoleInstructions: 'Developer private' });
+  migrated.saveBot('default', { name: 'Renamed default' });
+  migrated.saveBot('dev', { model: 'New model' });
+  const restored = new Store(dir);
+  assert.equal(restored.bot('default')!.roleInstructions, 'Default group');
+  assert.equal(restored.bot('default')!.privateRoleInstructions, 'Default private');
+  assert.equal(restored.bot('dev')!.roleInstructions, 'Developer group');
+  assert.equal(restored.bot('dev')!.privateRoleInstructions, 'Developer private');
+  restored.saveBot('default', { privateRoleInstructions: '' });
+  assert.equal(new Store(dir).bot('default')!.privateRoleInstructions, '');
+  assert.equal(new Store(dir).bot('dev')!.privateRoleInstructions, 'Developer private');
+});
+
+test('thread snapshots preserve an absent or explicitly empty role across rebinding and restart', t => {
+  const { store, dir } = setup(t);
+  for (const role of [undefined, '']) {
+    const conversation = store.conversation('oc_private', 'user', dir, 'p2p');
+    conversation.threadId = role === undefined ? 'roleless-thread' : 'empty-role-thread';
+    store.rememberThread(conversation, role);
+    store.save();
+    const restored = new Store(dir);
+    restored.rememberThread(restored.conversation('oc_private'), 'Must not replace the original snapshot');
+    assert.equal(restored.state.threadBindings[conversation.threadId]!.roleInstructions, role);
+    assert.equal(restored.state.threadBindings[conversation.threadId]!.roleManaged, role !== undefined);
+  }
+});

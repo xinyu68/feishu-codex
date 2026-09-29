@@ -30,9 +30,9 @@ Feishu Codex 是一个本地 Windows 应用，围绕 **桌面与手机接续工�
 ![Feishu Codex 工作台](docs/images/workbench.png)
 
 <details>
-<summary>查看连接设置</summary>
+<summary>查看机器人管理</summary>
 
-![飞书连接设置](docs/images/settings.png)
+![机器人管理](docs/images/robots.png)
 
 </details>
 
@@ -56,8 +56,8 @@ Feishu Codex 是一个本地 Windows 应用，围绕 **桌面与手机接续工�
 1. 在 Windows x64 上安装并登录官方 Codex，确认它能独立使用。
 2. 在 [Releases](https://github.com/xinyu68/feishu-codex/releases/latest) 下载最新的 `Feishu-Codex-版本号-Setup.exe`，双击安装。
 3. 在 [飞书开放平台](https://open.feishu.cn/app) 创建自建应用，启用机器人与长连接事件。完整步骤见 [配置指南](docs/getting-started.md)。
-4. 在应用“设置 → 飞书连接”填入 App ID 和 App Secret，验证成功后自动连接。
-5. 私聊机器人，再在应用中允许自己的账号。通过 `/project` 和 `/session` 选择要继续的工作。
+4. 在应用“机器人 → 连接设置”填入 App ID 和 App Secret，验证成功后自动连接。
+5. 私聊机器人，再在“访问权限”中允许自己的账号。通过 `/project` 和 `/session` 选择要继续的工作。
 
 应用默认在启动时一起打开 Codex，也可以关闭自动打开，只通过飞书使用。使用原来的 Codex 图标独立启动时，飞书写入会暂停；在工作台点击“连接飞书”，确认重启后即可恢复双端接续。
 

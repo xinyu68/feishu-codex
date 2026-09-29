@@ -11,7 +11,7 @@ test('desktop completion notification preference starts off and persists through
     await page.setViewportSize({ width: 1024, height: 680 });
     await page.goto(base);
     await page.getByRole('button', { name: '设置', exact: true }).click();
-    await page.getByRole('button', { name: 'Codex 偏好', exact: true }).click();
+    await page.getByRole('button', { name: '对话与通知', exact: true }).click();
     const toggle = page.getByRole('checkbox', { name: '桌面任务完成后通知飞书', exact: true });
     await expect(toggle).not.toBeChecked();
     await expect(page.getByText('需要时可说“做完飞书通知我”，仅通知本轮。')).toBeVisible();
@@ -21,7 +21,7 @@ test('desktop completion notification preference starts off and persists through
     expect((await (await page.request.get(`${base}/api/state`)).json()).config.autoNotifyDesktop).toBe(true);
     await page.reload();
     await page.getByRole('button', { name: '设置', exact: true }).click();
-    await page.getByRole('button', { name: 'Codex 偏好', exact: true }).click();
+    await page.getByRole('button', { name: '对话与通知', exact: true }).click();
     await expect(toggle).toBeChecked();
     await page.screenshot({ path: 'artifacts/desktop-auto-notifications-settings.png' });
     expect(await page.evaluate(() => document.documentElement.scrollHeight > innerHeight)).toBe(false);
@@ -38,7 +38,7 @@ test('automatic settings feedback fits a compact application window', async ({ p
   await expect(page.getByRole('button', { name: '保存凭据', exact: true })).toHaveCount(0);
   await expect(page.locator('.settings-save-status')).toBeInViewport();
   expect(await page.locator('.settings-content').evaluate(element => element.scrollHeight > element.clientHeight)).toBe(false);
-  await page.getByRole('button', { name: 'Codex 偏好', exact: true }).click();
+  await page.getByRole('button', { name: '对话与通知', exact: true }).click();
   await expect(page.locator('.settings-save-status')).toBeInViewport();
   await expect(page.getByRole('checkbox', { name: '桌面任务完成后通知飞书' })).toBeInViewport();
   expect(await page.locator('.settings-content').evaluate(element => element.scrollHeight > element.clientHeight)).toBe(false);

@@ -189,11 +189,12 @@ test('desktop completion follows a former group thread after /new and never fall
   emit(); await tick(); assert.equal(h.sent.filter(item => item.card.title === '桌面任务已完成').length, 1);
 });
 
-test('role edits apply to new threads while existing threads retain their original role', async t => {
+test('private role edits apply to new threads while existing threads retain their original role', async t => {
   const h = setup(t);
+  h.store.saveBot('default', { privateRoleInstructions: '澄清需求，整理验收标准' });
   await h.send('default', '开始', { chatId: 'oc_private', chatType: 'p2p' });
   assert.match(h.runs[0]!.roleInstructions!, /澄清需求/);
-  h.store.saveBot('default', { roleInstructions: '' });
+  h.store.saveBot('default', { privateRoleInstructions: '' });
   await h.send('default', '继续', { chatId: 'oc_private', chatType: 'p2p' });
   assert.equal(h.runs[1]!.roleInstructions, h.runs[0]!.roleInstructions);
   await h.send('default', '/new', { chatId: 'oc_private', chatType: 'p2p' });
@@ -328,4 +329,109 @@ test('identical user text still has distinct compact context batch markers', asy
   assert.notEqual(first, second);
   assert.equal(cleanBridgeText(h.runs[0]!.prompt), '继续');
   assert.equal(cleanBridgeText(h.runs[1]!.prompt), '继续');
+});
+
+test('disabling group supplementation preserves the active thread, current instruction and explicit quote', async t => {
+  const h = setup(t);
+  await h.send('default', 'Remember the existing task');
+  const threadId = h.store.conversation('oc_team').threadId;
+  const reply = h.sent.find(item => item.card.text.includes('五分钟'))!;
+  h.store.saveBot('default', { includeGroupContext: false });
+  h.store.observeGroup(h.message('default', 'Unrequested discussion while disabled'));
+  await h.send('default', 'Continue using this explicit quote', { replyTo: reply.id });
+  assert.equal(h.runs[1]!.threadId, threadId);
+  assert.equal(cleanBridgeText(h.runs[1]!.prompt), 'Continue using this explicit quote');
+  assert.match(h.runs[1]!.prompt, /明确引用[\s\S]*验证码五分钟有效/);
+  assert.doesNotMatch(h.runs[1]!.prompt, /Unrequested discussion|Remember the existing task|新增群聊/);
+  await h.send('default', 'Continue the same task without a quote');
+  assert.equal(h.runs[2]!.threadId, threadId);
+  assert.equal(cleanBridgeText(h.runs[2]!.prompt), 'Continue the same task without a quote');
+  assert.doesNotMatch(h.runs[2]!.prompt, /Unrequested discussion|验证码五分钟有效|新增群聊/);
+  assert.equal(h.store.conversation('oc_team').threadId, threadId);
+  assert.deepEqual(h.stopped, []);
+  assert.ok(h.store.state.history.oc_team!.some(item => item.text === 'Remember the existing task'));
+});
+
+
+test('private chats start without bot names or group personas for every bot', async t => {
+  const h = setup(t);
+  for (const botId of ['default', 'dev']) {
+    await h.send(botId, 'Private request', { chatId: 'oc_private', chatType: 'p2p' });
+    assert.equal(h.runs.at(-1)!.roleInstructions, undefined);
+    h.store.saveBot(botId, { privateRoleInstructions: 'New private instructions' });
+    await h.send(botId, 'Continue private request', { chatId: 'oc_private', chatType: 'p2p' });
+    assert.equal(h.runs.at(-1)!.roleInstructions, undefined);
+    await h.send(botId, '/new', { chatId: 'oc_private', chatType: 'p2p' });
+    await h.send(botId, 'New private request', { chatId: 'oc_private', chatType: 'p2p' });
+    assert.equal(h.runs.at(-1)!.roleInstructions, 'New private instructions');
+  }
+});
+
+test('private and group instructions stay separate while model preferences are shared', async t => {
+  const h = setup(t);
+  h.store.saveBot('dev', { privateRoleInstructions: '  Independent private assistant  ' });
+  await h.send('dev', 'Private request', { chatId: 'oc_private', chatType: 'p2p' });
+  assert.equal(h.runs[0]!.roleInstructions, 'Independent private assistant');
+  assert.equal(h.runs[0]!.model, 'dev-model');
+  assert.equal(h.runs[0]!.effort, 'high');
+  await h.send('dev', 'Group request');
+  assert.match(h.runs[1]!.roleInstructions!, /根据需求实现功能/);
+  assert.doesNotMatch(h.runs[1]!.roleInstructions!, /Independent private assistant/);
+  const groupRole = h.runs[1]!.roleInstructions;
+  h.store.saveBot('dev', { roleInstructions: 'Updated group responsibility' });
+  await h.send('dev', 'Continue group request');
+  assert.equal(h.runs[2]!.roleInstructions, groupRole);
+  await h.send('dev', '/new');
+  await h.send('dev', 'New group request');
+  assert.match(h.runs[3]!.roleInstructions!, /Updated group responsibility/);
+  assert.doesNotMatch(h.runs[3]!.roleInstructions!, /Independent private assistant/);
+});
+
+test('legacy private threads retain their original role snapshot', async t => {
+  const h = setup(t);
+  const conversation = h.store.conversation('oc_private', 'pm-user', h.dir, 'p2p');
+  conversation.threadId = 'legacy-private-thread';
+  h.store.rememberThread(conversation, 'Legacy product manager persona');
+  h.store.save();
+  h.store.saveBot('default', { privateRoleInstructions: 'New private assistant' });
+  await h.send('default', 'Continue legacy request', { chatId: 'oc_private', chatType: 'p2p' });
+  assert.equal(h.runs[0]!.roleInstructions, 'Legacy product manager persona');
+  assert.equal(h.runs[0]!.threadId, 'legacy-private-thread');
+});
+
+test('native desktop threads receive no configured private persona', async t => {
+  const h = setup(t);
+  h.store.saveBot('default', { privateRoleInstructions: 'Configured private assistant' });
+  const conversation = h.store.conversation('oc_private', 'pm-user', h.dir, 'p2p');
+  conversation.threadId = 'native-desktop-thread';
+  h.store.save();
+  await h.send('default', 'Continue native request', { chatId: 'oc_private', chatType: 'p2p' });
+  assert.equal(h.runs[0]!.roleInstructions, undefined);
+  assert.equal(h.store.state.threadBindings['native-desktop-thread']!.roleManaged, false);
+});
+
+test('reusing a private thread from another bot retains the original persona', async t => {
+  const h = setup(t);
+  h.store.saveBot('default', { privateRoleInstructions: 'Original private persona' });
+  h.store.saveBot('dev', { privateRoleInstructions: 'Different private persona' });
+  await h.send('default', 'Start private request', { chatId: 'oc_private', chatType: 'p2p' });
+  const threadId = h.store.conversation('oc_private').threadId!;
+  const devChat = conversationKey('dev', 'oc_private');
+  h.store.conversation(devChat, 'dev-user', h.dir, 'p2p');
+  await h.bridge.bind(devChat, h.dir, threadId);
+  await h.send('dev', 'Continue same thread', { chatId: 'oc_private', chatType: 'p2p' });
+  assert.equal(h.runs[1]!.threadId, threadId);
+  assert.equal(h.runs[1]!.roleInstructions, 'Original private persona');
+});
+
+test('private entry cannot rebind or replace a group thread role', async t => {
+  const h = setup(t);
+  await h.send('default', 'Start group request');
+  const threadId = h.store.conversation('oc_team').threadId!;
+  const role = h.store.state.threadBindings[threadId]!.roleInstructions;
+  h.store.conversation('oc_private', 'pm-user', h.dir, 'p2p');
+  h.store.saveBot('default', { privateRoleInstructions: 'Private assistant' });
+  await assert.rejects(h.bridge.bind('oc_private', h.dir, threadId), /独立会话/);
+  await h.send('default', 'Continue group request');
+  assert.equal(h.runs[1]!.roleInstructions, role);
 });

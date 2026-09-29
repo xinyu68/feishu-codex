@@ -44,3 +44,89 @@
 .bot-section-tabs{display:flex;align-items:center;gap:22px;border-bottom:1px solid var(--border);margin:0 0 23px}.bot-section-tabs>button{display:flex;align-items:center;gap:7px;position:relative;color:#8b9bb1;padding:0 1px 12px;font-size:11px}.bot-section-tabs>button.active{color:#3c6bb6;font-weight:550}.bot-section-tabs>button.active:after{content:"";position:absolute;bottom:-1px;left:0;right:0;height:2px;background:#6893e6;border-radius:2px}.bot-section-tabs .count-badge{font-size:9px;border-radius:4px;padding:2px 4px;background:#edf3ff;color:#6187c9}.bot-toolbar{margin-bottom:20px}
 @media(max-height:720px){.bot-toolbar{margin-bottom:15px;padding-top:8px;padding-bottom:8px}.bot-section-tabs{margin-bottom:16px}.bot-section-tabs>button{padding-bottom:10px}.settings-content:not(.defaults-settings):not(.application-settings)>.settings-title{margin-bottom:17px}.bot-role-settings{margin-bottom:14px}.bot-role-settings>summary{padding-top:11px;padding-bottom:11px}}
 .working-indicator .working-meta{font-size:10px;line-height:1.5;color:#a5b2c4}
+
+/* Native selection behavior with a shared trigger and top-layer menu. */
+select.app-select { appearance:auto; }
+.app-select-trigger { display:none; }
+@supports (appearance: base-select) {
+  select.app-select,
+  select.app-select::picker(select) { appearance:base-select; }
+  select.app-select {
+    --select-height:37px;display:block;width:100%;max-width:100%;min-width:0;height:var(--select-height);padding:0;
+    border:1px solid #dce5f2;border-radius:8px;background:#fff;color:#385477;
+    font-family:inherit;font-size:12px;font-weight:400;line-height:1.4;cursor:pointer;
+    transition:border-color .15s,box-shadow .15s;
+  }
+  select.app-select .app-select-trigger {
+    display:flex;align-items:center;gap:9px;width:100%;max-width:100%;min-width:0;height:calc(var(--select-height) - 2px);
+    padding:0 11px;border:0;background:transparent;color:inherit;font:inherit;text-align:left;
+  }
+  .app-select-label { flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap; }
+  .app-select-icon { display:flex;flex-shrink:0;color:#6c84a8; }
+  .app-select-chevron { flex-shrink:0;color:#6c84a8;transition:transform .16s; }
+  select.app-select:open .app-select-chevron { transform:rotate(180deg); }
+  select.app-select:hover { border-color:#b8c9e1; }
+  select.app-select:focus-visible,
+  select.app-select:open { outline:0;border-color:#8fb1ea;box-shadow:0 0 0 3px #eaf2ff; }
+  select.app-select:disabled { opacity:.55;cursor:not-allowed; }
+  select.app-select::picker-icon { display:none; }
+  select.app-select::picker(select) {
+    position-try-order:normal;
+    min-width:anchor-size(width);max-width:calc(100vw - 32px);max-height:min(280px,calc(100dvh - 32px));
+    margin-top:7px;margin-bottom:7px;padding:5px;border:1px solid #dfe7f2;border-radius:10px;
+    background:#fff;color:#385477;box-shadow:0 12px 32px #20334d1a,0 2px 7px #20334d0a;
+    overflow:auto;font-family:inherit;font-size:12px;
+  }
+  select.app-select option {
+    display:flex;align-items:center;gap:12px;min-height:36px;padding:8px 10px;
+    border:0;border-radius:6px;background:transparent;color:#526987;font-weight:400;
+    line-height:1.5;white-space:normal;overflow-wrap:anywhere;cursor:pointer;
+  }
+  select.app-select option + option { margin-top:2px; }
+  select.app-select option:hover,
+  select.app-select option:focus { outline:0;background:#f2f6fc; }
+  select.app-select option:checked { background:#eaf2ff;color:#2865e8;font-weight:550; }
+  select.app-select option:checked:hover,
+  select.app-select option:checked:focus { background:#e2edff; }
+  select.app-select option:disabled { color:#9baac0;cursor:not-allowed;background:transparent; }
+  select.app-select option::checkmark { order:1;margin-left:auto;color:#2865e8;font-size:13px; }
+  .bot-picker { flex:1;max-width:300px;min-width:0; }
+  .bot-picker select.app-select { --select-height:38px;font-weight:550; }
+  .notification-options-row select.app-select { --select-height:32px;width:150px; }
+  select.app-select.preference-select { --select-height:32px;width:164px;flex-shrink:0; }
+  .binding-footer select.app-select { --select-height:30px;max-width:200px;font-size:11px; }
+  @media (max-width:660px) { .bot-picker { max-width:none; } }
+}
+.project-menu { border-color:#dfe7f2;border-radius:10px;box-shadow:0 12px 32px #20334d1a,0 2px 7px #20334d0a; }
+.project-options button { border-radius:6px; }
+.project-options button + button { margin-top:2px; }
+.project-options button:hover,
+.project-options button:focus-visible { outline:0;background:#f2f6fc; }
+.project-options button.chosen { background:#eaf2ff;color:#2865e8; }
+.project-options button.chosen:hover,
+.project-options button.chosen:focus-visible { background:#e2edff; }
+
+.group-context-preference { border-top:1px solid var(--border);padding-top:14px; }
+.group-context-preference strong { font-size:11px; }
+.group-context-preference small { font-size:10px; }
+
+/* Only the switch itself is interactive; its row text is selectable. */
+.toggle-row { cursor:default; }
+.toggle-control { position:relative;display:inline-flex;align-items:center;width:33px;height:19px;flex-shrink:0;cursor:pointer; }
+.toggle-control input { inset:0;width:100%;height:100%;margin:0;z-index:1; }
+.toggle-control:has(input:disabled),.toggle-control input:disabled { cursor:not-allowed; }
+.toggle-control input:disabled+.toggle { opacity:.45; }
+
+.bot-role-instructions { display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,220px),1fr));gap:16px; }
+.bot-role-instructions .field-label { min-width:0; }
+
+/* Keep per-bot drafts mounted while switching the app navigation. */
+.robot-page-slot { flex:1;min-height:0;overflow:hidden;display:flex; }
+.robot-page-slot[hidden] { display:none; }
+.rail-button > span { white-space:nowrap; }
+.notification-target-summary { margin-top:16px;display:flex;align-items:center;justify-content:space-between;gap:16px; }
+.notification-target-summary>div { display:flex;align-items:center;flex-wrap:wrap;gap:10px;font-size:11px;color:#8798b0;min-width:0; }
+.notification-target-summary strong { font-size:11px;font-weight:500;color:#617a9f;overflow-wrap:anywhere; }
+.notification-target-summary strong.unavailable { color:#a08044; }
+.notification-target-summary small { font-size:10px;color:#a08044; }
+.notification-target-summary .text-button { display:flex;align-items:center;gap:2px;white-space:nowrap;font-size:11px;padding:0; }

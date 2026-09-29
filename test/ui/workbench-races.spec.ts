@@ -1,5 +1,7 @@
 import { test, expect, type Page } from '@playwright/test';
 
+test.beforeEach(({ page }) => { page.on('pageerror', error => { throw error; }); });
+
 function fixtureState() {
   return {
     csrfToken: 'fixture-token',
@@ -32,14 +34,14 @@ test('draft-to-draft project changes and explicit new tasks clear the previous d
   await page.goto('/?demo=1');
   await page.getByRole('button', { name: /新建任务/ }).click();
   await expect(page.getByRole('heading', { name: '新任务', exact: true })).toBeVisible();
-  await page.locator('textarea').fill('这个草稿只属于旧项目');
+  await page.getByRole('textbox', { name: '发送给 Codex 的消息', exact: true }).fill('这个草稿只属于旧项目');
   await page.locator('.project-button').click();
   await page.locator('.project-options').getByRole('button', { name: /sample-web-app/ }).click();
   await expect(page.locator('.directory')).toContainText('sample-web-app');
-  await expect(page.locator('textarea')).toHaveValue('');
-  await page.locator('textarea').fill('这个草稿只属于旧任务');
+  await expect(page.getByRole('textbox', { name: '发送给 Codex 的消息', exact: true })).toHaveValue('');
+  await page.getByRole('textbox', { name: '发送给 Codex 的消息', exact: true }).fill('这个草稿只属于旧任务');
   await page.getByRole('button', { name: /新建任务/ }).click();
-  await expect(page.locator('textarea')).toHaveValue('');
+  await expect(page.getByRole('textbox', { name: '发送给 Codex 的消息', exact: true })).toHaveValue('');
 });
 
 test('a late old-thread history response never appears inside a new unstarted task', async ({ page }) => {
@@ -52,6 +54,7 @@ test('a late old-thread history response never appears inside a new unstarted ta
     if (pathname === '/api/state') body = state;
     if (pathname === '/api/runtime-status') body = state.runtime;
     if (pathname === '/api/projects') body = { projects: [] };
+    if (pathname === '/api/models') body = { models: [] };
     if (pathname === '/api/sessions') body = { sessions: [] };
     if (pathname === '/api/new') Object.assign(state.conversations[0], { title: '新任务', threadId: undefined, revision: 2 });
     if (pathname === '/api/history') {
@@ -90,6 +93,7 @@ test('a lost submission response is not automatically replayed and manual retry 
     if (pathname === '/api/state') body = state;
     if (pathname === '/api/runtime-status') body = state.runtime;
     if (pathname === '/api/projects') body = { projects: [] };
+    if (pathname === '/api/models') body = { models: [] };
     if (pathname === '/api/sessions') body = { sessions: [] };
     if (pathname === '/api/history') body = { threadId: 'thread-first', messages };
     if (pathname === '/api/chat') {
@@ -102,15 +106,15 @@ test('a lost submission response is not automatically replayed and manual retry 
     await route.fulfill({ contentType: 'application/json', body: JSON.stringify(body) });
   });
   await page.goto('/');
-  await page.locator('textarea').fill('只执行一次的消息');
+  await page.getByRole('textbox', { name: '发送给 Codex 的消息', exact: true }).fill('只执行一次的消息');
   await page.getByRole('button', { name: '发送消息', exact: true }).click();
   await expect(page.getByRole('alert')).toContainText('提交结果尚未确认');
   await expect(page.locator('.message-column')).toContainText('只执行一次的消息');
-  await expect(page.locator('textarea')).toHaveValue('只执行一次的消息');
+  await expect(page.getByRole('textbox', { name: '发送给 Codex 的消息', exact: true })).toHaveValue('只执行一次的消息');
   await page.waitForTimeout(500);
   expect(submissions).toHaveLength(1);
   await page.getByRole('button', { name: '发送消息', exact: true }).click();
-  await expect(page.locator('textarea')).toHaveValue('');
+  await expect(page.getByRole('textbox', { name: '发送给 Codex 的消息', exact: true })).toHaveValue('');
   expect(submissions).toHaveLength(2);
   expect(submissions[1].messageId).toBe(submissions[0].messageId);
   expect(messages).toHaveLength(1);
@@ -126,7 +130,7 @@ test('new stream text respects a user reading above the bottom and Markdown stay
   ].join('\n\n') }];
   await page.route('**/api/**', async route => {
     const pathname = new URL(route.request().url()).pathname;
-    const body = pathname === '/api/state' ? state : pathname === '/api/runtime-status' ? state.runtime : pathname === '/api/projects' ? { projects: [] } : pathname === '/api/sessions' ? { sessions: [] } : pathname === '/api/history' ? { threadId: 'thread-first', messages } : {};
+    const body = pathname === '/api/state' ? state : pathname === '/api/runtime-status' ? state.runtime : pathname === '/api/projects' ? { projects: [] } : pathname === '/api/models' ? { models: [] } : pathname === '/api/sessions' ? { sessions: [] } : pathname === '/api/history' ? { threadId: 'thread-first', messages } : {};
     await route.fulfill({ contentType: 'application/json', body: JSON.stringify(body) });
   });
   await page.goto('/');
@@ -159,6 +163,7 @@ test('allocating a first task and completing an older send do not erase a newly 
     if (pathname === '/api/state') body = state;
     if (pathname === '/api/runtime-status') body = state.runtime;
     if (pathname === '/api/projects') body = { projects: [] };
+    if (pathname === '/api/models') body = { models: [] };
     if (pathname === '/api/sessions') body = { sessions: [] };
     if (pathname === '/api/history') {
       allocatedHistoryRead = allocatedHistoryRead || state.conversations[0].threadId === 'allocated';
@@ -173,14 +178,14 @@ test('allocating a first task and completing an older send do not erase a newly 
     await route.fulfill({ contentType: 'application/json', body: JSON.stringify(body) });
   });
   await page.goto('/');
-  await page.locator('textarea').fill('第一条消息');
+  await page.getByRole('textbox', { name: '发送给 Codex 的消息', exact: true }).fill('第一条消息');
   await page.getByRole('button', { name: '发送消息', exact: true }).click();
   await expect.poll(() => received).toBe(true);
-  await page.locator('textarea').fill('仍在编辑的补充要求');
+  await page.getByRole('textbox', { name: '发送给 Codex 的消息', exact: true }).fill('仍在编辑的补充要求');
   await page.evaluate(() => window.dispatchEvent(new CustomEvent('fixture-sse', { detail: { type: 'state', data: {} } })));
   await expect.poll(() => allocatedHistoryRead).toBe(true);
-  await expect(page.locator('textarea')).toHaveValue('仍在编辑的补充要求');
+  await expect(page.getByRole('textbox', { name: '发送给 Codex 的消息', exact: true })).toHaveValue('仍在编辑的补充要求');
   releaseSubmit!();
   await expect(page.getByRole('button', { name: '补充当前任务', exact: true })).toBeEnabled();
-  await expect(page.locator('textarea')).toHaveValue('仍在编辑的补充要求');
+  await expect(page.getByRole('textbox', { name: '发送给 Codex 的消息', exact: true })).toHaveValue('仍在编辑的补充要求');
 });

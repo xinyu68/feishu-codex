@@ -1,6 +1,8 @@
 import { expect, test, type Page } from '@playwright/test';
 import type { AppState, BotProfile } from '../../ui/src/types';
 
+test.beforeEach(({ page }) => { page.on('pageerror', error => { throw error; }); });
+
 function fixture(): AppState {
   const now = new Date().toISOString();
   const bot = (id: string, name: string): BotProfile => ({ id, name, appId: `cli_${id}`, hasSecret: true, enabled: true,
@@ -21,7 +23,7 @@ function fixture(): AppState {
   };
 }
 
-async function setup(page: Page, state = fixture()) {
+async function setup(page: Page, state = fixture(), url = '/') {
   const writes: { path: string; method: string; body: Record<string, unknown> }[] = [];
   const reads: string[] = [];
   await page.addInitScript(() => {
@@ -51,7 +53,7 @@ async function setup(page: Page, state = fixture()) {
     if (url.pathname.startsWith('/api/bots/')) {
       const [, , , id, operation] = url.pathname.split('/');
       const bot = state.bots!.find(item => item.id === id)!;
-      if (operation === 'credentials') { bot.appId = String(input.appId); bot.hasSecret = true; }
+      if (operation === 'credentials') { bot.appId = String(input.appId); bot.hasSecret = true; bot.enabled = true; bot.connection.status = 'connected'; }
       if (operation === 'connection') { bot.enabled = Boolean(input.enabled); bot.connection.status = bot.enabled ? 'connected' : 'stopped'; }
       if (method === 'PATCH') Object.assign(bot, input);
       if (method === 'DELETE') state.bots = state.bots!.filter(item => item.id !== id);
@@ -71,37 +73,43 @@ async function setup(page: Page, state = fixture()) {
     }
     await route.fulfill({ json: body });
   });
-  await page.goto('/');
+  await page.goto(url);
   return { state, writes, reads };
 }
 
-test('adding a role bot only submits after explicit confirmation and switches to its own settings', async ({ page }) => {
+test('adding a bot only submits after explicit confirmation and starts with access setup', async ({ page }) => {
   const { writes } = await setup(page);
-  await page.getByRole('button', { name: '设置', exact: true }).click();
+  await page.getByRole('button', { name: '机器人', exact: true }).click();
   await page.getByRole('button', { name: '添加机器人', exact: true }).click();
   const dialog = page.getByRole('dialog', { name: '添加机器人' });
   await dialog.getByRole('textbox', { name: '机器人名称' }).fill('测试');
   await dialog.getByRole('textbox', { name: 'App ID', exact: true }).fill('cli_tester');
   await dialog.locator('input[type=password]').fill('fixture-secret');
-  await dialog.getByRole('textbox', { name: /角色说明/ }).fill('负责检查需求和验收，不自动修改代码。');
+  await expect(dialog.getByRole('textbox', { name: /角色说明/ })).toHaveCount(0);
   await dialog.getByRole('heading', { name: '添加机器人' }).click();
   expect(writes).toEqual([]);
   await dialog.getByRole('button', { name: '验证并添加' }).click();
   await expect(dialog).not.toBeVisible();
-  await expect(page.getByRole('combobox', { name: '管理机器人' })).toHaveValue('tester');
+  await expect(page.getByRole('button', { name: '管理测试', exact: true })).toBeVisible();
+  await expect(page.getByRole('tab', { name: /访问权限/ })).toHaveAttribute('aria-selected', 'true');
+  await expect(page.getByText('开始使用', { exact: true })).toBeVisible();
+  await page.getByRole('tab', { name: '连接设置', exact: true }).click();
+  await page.getByRole('button', { name: '修改凭据', exact: true }).click();
   await expect(page.getByRole('textbox', { name: 'App ID', exact: true })).toHaveValue('cli_tester');
-  await expect(page.locator('input[type=password]')).toHaveValue('');
-  expect(writes).toEqual([{ path: '/api/bots', method: 'POST', body: { name: '测试', appId: 'cli_tester', appSecret: 'fixture-secret', roleInstructions: '负责检查需求和验收，不自动修改代码。' } }]);
+  await expect(page.locator('input[type=password]:visible')).toHaveValue('');
+  expect(writes).toEqual([{ path: '/api/bots', method: 'POST', body: { name: '测试', appId: 'cli_tester', appSecret: 'fixture-secret' } }]);
 });
 
 test('group and actor authorization are separate and scoped to the selected bot', async ({ page }) => {
   const { state, writes } = await setup(page);
-  await page.getByRole('button', { name: '设置', exact: true }).click();
-  await page.getByRole('tab', { name: /账号与群聊/ }).click();
+  await page.getByRole('button', { name: '机器人', exact: true }).click();
+  await page.getByRole('tab', { name: /访问权限/ }).click();
   await expect(page.getByText('ou_product_pending', { exact: true })).not.toBeVisible();
   await expect(page.getByRole('button', { name: '允许群聊', exact: true })).not.toBeVisible();
-  await page.getByRole('combobox', { name: '管理机器人' }).selectOption('product');
-  await expect(page.getByText('ou_product_pending', { exact: true })).toBeVisible();
+  await page.getByRole('button', { name: '管理产品经理', exact: true }).click();
+  await page.getByRole('tab', { name: /访问权限/ }).click();
+  await expect(page.getByRole('heading', { name: '谁能使用', exact: true })).toBeVisible();
+  await expect(page.getByRole('heading', { name: '哪些群可用', exact: true })).toBeVisible();
   await page.getByRole('button', { name: '允许群聊', exact: true }).click();
   await expect(page.getByRole('button', { name: '允许群聊', exact: true })).not.toBeVisible();
   await expect(page.getByRole('button', { name: '允许访问', exact: true })).toBeVisible();
@@ -135,15 +143,20 @@ test('switching a group role changes its preview and operations keep the opaque 
 
 test('an additional bot requires a matching secret when changing its app and only edits its own connection', async ({ page }) => {
   const { writes } = await setup(page);
-  await page.getByRole('button', { name: '设置', exact: true }).click();
-  await page.getByRole('combobox', { name: '管理机器人' }).selectOption('product');
+  await page.getByRole('button', { name: '机器人', exact: true }).click();
+  await page.getByRole('button', { name: '管理产品经理', exact: true }).click();
+  await page.getByRole('tab', { name: '连接设置', exact: true }).click();
+  await page.getByRole('button', { name: '修改凭据', exact: true }).click();
   await page.getByRole('textbox', { name: 'App ID', exact: true }).fill('cli_product2');
-  await page.getByRole('heading', { name: '飞书连接', exact: true }).click();
+  await page.getByRole('tab', { name: '连接设置', exact: true }).click();
+  expect(writes).toEqual([]);
+  await page.getByRole('button', { name: '验证并连接', exact: true }).click();
   await expect(page.getByRole('alert')).toContainText('对应的 App Secret');
   expect(writes).toEqual([]);
-  await page.locator('input[type=password]').fill('fixture-replacement');
-  await page.getByRole('heading', { name: '飞书连接', exact: true }).click();
-  await expect(page.locator('input[type=password]')).toHaveValue('');
+  await page.locator('input[type=password]:visible').fill('fixture-replacement');
+  await page.getByRole('tab', { name: '连接设置', exact: true }).click();
+  await page.getByRole('button', { name: '修改凭据', exact: true }).click();
+  await expect(page.locator('input[type=password]:visible')).toHaveValue('');
   await page.getByRole('button', { name: '断开连接', exact: true }).click();
   await expect(page.getByRole('button', { name: '连接飞书', exact: true })).toBeVisible();
   expect(writes).toEqual([
@@ -154,23 +167,25 @@ test('an additional bot requires a matching secret when changing its app and onl
 
 test('removing an extra bot requires confirmation and the default bot has no remove action', async ({ page }) => {
   const { writes } = await setup(page);
-  await page.getByRole('button', { name: '设置', exact: true }).click();
+  await page.getByRole('button', { name: '机器人', exact: true }).click();
+  await page.getByRole('tab', { name: '连接设置', exact: true }).click();
   await expect(page.getByRole('button', { name: '移除这个机器人' })).not.toBeVisible();
-  await page.getByRole('combobox', { name: '管理机器人' }).selectOption('product');
+  await page.getByRole('button', { name: '管理产品经理', exact: true }).click();
+  await page.getByRole('tab', { name: '连接设置', exact: true }).click();
   await page.getByRole('button', { name: '移除这个机器人' }).click();
   expect(writes).toEqual([]);
   await page.getByRole('button', { name: '确认移除', exact: true }).click();
-  await expect(page.getByRole('combobox', { name: '管理机器人' })).toHaveValue('default');
+  await expect(page.getByRole('button', { name: '管理产品经理', exact: true })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: '管理开发', exact: true })).toBeVisible();
   expect(writes).toEqual([{ path: '/api/bots/product', method: 'DELETE', body: {} }]);
 });
 
 test('role and model preferences save only to the selected bot', async ({ page }) => {
   const { state, writes } = await setup(page);
-  await page.getByRole('button', { name: '设置', exact: true }).click();
-  await page.getByRole('combobox', { name: '管理机器人' }).selectOption('product');
-  await page.locator('.bot-role-settings summary').click();
-  await page.getByRole('textbox', { name: '角色说明', exact: true }).fill('负责需求分析和验收标准。');
-  await page.getByRole('heading', { name: '飞书连接', exact: true }).click();
+  await page.getByRole('button', { name: '机器人', exact: true }).click();
+  await page.getByRole('button', { name: '管理产品经理', exact: true }).click();
+  await page.getByRole('textbox', { name: '群聊角色说明', exact: true }).fill('负责需求分析和验收标准。');
+  await page.getByRole('tab', { name: '对话设置', exact: true }).click();
   await expect.poll(() => state.bots![1].roleInstructions).toBe('负责需求分析和验收标准。');
   await page.getByRole('combobox', { name: '机器人模型' }).selectOption('test-model');
   await expect(page.getByRole('combobox', { name: '机器人思考深度' })).toHaveValue('high');
@@ -192,8 +207,357 @@ test('global connection status reflects additional bots when the default bot is 
   state.connectionSummary = { status: 'connected', connected: 1, total: 2 };
   await setup(page, state);
   await expect(page.locator('.header-status .connection-pill')).toHaveText('1/2 个机器人已连接');
+  await page.getByRole('button', { name: '机器人', exact: true }).click();
+  await page.getByRole('tab', { name: '连接设置', exact: true }).click();
+  await expect(page.locator('.bot-connection-status:visible')).toHaveText('未连接');
+  await page.getByRole('button', { name: '管理产品经理', exact: true }).click();
+  await page.getByRole('tab', { name: '连接设置', exact: true }).click();
+  await expect(page.locator('.bot-connection-status:visible')).toHaveText('已连接');
+});
+
+
+test('group background defaults on and auto-saves separately for each bot', async ({ page }) => {
+  const { state, writes } = await setup(page);
+  const openRole = async () => {
+    await page.getByRole('button', { name: '机器人', exact: true }).click();
+  };
+  await openRole();
+  const toggle = page.getByRole('checkbox', { name: '补充群聊背景', exact: true });
+  await expect(toggle).toBeChecked();
+  await toggle.uncheck();
+  await expect.poll(() => state.bots![0].includeGroupContext).toBe(false);
+  await expect(page.getByText('仅处理 @我的消息，保留历史、引用和交接。', { exact: true })).toBeVisible();
+  await page.getByRole('button', { name: '管理产品经理', exact: true }).click();
+  await expect(toggle).toBeChecked();
+  await toggle.uncheck();
+  await expect.poll(() => state.bots![1].includeGroupContext).toBe(false);
+  await page.getByRole('button', { name: '管理开发', exact: true }).click();
+  await expect(toggle).not.toBeChecked();
+  await toggle.check();
+  await expect.poll(() => state.bots![0].includeGroupContext).toBe(true);
+  await page.reload();
+  await openRole();
+  await expect(toggle).toBeChecked();
+  await page.getByRole('button', { name: '管理产品经理', exact: true }).click();
+  await expect(toggle).not.toBeChecked();
+  expect(writes).toEqual([
+    { path: '/api/bots/default', method: 'PATCH', body: { includeGroupContext: false } },
+    { path: '/api/bots/product', method: 'PATCH', body: { includeGroupContext: false } },
+    { path: '/api/bots/default', method: 'PATCH', body: { includeGroupContext: true } },
+  ]);
+});
+
+
+test('failed group background auto-save retains its draft and offers a local retry', async ({ page }) => {
+  const { state } = await setup(page);
+  await page.route('**/api/bots/default', route => route.fulfill({ status: 503, json: { error: '测试保存失败' } }));
+  await page.getByRole('button', { name: '机器人', exact: true }).click();
+  const toggle = page.getByRole('checkbox', { name: '补充群聊背景', exact: true });
+  await toggle.click();
+  await expect(page.getByRole('alert')).toContainText('测试保存失败');
+  await expect(toggle).not.toBeChecked();
+  expect(state.bots![0].includeGroupContext).toBeUndefined();
+  await page.getByRole('button', { name: '管理产品经理', exact: true }).click();
+  await expect(toggle).toBeChecked();
+  await expect(page.getByRole('alert')).toHaveCount(0);
+  await page.getByRole('button', { name: '管理开发', exact: true }).click();
+  await expect(toggle).not.toBeChecked();
+  await expect(page.getByRole('alert')).toContainText('测试保存失败');
+  await page.unroute('**/api/bots/default');
+  await page.getByRole('button', { name: '重试', exact: true }).click();
+  await expect.poll(() => state.bots![0].includeGroupContext).toBe(false);
+});
+
+test('group and private role instructions auto-save independently for each bot and private roles can be cleared', async ({ page }) => {
+  const initial = fixture();
+  initial.bots![0].roleInstructions = '开发群聊角色';
+  initial.bots![1].roleInstructions = '产品群聊角色';
+  const { state, writes } = await setup(page, initial);
+  await page.getByRole('button', { name: '机器人', exact: true }).click();
+  const groupRole = page.getByRole('textbox', { name: '群聊角色说明', exact: true });
+  const privateRole = page.getByRole('textbox', { name: '私聊角色说明', exact: true });
+  const blur = () => page.getByRole('tab', { name: '对话设置', exact: true }).click();
+  await expect(privateRole).toHaveValue('');
+  await expect(page.locator('.bot-field[data-field="privateRoleInstructions"]:visible')).toContainText('可选；留空使用普通 Codex');
+  await groupRole.fill('负责群聊中的开发');
+  await blur();
+  await expect.poll(() => state.bots![0].roleInstructions).toBe('负责群聊中的开发');
+  await privateRole.fill('协助个人代码学习');
+  await blur();
+  await expect.poll(() => state.bots![0].privateRoleInstructions).toBe('协助个人代码学习');
+  await expect(groupRole).toHaveValue('负责群聊中的开发');
+  await page.getByRole('button', { name: '管理产品经理', exact: true }).click();
+  await expect(groupRole).toHaveValue('产品群聊角色');
+  await expect(privateRole).toHaveValue('');
+  await privateRole.fill('协助个人需求整理');
+  await blur();
+  await expect.poll(() => state.bots![1].privateRoleInstructions).toBe('协助个人需求整理');
+  await page.getByRole('button', { name: '管理开发', exact: true }).click();
+  await expect(privateRole).toHaveValue('协助个人代码学习');
+  await privateRole.fill('   ');
+  await blur();
+  await expect.poll(() => state.bots![0].privateRoleInstructions).toBe('');
+  await expect(privateRole).toHaveValue('');
+  await page.reload();
+  await page.getByRole('button', { name: '机器人', exact: true }).click();
+  await expect(groupRole).toHaveValue('负责群聊中的开发');
+  await expect(privateRole).toHaveValue('');
+  await page.getByRole('button', { name: '管理产品经理', exact: true }).click();
+  await expect(privateRole).toHaveValue('协助个人需求整理');
+  expect(writes).toEqual([
+    { path: '/api/bots/default', method: 'PATCH', body: { roleInstructions: '负责群聊中的开发' } },
+    { path: '/api/bots/default', method: 'PATCH', body: { privateRoleInstructions: '协助个人代码学习' } },
+    { path: '/api/bots/product', method: 'PATCH', body: { privateRoleInstructions: '协助个人需求整理' } },
+    { path: '/api/bots/default', method: 'PATCH', body: { privateRoleInstructions: '' } },
+  ]);
+  expect(state.bots![1].roleInstructions).toBe('产品群聊角色');
+});
+
+for (const field of ['roleInstructions', 'privateRoleInstructions'] as const) {
+  test(`failed ${field} saves keep their draft through other saves and bot switches and allow blur retry`, async ({ page }) => {
+    const initial = fixture();
+    initial.bots![0].roleInstructions = '已保存的群聊角色';
+    initial.bots![0].privateRoleInstructions = '已保存的私聊角色';
+    const { state, writes } = await setup(page, initial);
+    let failures = 0;
+    await page.route('**/api/bots/default', async route => {
+      if (field in route.request().postDataJSON()) {
+        failures += 1;
+        await route.fulfill({ status: 503, json: { error: '测试角色保存失败' } });
+      } else await route.fallback();
+    });
+    await page.getByRole('button', { name: '机器人', exact: true }).click();
+    const fieldLabel = field === 'roleInstructions' ? '群聊角色说明' : '私聊角色说明';
+    const otherLabel = field === 'roleInstructions' ? '私聊角色说明' : '群聊角色说明';
+    const otherField = field === 'roleInstructions' ? 'privateRoleInstructions' : 'roleInstructions';
+    const role = page.getByRole('textbox', { name: fieldLabel, exact: true });
+    const blur = () => page.getByRole('tab', { name: '对话设置', exact: true }).click();
+    const draft = '  保留尚未保存的角色草稿  ';
+    const saved = state.bots![0][field];
+    await role.fill(draft);
+    await blur();
+    await expect(page.getByRole('alert')).toContainText('测试角色保存失败');
+    await expect(page.locator('.toast')).toHaveCount(0);
+    await expect(role).toHaveValue(draft);
+    expect(state.bots![0][field]).toBe(saved);
+    await page.getByRole('textbox', { name: otherLabel, exact: true }).fill('另一个范围独立保存');
+    await blur();
+    await expect.poll(() => state.bots![0][otherField]).toBe('另一个范围独立保存');
+    await expect(role).toHaveValue(draft);
+    await page.getByRole('tab', { name: /访问权限/ }).click();
+    await expect(page.getByRole('alert')).toHaveCount(0);
+    await page.getByRole('tab', { name: '对话设置' }).click();
+    await expect(role).toHaveValue(draft);
+    await page.getByRole('button', { name: '对话', exact: true }).click();
+    await expect(page.getByRole('alert')).toHaveCount(0);
+    await page.getByRole('button', { name: '设置', exact: true }).click();
+    await expect(page.getByRole('alert')).toHaveCount(0);
+    await page.getByRole('button', { name: '机器人', exact: true }).click();
+    await expect(role).toHaveValue(draft);
+    await expect(page.getByRole('alert')).toContainText('测试角色保存失败');
+    await page.getByRole('button', { name: '管理产品经理', exact: true }).click();
+    await expect(role).toHaveValue('');
+    await expect(page.getByRole('alert')).toHaveCount(0);
+    await page.getByRole('button', { name: '管理开发', exact: true }).click();
+    await expect(role).toHaveValue(draft);
+    await page.unroute('**/api/bots/default');
+    await role.focus();
+    await blur();
+    await expect.poll(() => state.bots![0][field]).toBe(draft.trim());
+    await expect(role).toHaveValue(draft.trim());
+    expect(failures).toBe(1);
+    expect(writes).toEqual([
+      { path: '/api/bots/default', method: 'PATCH', body: { [otherField]: '另一个范围独立保存' } },
+      { path: '/api/bots/default', method: 'PATCH', body: { [field]: draft.trim() } },
+    ]);
+  });
+}
+
+test('bot selection remembers each tab and preserves unfinished credentials across all navigation', async ({ page }) => {
+  const { state, writes } = await setup(page);
+  await page.getByRole('button', { name: '机器人', exact: true }).click();
+  await expect(page.getByRole('tab', { name: '对话设置', exact: true })).toHaveAttribute('aria-selected', 'true');
+  await page.getByRole('tab', { name: '连接设置', exact: true }).click();
+  await expect(page.getByRole('textbox', { name: 'App ID', exact: true })).toHaveCount(0);
+  await page.getByRole('button', { name: '修改凭据', exact: true }).click();
+  await page.getByRole('textbox', { name: 'App ID', exact: true }).fill('cli_draftonly');
+  await page.getByRole('tab', { name: '连接设置', exact: true }).click();
+  await page.getByRole('button', { name: '验证并连接', exact: true }).click();
+  await expect(page.getByRole('alert')).toContainText('对应的 App Secret');
+  await page.getByRole('button', { name: '管理产品经理', exact: true }).click();
+  await expect(page.getByRole('tab', { name: '对话设置', exact: true })).toHaveAttribute('aria-selected', 'true');
+  await page.getByRole('tab', { name: /访问权限/ }).click();
   await page.getByRole('button', { name: '设置', exact: true }).click();
-  await expect(page.locator('.settings-content .inline-status')).toHaveText('飞书未连接');
-  await page.getByRole('combobox', { name: '管理机器人' }).selectOption('product');
-  await expect(page.locator('.settings-content .inline-status')).toHaveText('飞书已连接');
+  await page.getByRole('button', { name: '机器人', exact: true }).click();
+  await expect(page.getByRole('tab', { name: /访问权限/ })).toHaveAttribute('aria-selected', 'true');
+  await page.getByRole('button', { name: '管理开发', exact: true }).click();
+  await expect(page.getByRole('tab', { name: '连接设置', exact: true })).toHaveAttribute('aria-selected', 'true');
+  await expect(page.getByRole('textbox', { name: 'App ID', exact: true })).toHaveValue('cli_draftonly');
+  await expect(page.locator('input[type=password]:visible')).toHaveValue('');
+  expect(writes).toEqual([]);
+  expect(state.bots![0].appId).toBe('cli_default');
+  expect(state.bots![1].appId).toBe('cli_product');
+});
+
+test('an in-flight role save does not overwrite the other bot or lose its newer draft', async ({ page }) => {
+  const { state, writes } = await setup(page);
+  let release!: () => void;
+  let entered = false;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  await page.route('**/api/bots/default', async route => {
+    entered = true;
+    await gate;
+    await route.fallback();
+  });
+  await page.getByRole('button', { name: '机器人', exact: true }).click();
+  const role = page.getByRole('textbox', { name: '私聊角色说明', exact: true });
+  await role.fill('开发的独立私聊角色');
+  await page.getByRole('tab', { name: '对话设置', exact: true }).click();
+  await expect.poll(() => entered).toBe(true);
+  await page.getByRole('button', { name: '管理产品经理', exact: true }).click();
+  await expect(role).toHaveValue('');
+  await role.fill('产品的新草稿');
+  release();
+  await expect.poll(() => state.bots![0].privateRoleInstructions).toBe('开发的独立私聊角色');
+  await expect(role).toHaveValue('产品的新草稿');
+  expect(state.bots![1].privateRoleInstructions).toBeUndefined();
+  await page.getByRole('tab', { name: '对话设置', exact: true }).click();
+  await expect.poll(() => state.bots![1].privateRoleInstructions).toBe('产品的新草稿');
+  await page.getByRole('button', { name: '管理开发', exact: true }).click();
+  await expect(role).toHaveValue('开发的独立私聊角色');
+  expect(writes).toEqual([
+    { path: '/api/bots/default', method: 'PATCH', body: { privateRoleInstructions: '开发的独立私聊角色' } },
+    { path: '/api/bots/product', method: 'PATCH', body: { privateRoleInstructions: '产品的新草稿' } },
+  ]);
+});
+
+test('setup links route to bot connections', async ({ page }) => {
+  await setup(page, fixture(), '/?setup=feishu');
+  await expect(page.getByRole('button', { name: '机器人', exact: true })).toHaveClass(/selected/);
+  await expect(page.getByRole('tab', { name: '连接设置', exact: true })).toHaveAttribute('aria-selected', 'true');
+});
+
+test('pending first use routes to the requesting bot access', async ({ page }) => {
+  const firstUse = fixture();
+  firstUse.conversations = [];
+  await setup(page, firstUse);
+  await expect(page.getByRole('button', { name: '机器人', exact: true })).toHaveClass(/selected/);
+  await expect(page.getByRole('tab', { name: /访问权限/ })).toHaveAttribute('aria-selected', 'true');
+  await expect(page.getByRole('button', { name: '管理产品经理', exact: true })).toHaveAttribute('aria-pressed', 'true');
+  await expect(page.getByRole('button', { name: '允许访问', exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: '允许群聊', exact: true })).toBeVisible();
+});
+
+test('role save failures offer a local retry without a global error or unrelated writes', async ({ page }) => {
+  const { state, writes } = await setup(page);
+  await page.route('**/api/bots/product', route => route.fulfill({ status: 503, json: { error: '角色暂未保存' } }));
+  await page.getByRole('button', { name: '机器人', exact: true }).click();
+  await page.getByRole('button', { name: '管理产品经理', exact: true }).click();
+  const role = page.getByRole('textbox', { name: '群聊角色说明', exact: true });
+  await role.fill('产品群聊角色草稿');
+  await page.getByRole('tab', { name: '对话设置', exact: true }).click();
+  const field = page.locator('.bot-field[data-field="roleInstructions"]:visible');
+  await expect(field.getByRole('alert')).toContainText('角色暂未保存');
+  await expect(field.getByRole('button', { name: '重试', exact: true })).toBeVisible();
+  await expect(page.locator('.toast')).toHaveCount(0);
+  await expect(role).toHaveValue('产品群聊角色草稿');
+  await page.unroute('**/api/bots/product');
+  await field.getByRole('button', { name: '重试', exact: true }).click();
+  await expect.poll(() => state.bots![1].roleInstructions).toBe('产品群聊角色草稿');
+  await expect(field.getByRole('alert')).toHaveCount(0);
+  expect(writes).toEqual([{ path: '/api/bots/product', method: 'PATCH', body: { roleInstructions: '产品群聊角色草稿' } }]);
+  expect(state.bots![0].roleInstructions).toBe('');
+});
+
+test('cancelling edited credentials does not save the pair on blur', async ({ page }) => {
+  const { state, writes } = await setup(page);
+  await page.getByRole('button', { name: '机器人', exact: true }).click();
+  await page.getByRole('button', { name: '管理产品经理', exact: true }).click();
+  await page.getByRole('tab', { name: '连接设置', exact: true }).click();
+  await page.getByRole('button', { name: '修改凭据', exact: true }).click();
+  await page.getByRole('textbox', { name: 'App ID', exact: true }).fill('cli_cancelled');
+  await page.locator('input[type=password]:visible').fill('never-save-this-secret');
+  await page.getByRole('button', { name: '取消修改', exact: true }).click();
+  await expect(page.getByRole('button', { name: '修改凭据', exact: true })).toBeVisible();
+  expect(writes).toEqual([]);
+  expect(state.bots![1].appId).toBe('cli_product');
+  await page.getByRole('button', { name: '修改凭据', exact: true }).click();
+  await expect(page.getByRole('textbox', { name: 'App ID', exact: true })).toHaveValue('cli_product');
+  await expect(page.locator('input[type=password]:visible')).toHaveValue('');
+});
+
+test('a late save response preserves a newer edit to the same role field', async ({ page }) => {
+  const { state, writes } = await setup(page);
+  let release!: () => void;
+  let entered = false;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  await page.route('**/api/bots/default', async route => {
+    entered = true;
+    await gate;
+    await route.fallback();
+  });
+  await page.getByRole('button', { name: '机器人', exact: true }).click();
+  const role = page.getByRole('textbox', { name: '群聊角色说明', exact: true });
+  await role.fill('第一版群聊角色');
+  await page.getByRole('tab', { name: '对话设置', exact: true }).click();
+  await expect.poll(() => entered).toBe(true);
+  await role.fill('正在编辑的第二版群聊角色');
+  release();
+  await expect.poll(() => state.bots![0].roleInstructions).toBe('第一版群聊角色');
+  await expect(role).toHaveValue('正在编辑的第二版群聊角色');
+  await page.getByRole('tab', { name: '对话设置', exact: true }).click();
+  await expect.poll(() => state.bots![0].roleInstructions).toBe('正在编辑的第二版群聊角色');
+  expect(writes).toEqual([
+    { path: '/api/bots/default', method: 'PATCH', body: { roleInstructions: '第一版群聊角色' } },
+    { path: '/api/bots/default', method: 'PATCH', body: { roleInstructions: '正在编辑的第二版群聊角色' } },
+  ]);
+});
+
+test('changing effort during model save queues the later choice without another bot changing', async ({ page }) => {
+  const { state, writes } = await setup(page);
+  let release!: () => void;
+  let entered = false;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  await page.route('**/api/bots/product', async route => {
+    if ('model' in route.request().postDataJSON()) { entered = true; await gate; }
+    await route.fallback();
+  });
+  await page.getByRole('button', { name: '机器人', exact: true }).click();
+  await page.getByRole('button', { name: '管理产品经理', exact: true }).click();
+  await page.getByRole('combobox', { name: '机器人模型', exact: true }).selectOption('test-model');
+  await expect.poll(() => entered).toBe(true);
+  const effort = page.getByRole('combobox', { name: '机器人思考深度', exact: true });
+  await expect(effort).toHaveValue('high');
+  await effort.selectOption('low');
+  await expect(effort).toHaveValue('low');
+  release();
+  await expect.poll(() => state.bots![1].effort).toBe('low');
+  await expect(effort).toHaveValue('low');
+  expect(writes).toEqual([
+    { path: '/api/bots/product', method: 'PATCH', body: { model: 'test-model', effort: 'high' } },
+    { path: '/api/bots/product', method: 'PATCH', body: { effort: 'low' } },
+  ]);
+  expect(state.bots![0].model).toBe('');
+  expect(state.bots![0].effort).toBe('');
+});
+
+test('explicit verification reconnects saved credentials while untouched blur stays quiet', async ({ page }) => {
+  const initial = fixture();
+  initial.bots![1].enabled = false;
+  initial.bots![1].connection = { status: 'stopped' };
+  const { state, writes } = await setup(page, initial);
+  await page.getByRole('button', { name: '机器人', exact: true }).click();
+  await page.getByRole('button', { name: '管理产品经理', exact: true }).click();
+  await page.getByRole('tab', { name: '连接设置', exact: true }).click();
+  await expect(page.locator('.bot-connection-status:visible')).toHaveText('未连接');
+  await page.getByRole('button', { name: '修改凭据', exact: true }).click();
+  await page.getByRole('textbox', { name: 'App ID', exact: true }).focus();
+  await page.getByRole('tab', { name: '连接设置', exact: true }).click();
+  expect(writes).toEqual([]);
+  await page.getByRole('button', { name: '验证并连接', exact: true }).click();
+  await expect(page.getByRole('button', { name: '修改凭据', exact: true })).toBeVisible();
+  await expect(page.locator('.bot-connection-status:visible')).toHaveText('已连接');
+  expect(writes).toEqual([{ path: '/api/bots/product/credentials', method: 'POST', body: { appId: 'cli_product' } }]);
+  expect(state.bots![1].enabled).toBe(true);
+  expect(state.bots![0].appId).toBe('cli_default');
 });

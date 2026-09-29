@@ -12,7 +12,10 @@ export type Config = {
   appId: string; hasSecret: boolean; enabled: boolean; allowedActors: string[];
   defaultWorkspace: string; model: string; effort: string; progress: boolean; autoNotifyDesktop: boolean;
   desktopNotificationMode: 'all' | 'long'; desktopNotificationMinMinutes: number;
+  desktopNotificationTarget?: DesktopNotificationTarget | null;
 };
+export type DesktopNotificationTarget = { chatId: string; actorId: string; botAppId: string };
+export type NotificationTarget = DesktopNotificationTarget & { botId: string; botName: string };
 export type PendingRequest = {
   id: string; chatId: string; kind: 'approval' | 'question'; title: string; text: string;
   questions?: { id: string; question: string; options?: { label: string; description?: string }[] }[];
@@ -26,6 +29,7 @@ export type AppState = {
   codex: { available: boolean; authenticated?: boolean; version?: string; mode?: string; error?: string };
   runtime?: DesktopStatus;
   conversations: Conversation[];
+  notificationTargets?: NotificationTarget[];
   bots?: BotProfile[];
   pendingActors: { actorId: string; chatId: string; lastSeenAt: string; botId?: string; botName?: string }[];
   pendingGroups?: { botId: string; chatId: string; title?: string; actorId?: string; lastSeenAt?: string }[];
@@ -35,6 +39,8 @@ export type AppState = {
 export type BotProfile = {
   id: string; name: string; appId: string; hasSecret: boolean; enabled: boolean;
   allowedActors: string[]; allowedGroups: string[]; roleInstructions: string; model: string; effort: string;
+  includeGroupContext?: boolean;
+  privateRoleInstructions?: string;
   connection: AppState['connection'];
 };
 export type DesktopStatus = {

@@ -1,14 +1,20 @@
 export type ConnectionStatus = 'stopped' | 'connecting' | 'connected' | 'error';
 export type BotProfile = {
   id: string; name: string; appId: string; appSecret: string; enabled: boolean;
-  allowedActors: string[]; allowedGroups: string[]; roleInstructions: string; model: string; effort: string;
+  allowedActors: string[]; allowedGroups: string[]; roleInstructions: string; privateRoleInstructions?: string; model: string; effort: string;
+  /** Automatically supplement recent group discussion; omitted legacy values default to true. */
+  includeGroupContext?: boolean;
 };
 export type BridgeConfig = {
   appId: string; appSecret: string; enabled: boolean; allowedActors: string[];
   defaultWorkspace: string; model: string; effort: string; progress: boolean; autoNotifyDesktop: boolean;
   desktopNotificationMode: 'all' | 'long'; desktopNotificationMinMinutes: number;
-  botName?: string; roleInstructions?: string; allowedGroups?: string[]; bots?: BotProfile[];
+  botName?: string; roleInstructions?: string; privateRoleInstructions?: string; allowedGroups?: string[]; bots?: BotProfile[];
+  includeGroupContext?: boolean;
+  desktopNotificationTarget?: DesktopNotificationTarget | null;
 };
+export type DesktopNotificationTarget = { chatId: string; actorId: string; botAppId: string };
+export type DesktopNotificationTargetOption = DesktopNotificationTarget & { botId: string; botName: string };
 export type Project = { path: string; name: string; threadCount: number; lastActiveAt: string };
 export type ThreadSummary = { id: string; title: string; cwd: string; updatedAt: string; preview: string };
 export type ModelInfo = { id: string; name: string; efforts: string[]; defaultEffort: string };
@@ -49,6 +55,8 @@ export type RuntimeAnswer = { decision?: 'accept' | 'decline'; answers?: Record<
 export type CodexRunInput = {
   cwd: string; threadId?: string; prompt: string; images?: string[]; model?: string; effort?: string;
   roleInstructions?: string;
+  /** Bridge-owned channel identity; never inferred from user text. */
+  channel?: 'feishu' | 'local-preview';
   /** Automated relay work must not steer a task already started on the desktop. */
   allowSteering?: boolean;
   onThread?: (id: string) => void;
@@ -58,7 +66,7 @@ export type CodexRunInput = {
   onSubmitted?: (event: { threadId: string; turnId?: string; mode: 'start' | 'steer'; status: 'submitting' | 'submitted' | 'uncertain' | 'rejected' }) => void;
   onBeforeSubmit?: () => void | Promise<void>;
   /** Resolve incremental background inside the runtime submission lock. */
-  preparePrompt?: (threadId: string) => string | Promise<string>;
+  preparePrompt?: (threadId: string, options?: { compactChannelHeader: boolean }) => string | Promise<string>;
 };
 export type RuntimeEvent = { method: string; threadId?: string; turnId?: string; params?: Record<string, unknown> };
 export type BridgeEvent = { type: 'state' | 'history' | 'runtime'; chatId?: string; threadId?: string; event?: RuntimeEvent; delta?: { threadId: string; turnId: string; itemId: string; text: string; phase?: string } };
@@ -71,6 +79,9 @@ export type CompletionNotification = {
   automatic?: boolean; sessionTitle?: string; result?: string;
   timing?: TurnTiming; skipReason?: 'short' | 'timing-unavailable';
   outcome?: 'completed' | 'failed' | 'interrupted'; completedAt?: string; messageId?: string;
+  /** Pin the receiving application across configuration changes while a task is running. */
+  botAppId?: string;
+  chatType?: 'p2p' | 'group';
 };
 export type ArtifactDeliveryResult = {
   path: string; name: string; kind: 'image' | 'file';

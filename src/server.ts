@@ -275,6 +275,7 @@ export async function startServer(options: { port?: number; dataDir?: string; co
             stats: { messagesToday: store.state.dailyMessages[localDay()] ?? 0, totalTurns: store.state.totalTurns },
             conversations: bridge.conversations(), pendingActors: store.state.pendingActors, pendingGroups: store.state.pendingGroups,
             activeWork: bridge.hasActiveWork(),
+            notificationTargets: store.notificationTargets(),
             pendingRequests: bridge.pendingRequests(), logs: store.state.logs
           });
         }
@@ -362,12 +363,20 @@ export async function startServer(options: { port?: number; dataDir?: string; co
           assertUniqueApp('default', patch.appId ?? store.config.appId);
           const credentialsChanged = (patch.appId !== undefined && patch.appId !== store.config.appId) || Boolean(patch.appSecret && patch.appSecret !== store.config.appSecret);
           if (credentialsChanged && bridge.hasActiveWork()) throw new UserError('请等当前对话完成后再更换应用凭据。', 409);
-          if (credentialsChanged && store.config.enabled) await setConnection(false);
           const appChanged = patch.appId !== undefined && patch.appId !== store.config.appId;
           if (appChanged) {
             if (!patch.appSecret) patch.appSecret = '';
             patch.allowedActors = []; patch.allowedGroups = [];
           }
+          if (patch.desktopNotificationTarget) {
+            const target = patch.desktopNotificationTarget;
+            const matches = (candidate: NonNullable<BridgeConfig['desktopNotificationTarget']>) => candidate.chatId === target.chatId
+              && candidate.actorId === target.actorId && candidate.botAppId === target.botAppId;
+            if (!store.notificationTargets().some(matches) || !store.notificationTargets({ ...store.config, ...patch }).some(matches)) {
+              throw new UserError('默认通知接收位置不可用，请选择已配置机器人下仍获授权的飞书私聊。');
+            }
+          }
+          if (credentialsChanged && store.config.enabled) await setConnection(false);
           store.saveConfig(patch);
           if (appChanged) store.resetBotBindings('default');
           if (patch.allowedActors || patch.allowedGroups) await stopUnauthorized('default');
@@ -557,7 +566,24 @@ function validateConfig(body: Record<string, unknown>): Partial<BridgeConfig> {
   }
   if (body.allowedGroups !== undefined) result.allowedGroups = validateIdList(body.allowedGroups, /^oc_[\w-]+$/, '授权群名单应为飞书 chat_id 列表。');
   if (body.botName !== undefined) result.botName = validateString(body.botName, '机器人名称', 80, true);
-  if (body.roleInstructions !== undefined) result.roleInstructions = validateString(body.roleInstructions, '角色说明', 12_000);
+  if (body.roleInstructions !== undefined) result.roleInstructions = validateString(body.roleInstructions, '群聊角色说明', 12_000);
+  if (body.privateRoleInstructions !== undefined) result.privateRoleInstructions = validateString(body.privateRoleInstructions, '私聊角色说明', 12_000);
+  if (body.includeGroupContext !== undefined) result.includeGroupContext = validateGroupContextSetting(body.includeGroupContext);
+  if (body.desktopNotificationTarget !== undefined) {
+    const value = body.desktopNotificationTarget;
+    if (value === null) result.desktopNotificationTarget = null;
+    else {
+      if (!value || typeof value !== 'object' || Array.isArray(value)) throw new UserError('默认通知接收位置格式无效');
+      const target = value as Record<string, unknown>;
+      if (Object.keys(target).length !== 3 || typeof target.chatId !== 'string' || target.chatId.length > 500
+        || typeof target.actorId !== 'string' || !/^ou_[\w-]{1,180}$/.test(target.actorId)
+        || typeof target.botAppId !== 'string' || !/^cli_[a-zA-Z0-9]{1,180}$/.test(target.botAppId)) throw new UserError('默认通知接收位置格式无效');
+      let route: ReturnType<typeof parseRoute>;
+      try { route = parseRoute(target.chatId); } catch { throw new UserError('默认通知接收位置格式无效'); }
+      if (!/^oc_[\w-]{1,180}$/.test(route.id)) throw new UserError('默认通知接收位置必须是飞书私聊');
+      result.desktopNotificationTarget = { chatId: target.chatId, actorId: target.actorId, botAppId: target.botAppId };
+    }
+  }
   return result;
 }
 function validateString(value: unknown, label: string, max: number, nonempty = false): string {
@@ -570,17 +596,23 @@ function validateIdList(value: unknown, pattern: RegExp, error: string): string[
 }
 function validateBot(body: Record<string, unknown>): Partial<BotProfile> {
   const patch: Partial<BotProfile> = {};
-  for (const name of ['name', 'appId', 'appSecret', 'roleInstructions', 'model', 'effort'] as const) {
+  for (const name of ['name', 'appId', 'appSecret', 'roleInstructions', 'privateRoleInstructions', 'model', 'effort'] as const) {
     if (body[name] === undefined) continue;
-    const max = name === 'roleInstructions' ? 12_000 : name === 'name' ? 80 : 1500;
-    const value = validateString(body[name], name, max, name === 'name');
+    const max = name === 'roleInstructions' || name === 'privateRoleInstructions' ? 12_000 : name === 'name' ? 80 : 1500;
+    const label = name === 'privateRoleInstructions' ? '私聊角色说明' : name === 'roleInstructions' ? '群聊角色说明' : name;
+    const value = validateString(body[name], label, max, name === 'name');
     if (name === 'appSecret' && !value) continue;
     patch[name] = value;
   }
   if (patch.appId !== undefined && !/^cli_[\da-f]{16}$/i.test(patch.appId)) throw new UserError('请填写有效的飞书 App ID。');
   if (body.allowedActors !== undefined) patch.allowedActors = validateIdList(body.allowedActors, /^ou_[\w-]+$/, '授权名单应为飞书 open_id 列表。');
   if (body.allowedGroups !== undefined) patch.allowedGroups = validateIdList(body.allowedGroups, /^oc_[\w-]+$/, '授权群名单应为飞书 chat_id 列表。');
+  if (body.includeGroupContext !== undefined) patch.includeGroupContext = validateGroupContextSetting(body.includeGroupContext);
   return patch;
+}
+function validateGroupContextSetting(value: unknown): boolean {
+  if (typeof value !== 'boolean') throw new UserError('补充群聊背景设置无效');
+  return value;
 }
 function validateAnswers(value: unknown): Record<string, { answers: string[] }> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new UserError('回答格式无效');
