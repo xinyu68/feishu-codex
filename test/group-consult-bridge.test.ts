@@ -86,7 +86,8 @@ test('Hermes consultation artifacts use the target bot and original group once w
   });
   h.runWith(async (_input, prompt) => (await h.ask(prompt)).answer);
   await h.bridge.receive(h.message());
-  assert.deepEqual(sends, files.map((file, index) => ({ chatId: targetChat, file: fs.realpathSync(file), kind: index === 0 ? 'image' : 'file' })));
+  const canonicalFiles = await Promise.all(files.map(file => fs.promises.realpath(file)));
+  assert.deepEqual(sends, canonicalFiles.map((file, index) => ({ chatId: targetChat, file, kind: index === 0 ? 'image' : 'file' })));
   assert.equal(h.store.state.conversations[targetChat], undefined);
   assert.equal(h.store.state.threadBindings['hermes:consultation-1'], undefined, 'artifact routing does not rebind the ordinary chat');
 });
