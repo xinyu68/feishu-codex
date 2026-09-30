@@ -8,6 +8,11 @@ import type { CodexRunInput } from '../src/types.js';
 import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { Bridge } from '../src/bridge.js';
+import { Store } from '../src/store.js';
+import { RuntimeRouter } from '../src/runtime-router.js';
+import { conversationKey, namespaceMessage } from '../src/routing.js';
+import type { CodexRuntime, InboundMessage } from '../src/types.js';
 
 type Row = { live: string; stored: string; running: boolean; history: { role: string; content: string; tool_calls?: unknown[]; tool_call_id?: string; tool_name?: string }[] };
 type Request = { id: number; method: string; params: Record<string, any> };
@@ -288,6 +293,113 @@ function persistHandoff(row: Row, id: string, result: unknown = { result: '申�
   row.history.push({ role: 'assistant', content: '', tool_calls: [{ id, type: 'function', function: { name: handoffTool, arguments: JSON.stringify(handoffArgs) } }] });
   row.history.push({ role: 'tool', content: JSON.stringify(result), tool_call_id: id, tool_name: handoffTool });
 }
+
+const artifactTool = 'mcp_feishu_completion_send_artifact_to_feishu';
+function persistArtifact(row: Row, id: string, paths: string[], result: unknown = { result: '已提交', structuredContent: { paths } }): void {
+  row.history.push({ role: 'assistant', content: '', tool_calls: [{ id, type: 'function', function: { name: artifactTool, arguments: JSON.stringify({ paths }) } }] });
+  row.history.push({ role: 'tool', content: JSON.stringify(result), tool_call_id: id, tool_name: artifactTool });
+}
+
+for (const chatType of ['p2p', 'group'] as const) test(`Hermes sends actual image and file receipts through its own ${chatType} bot without replaying old calls`, async () => {
+  let paths: string[] = [], count = 0;
+  const fx = await fixture({ onPrompt(socket, row) {
+    if (count++ === 0) {
+      const payload = { name: artifactTool, tool_id: 'files', args: { paths }, result: { result: '已提交', structuredContent: { paths } } };
+      fx.event(socket, row, 'tool.complete', { ...payload, tool_id: 'orphan' });
+      fx.event(socket, row, 'tool.start', { ...payload, tool_id: 'submirror:other' });
+      fx.event(socket, row, 'tool.complete', { ...payload, tool_id: 'submirror:other' });
+      fx.event(socket, row, 'tool.start', payload);
+      fx.event(socket, row, 'tool.complete', payload);
+      fx.event(socket, row, 'tool.complete', payload);
+      persistArtifact(row, 'files', paths);
+      if (chatType === 'group') row.stored = 'compacted-with-artifacts';
+    }
+    fx.finish(socket, row, '文件请求已提交');
+  } });
+  const store = new Store(path.join(fx.hermesHome, 'bridge'));
+  store.saveConfig({ enabled: true, appId: 'cli_codex', allowedActors: ['human'], defaultWorkspace: fx.hermesHome, progress: false });
+  store.saveBot('hermes', { enabled: true, appId: 'cli_hermes', engine: 'hermes', name: 'Hermes', allowedActors: ['human'], allowedGroups: ['chat'] });
+  const unusedCodex: CodexRuntime = {
+    async run() { throw new Error('must not use Codex for Hermes'); }, async stop() {}, async release() {}, async close() {},
+    async models() { return []; }, async history() { return []; }, async status() { return { available: true }; },
+  };
+  const bridge = new Bridge(store, new RuntimeRouter(unusedCodex, fx.client), { projects: async () => [], threads: async () => [] });
+  const sends: Array<{ kind: string; chatId: string; path: string }> = [];
+  const events: any[] = [];
+  fx.client.subscribe(event => events.push(event));
+  bridge.transport = {
+    async start() {}, async close() {}, async sendText() { return 'text'; }, async sendCard() { return 'card'; }, async updateCard() {},
+    async startTyping() { return async () => {}; },
+    async sendImage(chatId, file) { sends.push({ kind: 'image', chatId, path: file }); return 'image-id'; },
+    async sendFile(chatId, file) { sends.push({ kind: 'file', chatId, path: file }); return 'file-id'; },
+  };
+  try {
+    paths = [path.join(fx.hermesHome, '图片.png'), path.join(fx.hermesHome, '报告.txt')];
+    await Promise.all(paths.map(file => writeFile(file, 'mock artifact')));
+    const fs = await import('node:fs/promises');
+    paths = await Promise.all(paths.map(file => fs.realpath(file)));
+    const message = (id: string): InboundMessage => namespaceMessage('hermes', { id, chatId: 'chat', actorId: 'human', text: '发送指定图片和文件', chatType });
+    await bridge.receive(message('first'));
+    for (let i = 0; i < 100 && Object.values(store.state.artifacts)[0]?.status !== 'sent'; i++) await new Promise(resolve => setTimeout(resolve, 10));
+    assert.deepEqual(sends, paths.map((file, i) => ({ kind: i === 0 ? 'image' : 'file', chatId: conversationKey('hermes', 'chat'), path: file })));
+    assert.equal(Object.values(store.state.artifacts).length, 1);
+    assert.equal(Object.values(store.state.artifacts)[0].status, 'sent');
+    assert.equal(events.filter(event => event.method === 'item/completed').length, 1, 'live and persisted receipt are deduplicated');
+    assert.equal(events[1].threadId, chatType === 'group' ? 'hermes:compacted-with-artifacts' : 'hermes:stored-1');
+    await bridge.receive(message('second'));
+    await bridge.receive(message('second'));
+    await bridge.deliverPendingArtifacts();
+    assert.equal(sends.length, 2, 'old files and duplicate incoming events must never resend');
+    assert.equal(count, 2);
+  } finally { await bridge.close(); await fx.cleanup(); }
+});
+
+test('Hermes artifact reconciliation works without tool progress and rejects failed, mismatched and unanchored receipts', async () => {
+  let paths: string[] = [], count = 0;
+  const fx = await fixture({ onPrompt(socket, row) {
+    const n = count++;
+    persistArtifact(row, `files-${n}`, paths, n === 1 ? { error: 'MCP failed' }
+      : n === 2 ? { structuredContent: { paths: ['C:/different/private.txt'] } } : undefined);
+    if (n === 3) row.history.push({ role: 'user', content: 'unrelated desktop turn' });
+    fx.finish(socket, row);
+  } });
+  try {
+    const file = path.join(fx.hermesHome, 'explicit.txt');
+    await writeFile(file, 'explicit artifact');
+    paths = [await import('node:fs/promises').then(fs => fs.realpath(file))];
+    const events: any[] = [];
+    fx.client.subscribe(event => { if (event.method === 'item/completed') events.push(event); });
+    let threadId: string | undefined;
+    for (let i = 0; i < 4; i++) threadId = (await fx.client.run({ cwd: 'C:/work', threadId, prompt: 'send my file' })).threadId;
+    assert.deepEqual(events.map(event => event.params.item.status), ['completed', 'failed', 'failed', 'failed']);
+    assert.equal(events[0].params.item.tool, 'send_artifact_to_feishu');
+    assert.deepEqual(events[0].params.item.arguments, { paths });
+  } finally { await fx.cleanup(); }
+});
+
+test('Hermes consultation delivers a file through its scoped callback before returning and never emits a recursive handoff', async () => {
+  let paths: string[] = [];
+  const fx = await fixture({ onPrompt(socket, row) {
+    persistArtifact(row, 'consult-files', paths);
+    persistHandoff(row, 'recursive');
+    fx.finish(socket, row);
+  } });
+  try {
+    const file = path.join(fx.hermesHome, 'consult.txt');
+    await writeFile(file, 'consult artifact');
+    paths = [await import('node:fs/promises').then(fs => fs.realpath(file))];
+    const callbacks: unknown[] = [], publicEvents: unknown[] = [];
+    fx.client.subscribe(event => publicEvents.push(event));
+    const result = await fx.client.consult({ cwd: 'C:/work', prompt: 'send this explicit file', signal: new AbortController().signal,
+      onArtifact: async receipt => { await new Promise(resolve => setTimeout(resolve, 30)); callbacks.push(receipt); },
+    });
+    assert.equal(callbacks.length, 1);
+    assert.deepEqual(callbacks[0], { threadId: result.threadId, turnId: (callbacks[0] as any).turnId, itemId: 'consult-files', paths });
+    assert.match((callbacks[0] as any).turnId, /^hermes-turn:/);
+    assert.deepEqual(publicEvents, []);
+    assert.equal(fx.trace.some(row => row.method === 'reload.mcp'), false, 'consultation must not disturb another active Hermes task');
+  } finally { await fx.cleanup(); }
+});
 
 test('Hermes reconciles only its current native tool receipts when tool progress is off', async () => {
   const fx = await fixture({ onPrompt(socket, row) {

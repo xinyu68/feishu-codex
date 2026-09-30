@@ -198,4 +198,6 @@ export type RuntimeConsultInput = {
   onRequest?: (request: RuntimeRequest) => Promise<RuntimeAnswer>;
   /** Recheck the source authorization immediately before submitting the consultation. */
   onBeforeSubmit?: () => void | Promise<void>;
+  /** Deliver an explicit artifact from this dedicated consultation to its original group. */
+  onArtifact?: (request: { threadId: string; turnId: string; itemId: string; paths: string[] }) => Promise<void>;
 };

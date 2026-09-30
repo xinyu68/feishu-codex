@@ -1,6 +1,5 @@
-import { lstat, realpath, stat } from 'node:fs/promises';
-import path from 'node:path';
 import { createInterface } from 'node:readline';
+import { ARTIFACT_TOOL_NAME, MAX_ARTIFACTS, validateArtifactPaths } from './artifact-request.js';
 import { GROUP_HANDOFF_REQUEST_SCHEMA, GROUP_HANDOFF_TOOL_NAME, validateGroupHandoffRequest } from './group-handoff-request.js';
 import { GROUP_CONSULT_REQUEST_SCHEMA, GROUP_CONSULT_TOOL_NAME, validateGroupConsultRequest } from './group-consult-request.js';
 import { consultFeishuGroupAgent } from './group-consult-client.js';
@@ -10,13 +9,8 @@ import { sendMessageToFeishu } from './message-client.js';
 type RpcRequest = { jsonrpc?: string; id?: string | number | null; method?: string; params?: Record<string, unknown> };
 
 const NOTIFICATION_TOOL_NAME = 'request_feishu_completion_notification';
-const ARTIFACT_TOOL_NAME = 'send_artifact_to_feishu';
-const MAX_ARTIFACTS = 5;
-const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
-const MAX_FILE_BYTES = 30 * 1024 * 1024;
-const IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp']);
-// Hermes supports bridge-owned handoffs, consultations and immediate messages. Do not advertise
-// desktop notifications or artifact delivery without a bound Hermes runtime.
+// Hermes artifact receipts are reconciled by its bound runtime. Desktop completion
+// notifications still require Codex's native turn lifecycle.
 const hermesMode = process.env.FEISHU_CODEX_MCP_MODE === 'hermes';
 const tools: Array<{ name: string; description: string; inputSchema: Record<string, unknown> }> = [{
   name: NOTIFICATION_TOOL_NAME,
@@ -28,7 +22,7 @@ const tools: Array<{ name: string; description: string; inputSchema: Record<stri
   },
 }, {
   name: ARTIFACT_TOOL_NAME,
-  description: '仅当用户明确要求把某个已知的本地成品图片或文件发送到飞书时调用。只传用户点名或本轮明确生成的成品文件，不要扫描项目、不要发送目录、通配符、源码改动、密钥或其他未明确要求的文件。图片会作为飞书图片发送，其他文件会作为飞书文件发送。普通编码任务结束时不要自动调用。',
+  description: '仅当用户明确要求把某个已知的本地成品图片或文件发送到飞书时调用。发送到当前任务绑定的私聊或群聊，不使用默认通知机器人；Hermes 在本轮结束后由桥接发送。只传用户点名或本轮明确生成的成品文件，不要扫描项目、不要发送目录、通配符、源码改动、密钥或其他未明确要求的文件。图片会作为飞书图片发送，其他文件会作为飞书文件发送。返回已提交不等于送达，以桥接的实际发送结果为准。普通编码任务结束时不要自动调用。',
   inputSchema: {
     type: 'object',
     properties: {
@@ -54,31 +48,12 @@ tools.push({
   description: '用户明确要求现在把一段文字发到自己的飞书时调用；通过应用已配置的默认通知机器人发到指定私聊，立即等待飞书确认，不必结束本轮。自行生成 request_id，同一次发送核对或重试复用原编号。普通飞书回复已自动转发，不调用此工具重复发送；“做完通知我”使用完成通知工具。通过本应用发给默认接收人优先用此工具；用户明确指定飞书 CLI 时遵循其选择，同一发送不得再调用 CLI 或其他工具补发。',
   inputSchema: MESSAGE_REQUEST_SCHEMA,
 });
-const hermesTools = new Set([GROUP_HANDOFF_TOOL_NAME, GROUP_CONSULT_TOOL_NAME, MESSAGE_TOOL_NAME]);
+const hermesTools = new Set([ARTIFACT_TOOL_NAME, GROUP_HANDOFF_TOOL_NAME, GROUP_CONSULT_TOOL_NAME, MESSAGE_TOOL_NAME]);
 const consultations = new Map<string | number, { controller: AbortController; cancelled: boolean }>();
 
 function write(value: unknown): void { process.stdout.write(`${JSON.stringify(value)}\n`); }
 function result(id: RpcRequest['id'], value: unknown): void { if (id !== undefined && id !== null) write({ jsonrpc: '2.0', id, result: value }); }
 function failure(id: RpcRequest['id'], code: number, message: string): void { if (id !== undefined && id !== null) write({ jsonrpc: '2.0', id, error: { code, message } }); }
-
-async function validateArtifactPaths(value: unknown): Promise<string[]> {
-  if (!Array.isArray(value) || value.length < 1 || value.length > MAX_ARTIFACTS) throw new Error(`paths must contain 1-${MAX_ARTIFACTS} files`);
-  const resolved: string[] = [];
-  for (const entry of value) {
-    if (typeof entry !== 'string' || !entry.trim() || /[*?]/.test(entry)) throw new Error('each path must be an absolute file path without wildcards');
-    const candidate = entry.trim();
-    if (!path.isAbsolute(candidate)) throw new Error('each path must be absolute');
-    const linkInfo = await lstat(candidate).catch(() => undefined);
-    if (!linkInfo?.isFile() || linkInfo.isSymbolicLink()) throw new Error(`not a regular file: ${path.basename(candidate) || candidate}`);
-    const canonical = await realpath(candidate);
-    const info = await stat(canonical);
-    const limit = IMAGE_EXTENSIONS.has(path.extname(canonical).toLowerCase()) ? MAX_IMAGE_BYTES : MAX_FILE_BYTES;
-    if (info.size <= 0) throw new Error(`file is empty: ${path.basename(canonical)}`);
-    if (info.size > limit) throw new Error(`${path.basename(canonical)} exceeds the ${limit / 1024 / 1024} MB limit`);
-    resolved.push(canonical);
-  }
-  return [...new Set(resolved)];
-}
 
 const input = createInterface({ input: process.stdin, crlfDelay: Infinity });
 input.on('close', () => {

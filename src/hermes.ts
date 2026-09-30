@@ -6,7 +6,8 @@ import { ensureHermesSkill, type HermesSkillResult } from './hermes-skill.js';
 import { ensureHermesMcp } from './hermes-mcp.js';
 import { recordManagedHermesHome } from './hermes-cleanup.js';
 import { GROUP_HANDOFF_TOOL_NAME, validateGroupHandoffRequest } from './group-handoff-request.js';
-import { collectHermesHandoffReceipts } from './hermes-handoff-receipts.js';
+import { collectHermesToolReceipts } from './hermes-handoff-receipts.js';
+import { ARTIFACT_TOOL_NAME, validateArtifactPaths } from './artifact-request.js';
 import { consultationAborted, consultationInstructions, declineConsultationRequest } from './runtime-consult.js';
 import { cleanBridgeText } from './discovery.js';
 import type { CodexRunInput, CodexRuntime, HistoryMessage, ModelInfo, RuntimeConsultInput, RuntimeEvent, RuntimeThreadInfo, TurnTiming } from './types.js';
@@ -19,9 +20,10 @@ type Active = {
   delta: string; final?: { text: string; status: string }; requests: Set<string>; idleSince?: number;
   resolve: (value: { threadId: string; turnId: string; text: string }) => void;
   reject: (error: Error) => void; poll?: NodeJS.Timeout; timeout?: NodeJS.Timeout; checking: boolean;
-  submittedPrompt: string; toolStarts: Set<string>; toolReceipts: Set<string>;
-  liveReceipts: Map<string, { args: unknown; result: unknown }>;
+  submittedPrompt: string; toolStarts: Map<string, string>; toolReceipts: Set<string>;
+  liveReceipts: Map<string, { tool: string; args: unknown; result: unknown }>;
   consultation?: boolean;
+  onArtifact?: RuntimeConsultInput['onArtifact'];
 };
 type Options = {
   baseUrl?: string;
@@ -36,6 +38,7 @@ type Options = {
 };
 
 const HERMES_HANDOFF_TOOL = `mcp_feishu_completion_${GROUP_HANDOFF_TOOL_NAME}`;
+const HERMES_ARTIFACT_TOOL = `mcp_feishu_completion_${ARTIFACT_TOOL_NAME}`;
 
 class RpcError extends Error {
   constructor(readonly method: string, readonly code: number) { super(`Hermes 操作失败（${method}，${code}）。`); }
@@ -126,7 +129,8 @@ export class HermesClient implements CodexRuntime {
       // A transport error can arrive while prompt.submit's acknowledgement is still pending.
       void completed.catch(() => undefined);
       active = { session, input, turnId, submitted: false, acknowledged: false, delta: '', requests: new Set(), resolve, reject, checking: false,
-        submittedPrompt: skill ? this.promptWithPolicy(prompt, skill, turnId) : prompt, toolStarts: new Set(), toolReceipts: new Set(), liveReceipts: new Map(), consultation: Boolean(consultation) };
+        submittedPrompt: skill ? this.promptWithPolicy(prompt, skill, turnId) : `<feishu_bridge_turn id="${turnId}" />\n${prompt}`,
+        toolStarts: new Map(), toolReceipts: new Set(), liveReceipts: new Map(), consultation: Boolean(consultation), onArtifact: consultation?.onArtifact };
       this.active.set(session.liveId, active);
       this.turns.set(turnId, { state: 'inProgress', timing: { startedAtMs: Date.now() } });
       active.timeout = setTimeout(() => {
@@ -312,7 +316,7 @@ export class HermesClient implements CodexRuntime {
           this.sessions.set(active.session.threadId, active.session);
           active.input.onThread?.(active.session.threadId);
         }
-        if (await this.reconcileHandoffReceipts(active) && active.final === final && this.active.get(active.session.liveId) === active) this.finish(active);
+        if (await this.reconcileToolReceipts(active) && active.final === final && this.active.get(active.session.liveId) === active) this.finish(active);
       } else active.idleSince = undefined;
     } catch (error) {
       this.fail(active, error instanceof Error ? error : new Error('Hermes 状态查询失败。'), 'unknown');
@@ -334,7 +338,11 @@ export class HermesClient implements CodexRuntime {
       valid = !result.error && result.isError !== true && request.target === receipt.target && request.task === receipt.task;
       structuredContent = receipt;
     } catch { /* Invalid, failed and incomplete tool results cannot dispatch. */ }
-    const item = { id, type: 'mcpToolCall', server: 'feishu_completion', tool: GROUP_HANDOFF_TOOL_NAME, arguments: args };
+    this.emitToolReceipt(active, id, GROUP_HANDOFF_TOOL_NAME, args, valid, structuredContent);
+  }
+
+  private emitToolReceipt(active: Active, id: string, tool: string, args: unknown, valid: boolean, structuredContent?: unknown): void {
+    const item = { id, type: 'mcpToolCall', server: 'feishu_completion', tool, arguments: args };
     for (const event of [
       { method: 'item/started', params: { item: { ...item, status: 'inProgress' } } },
       { method: 'item/completed', params: { item: { ...item, status: valid ? 'completed' : 'failed', result: { isError: !valid, structuredContent } } } },
@@ -345,39 +353,78 @@ export class HermesClient implements CodexRuntime {
     }
   }
 
-  private async reconcileHandoffReceipts(active: Active): Promise<boolean> {
-    if (active.consultation) return true;
+  private async artifactReceipt(active: Active, id: string, args: unknown, rawResult: unknown): Promise<void> {
+    if (!id || active.toolReceipts.has(id) || this.active.get(active.session.liveId) !== active) return;
+    active.toolReceipts.add(id);
+    let result = object(rawResult);
+    if (typeof rawResult === 'string') {
+      try { result = object(JSON.parse(rawResult)); } catch { result = {}; }
+    }
+    let paths: string[] | undefined;
+    try {
+      if (result.error || result.isError === true) throw new Error('Artifact tool failed');
+      const canonical = await validateArtifactPaths(object(args).paths);
+      const received = object(result.structuredContent).paths;
+      if (!Array.isArray(received) || received.length !== canonical.length || received.some((value, index) => value !== canonical[index])) {
+        throw new Error('Artifact receipt does not match the requested files');
+      }
+      paths = canonical;
+    } catch { /* Only a successful native receipt for these exact files can send. */ }
+    if (this.active.get(active.session.liveId) !== active) return;
+    if (active.consultation) {
+      if (!paths || !active.onArtifact) { active.input.onProgress?.('文件发送请求未能确认，本次未发送文件。'); return; }
+      try { await active.onArtifact({ threadId: active.session.threadId, turnId: active.turnId, itemId: id, paths }); }
+      catch { active.input.onProgress?.('文件发送未完成，请查看飞书中的实际发送结果，不要重复补发。'); }
+    } else {
+      if (!paths) active.input.onProgress?.('文件发送请求未能确认，本次未发送文件。');
+      this.emitToolReceipt(active, id, ARTIFACT_TOOL_NAME, paths ? { paths } : args, Boolean(paths), paths ? { paths } : undefined);
+    }
+  }
+
+  private async reconcileToolReceipts(active: Active): Promise<boolean> {
+    if (active.consultation && !active.onArtifact) return true;
     // Tool progress can be disabled in Hermes. Only this client's acknowledged,
     // still-active submission may reconcile its own native persisted receipts.
     // A random turn marker makes repeated user prompts distinct across turns.
     if (!active.acknowledged || this.active.get(active.session.liveId) !== active) return false;
-    if (!active.submittedPrompt.includes('<feishu_group_collaboration>')) return true;
+    const tools = [HERMES_ARTIFACT_TOOL, ...(!active.consultation && active.submittedPrompt.includes('<feishu_group_collaboration>') ? [HERMES_HANDOFF_TOOL] : [])];
     let result: Json | undefined;
-    let receipts: ReturnType<typeof collectHermesHandoffReceipts> = [];
+    let receipts: ReturnType<typeof collectHermesToolReceipts> = [];
     let unverified = false;
     try {
       result = await this.get(`/api/sessions/${encodeURIComponent(storedId(active.session.threadId))}/messages`);
-      receipts = collectHermesHandoffReceipts({ messages: result.messages, submittedPrompt: active.submittedPrompt,
-        sessionId: storedId(active.session.threadId), responseSessionId: string(result.session_id) });
+      receipts = collectHermesToolReceipts({ messages: result.messages, submittedPrompt: active.submittedPrompt,
+        sessionId: storedId(active.session.threadId), responseSessionId: string(result.session_id) }, tools);
     } catch {
       // A goal continuation or compaction can remove the exact anchor. That
-      // invalidates a handoff, not the already-completed normal answer.
+      // invalidates a bridge action, not the already-completed normal answer.
       unverified = true;
     }
     if (this.active.get(active.session.liveId) !== active || !await this.isIdle(active.session)) return false;
     if (unverified) {
-      const mayHaveCall = !result || active.liveReceipts.size > 0 || array(result.messages).some(value => {
-        const row = object(value);
-        return row.role === 'assistant' && array(row.tool_calls).some(call => object(object(call).function).name === HERMES_HANDOFF_TOOL);
-      });
-      if (mayHaveCall) this.handoffReceipt(active, `unverified:${active.turnId}`, {}, { error: 'Current handoff receipt could not be verified' });
+      for (const tool of tools) {
+        const mayHaveCall = (!result && tool === HERMES_HANDOFF_TOOL)
+          || [...active.liveReceipts.values()].some(receipt => receipt.tool === tool)
+          || array(result?.messages).some(value => {
+            const row = object(value);
+            return row.role === 'assistant' && array(row.tool_calls).some(call => object(object(call).function).name === tool);
+          });
+        if (!mayHaveCall) continue;
+        const id = `unverified:${tool}:${active.turnId}`;
+        if (tool === HERMES_HANDOFF_TOOL) this.handoffReceipt(active, id, {}, { error: 'Current handoff receipt could not be verified' });
+        else await this.artifactReceipt(active, id, {}, { error: 'Current artifact receipt could not be verified' });
+      }
       return true;
     }
     // Emit only after the final stored identity is known. Hermes compaction can
     // replace the stored thread ID while the live execution keeps the same sid.
     const combined = new Map(active.liveReceipts);
     for (const receipt of receipts) combined.set(receipt.id, receipt);
-    for (const [id, receipt] of combined) this.handoffReceipt(active, id, receipt.args, receipt.result);
+    for (const [id, receipt] of combined) {
+      if (!tools.includes(receipt.tool)) continue;
+      if (receipt.tool === HERMES_HANDOFF_TOOL) this.handoffReceipt(active, id, receipt.args, receipt.result);
+      else await this.artifactReceipt(active, id, receipt.args, receipt.result);
+    }
     return true;
   }
 
@@ -414,11 +461,12 @@ export class HermesClient implements CodexRuntime {
     else if (type === 'tool.start') {
       const text = active.delta.trim(); active.delta = '';
       if (text) active.input.onProgress?.(text);
-      if (!active.consultation && payload.name === HERMES_HANDOFF_TOOL && string(payload.tool_id) && !string(payload.tool_id).startsWith('submirror:')) active.toolStarts.add(string(payload.tool_id));
+      const name = string(payload.name), id = string(payload.tool_id);
+      if ((name === HERMES_ARTIFACT_TOOL || (!active.consultation && name === HERMES_HANDOFF_TOOL)) && id && !id.startsWith('submirror:')) active.toolStarts.set(id, name);
     } else if (type === 'tool.complete') {
-      if (payload.name === HERMES_HANDOFF_TOOL && active.toolStarts.has(string(payload.tool_id))) {
+      if (active.toolStarts.has(string(payload.tool_id)) && active.toolStarts.get(string(payload.tool_id)) === payload.name) {
         const id = string(payload.tool_id);
-        if (!active.liveReceipts.has(id) && active.liveReceipts.size < 32) active.liveReceipts.set(id, { args: payload.args, result: payload.result });
+        if (!active.liveReceipts.has(id) && active.liveReceipts.size < 32) active.liveReceipts.set(id, { tool: string(payload.name), args: payload.args, result: payload.result });
       }
     } else if (type === 'message.start') {
       // Goals can continue after message.complete: only the last completion of
@@ -627,6 +675,7 @@ function array(value: unknown): unknown[] { return Array.isArray(value) ? value 
 function string(value: unknown): string { return typeof value === 'string' ? value : ''; }
 function contentText(value: unknown): string { return typeof value === 'string' ? value : array(value).map(part => string(object(part).text)).filter(Boolean).join('\n'); }
 function stripPolicy(value: string): string {
-  const content = value.replace(/^((?:【(?:飞书消息|本地预览)】[^\n]*\n)?)<(feishu_bridge_instructions|feishu_bridge_context)>\n[\s\S]*?\n<\/\2>\n\n/, '$1');
+  const content = value.replace(/^<feishu_bridge_turn id="hermes-turn:[^"]+" \/>\n/, '')
+    .replace(/^((?:【(?:飞书消息|本地预览)】[^\n]*\n)?)<(feishu_bridge_instructions|feishu_bridge_context)>\n[\s\S]*?\n<\/\2>\n\n/, '$1');
   return cleanBridgeText(content.replace(/^【(?:飞书消息|本地预览)】\r?\n(?!\r?\n)/, header => `${header}\n`));
 }

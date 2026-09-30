@@ -250,9 +250,12 @@ export class Bridge {
     const outcome = status || (call ? notification?.outcome : undefined);
     if (notification && outcome && ['completed', 'failed', 'interrupted'].includes(outcome)) await this.deliverCompletionNotification(notification, outcome as 'completed' | 'failed' | 'interrupted');
   }
-  private async deliverArtifactCall(threadId: string, turnId: string, call: Record<string, unknown>): Promise<void> {
+  private async deliverArtifactCall(threadId: string, turnId: string, call: Record<string, unknown>, scope?: {
+    recipient: { chatId: string; actorId: string }; canSend: () => boolean;
+  }): Promise<void> {
+    if (scope && !scope.canSend()) throw new UserError('文件发送上下文已变化，本次未发送。', 403);
     const itemId = typeof call.id === 'string' && call.id ? call.id : '';
-    if (!itemId) { this.store.log('warn', 'Codex 请求发送飞书成品，但工具调用缺少标识。'); return; }
+    if (!itemId) { this.store.log('warn', '飞书成品发送请求缺少工具调用标识。'); return; }
     const deliveryId = `${threadId}:${turnId}:${itemId}`;
     const argumentsValue = call.arguments && typeof call.arguments === 'object' && !Array.isArray(call.arguments) ? call.arguments as Record<string, unknown> : {};
     const requested = Array.isArray(argumentsValue.paths) ? argumentsValue.paths : [];
@@ -260,7 +263,7 @@ export class Bridge {
     if (delivery && delivery.status !== 'registered') return;
     if (!delivery) {
       const operation = Object.values(this.store.state.operations).find(item => item.threadId === threadId && item.turnId === turnId);
-      const recipient = this.notificationRecipient(threadId, operation);
+      const recipient = scope?.recipient ?? this.notificationRecipient(threadId, operation);
       if (!recipient) return;
       delivery = this.store.artifact(deliveryId, {
         threadId, turnId, itemId, chatId: recipient.chatId, actorId: recipient.actorId,
@@ -299,6 +302,7 @@ export class Bridge {
         if (info.size > limit) throw new Error(`超过 ${limit / 1024 / 1024} MB 上限`);
         if (!this.store.isAuthorized(delivery.chatId, delivery.actorId)) throw new Error('账号或群聊授权已撤销，文件未发送');
         if (this.transport.isAvailable?.(delivery.chatId) === false) throw new Error('机器人连接已断开，文件未发送');
+        if (scope && !scope.canSend()) throw new Error('文件发送上下文已变化，文件未发送');
         const messageId = kind === 'image'
           ? await this.transport.sendImage(recipient.chatId, filePath)
           : await this.transport.sendFile(recipient.chatId, filePath);
@@ -311,7 +315,7 @@ export class Bridge {
     const failed = results.length - sent;
     const status = failed === 0 ? 'sent' as const : sent === 0 ? 'failed' as const : 'partial' as const;
     this.store.artifact(deliveryId, { status, results });
-    if (!this.store.isAuthorized(delivery.chatId, delivery.actorId) || this.transport.isAvailable?.(delivery.chatId) === false) return;
+    if (!this.store.isAuthorized(delivery.chatId, delivery.actorId) || this.transport.isAvailable?.(delivery.chatId) === false || (scope && !scope.canSend())) return;
     const detail = results.map(item => `${item.status === 'sent' ? '✓' : '✗'} ${item.name}${item.error ? `：${item.error}` : ''}`).join('\n');
     this.artifactSummaries.add(deliveryId);
     try {
@@ -1961,6 +1965,13 @@ export class Bridge {
               .replace(/fc1\.\d{1,5}\.[a-f0-9]{64}/g, '[咨询凭据已省略]'),
             signal, onBeforeSubmit: () => { if (!targetValid()) throw new UserError('咨询上下文已变化，未提交任务。', 403); },
             onProgress: text => reply.update(text),
+            onArtifact: async artifact => {
+              signal.throwIfAborted();
+              if (!isHermesThread(artifact.threadId) || snapshot.engine !== 'hermes') throw new UserError('文件发送的执行端不匹配。', 409);
+              await this.deliverArtifactCall(artifact.threadId, artifact.turnId,
+                { id: artifact.itemId, arguments: { paths: artifact.paths }, status: 'completed' },
+                { recipient: { chatId: targetChatId, actorId }, canSend: () => !signal.aborted && targetValid() });
+            },
             onRequest: raw => this.requestUser({ id: operationId, chatId: targetChatId, actorId, text: request.question, chatType: 'group' },
               { ...raw, title: `${bot.name} · ${raw.title}` }, { signal, valid: targetValid }),
           });

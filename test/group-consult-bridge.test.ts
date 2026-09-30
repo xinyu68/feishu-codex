@@ -69,6 +69,44 @@ test('an approval cannot authorize a delegated task after the target context cha
   assert.equal(h.replies.includes('不得发布'), false);
 });
 
+test('Hermes consultation artifacts use the target bot and original group once without binding its ordinary conversation', async t => {
+  const h = setup(t), targetChat = conversationKey('pm', 'oc_team');
+  const files = [path.join(h.dir, 'image.png'), path.join(h.dir, 'report.txt')];
+  for (const file of files) fs.writeFileSync(file, 'explicit artifact');
+  const sends: Array<{ chatId: string; file: string; kind: string }> = [];
+  h.bridge.transport!.sendImage = async (chatId, file) => { sends.push({ chatId, file, kind: 'image' }); return 'image'; };
+  h.bridge.transport!.sendFile = async (chatId, file) => { sends.push({ chatId, file, kind: 'file' }); return 'file'; };
+  h.consultWith(async input => {
+    const receipt = { threadId: 'hermes:consultation-1', turnId: 'hermes-turn:artifact', itemId: 'artifact-call', paths: files };
+    await input.onArtifact!(receipt);
+    await input.onArtifact!(receipt);
+    assert.equal(sends.length, 2, 'file delivery is awaited and duplicate callbacks cannot reupload');
+    assert.equal(Object.values(h.store.state.artifacts)[0]?.status, 'sent');
+    return { text: '文件请求已处理' };
+  });
+  h.runWith(async (_input, prompt) => (await h.ask(prompt)).answer);
+  await h.bridge.receive(h.message());
+  assert.deepEqual(sends, files.map((file, index) => ({ chatId: targetChat, file: fs.realpathSync(file), kind: index === 0 ? 'image' : 'file' })));
+  assert.equal(h.store.state.conversations[targetChat], undefined);
+  assert.equal(h.store.state.threadBindings['hermes:consultation-1'], undefined, 'artifact routing does not rebind the ordinary chat');
+});
+
+test('Hermes consultation cannot send an artifact after the original group or actor is no longer authorized', async t => {
+  const h = setup(t);
+  const file = path.join(h.dir, 'report.txt'); fs.writeFileSync(file, 'explicit artifact');
+  let sends = 0;
+  h.bridge.transport!.sendFile = async () => { sends++; return 'file'; };
+  h.consultWith(async input => {
+    h.store.saveBot('pm', { allowedActors: [] });
+    await assert.rejects(input.onArtifact!({ threadId: 'hermes:consultation-1', turnId: 'hermes-turn:revoked', itemId: 'artifact', paths: [file] }));
+    return { text: '不得发送' };
+  });
+  h.runWith(async (_input, prompt) => { await assert.rejects(h.ask(prompt)); return '未发送文件'; });
+  await h.bridge.receive(h.message());
+  assert.equal(sends, 0);
+  assert.equal(Object.keys(h.store.state.artifacts).length, 0);
+});
+
 function setup(t: test.TestContext, sourceEngine: 'codex' | 'hermes' = 'codex', targetEngine: 'codex' | 'hermes' = 'hermes') {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'group-consult-bridge-'));
   const store = new Store(dir);

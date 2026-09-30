@@ -39,7 +39,7 @@
 
 - Skill：解释渠道来源、回复规则和工具用法。
 - `request_feishu_completion_notification`：登记本轮结束后发送通知。
-- `send_artifact_to_feishu`：按明确要求发送指定的本地图片或文件。
+- `send_artifact_to_feishu`：Codex 和 Hermes 均可按明确要求发送指定的本地图片或文件，发回任务所在的私聊或群聊。Hermes 在本轮结束后发送；工具显示“已提交”时尚未确认送达，以飞书中的实际发送结果为准。
 - `send_message_to_feishu`：按明确要求立即发送文字到默认通知私聊，Codex 和 Hermes 均可调用，不需要结束当前任务。发送位置使用“机器人”页面的默认通知设置，与当前会话绑定和自动完成通知开关独立；不会切换会话。
 - `request_feishu_group_handoff`：在已授权的飞书群任务中，申请让另一角色接手；当前回复送达并结束后才派发。详见[群聊协作](group-collaboration.md)。
 - `consult_feishu_group_agent`：在当前飞书群轮中委派另一角色完成任务，可以查询、改文件、执行命令和操作外部应用，按用户授权使用现有工具。桥接公开任务并 @目标，再以目标身份展示进度和结果，同时将结果返回来源机器人，让它在同一轮继续。Codex 和 Hermes 均支持，单次最多等待 30 分钟；目标使用可接续的专用协作会话，普通群会话绑定保持不变。

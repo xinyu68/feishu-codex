@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { collectHermesHandoffReceipts } from '../src/hermes-handoff-receipts.js';
+import { collectHermesHandoffReceipts, collectHermesToolReceipts } from '../src/hermes-handoff-receipts.js';
 
 const sessionId = 'stored-session';
 const tool = 'mcp_feishu_completion_request_feishu_group_handoff';
@@ -109,4 +109,17 @@ test('returns each correctly paired current native call for bridge validation an
     { id: 'call-2', args: secondArgs, result: secondReceipt },
     { id: 'call-1', args, result: receipt },
   ]);
+});
+
+test('reconciles artifact pairs with their own native wrapper and never mistakes another tool for an artifact', () => {
+  const artifactTool = 'mcp_feishu_completion_send_artifact_to_feishu';
+  const paths = { paths: ['C:\\results\\image.png'] };
+  const artifactResult = { result: '已提交', structuredContent: paths };
+  const collectArtifacts = (messages: unknown) => collectHermesToolReceipts({ messages, submittedPrompt: prompt, sessionId, responseSessionId: sessionId }, [artifactTool]);
+  const messages = [user(), call('artifact', artifactTool, JSON.stringify(paths)), result('artifact', wrapped(JSON.stringify(artifactResult), artifactTool), artifactTool)];
+  assert.deepEqual(collectArtifacts(messages), [{ id: 'artifact', tool: artifactTool, args: paths, result: artifactResult }]);
+  assert.deepEqual(collect(messages), [], 'handoff compatibility parser must not promote artifacts');
+  assert.throws(() => collectArtifacts([user(), call('artifact', artifactTool, JSON.stringify(paths)), result('artifact', wrapped(JSON.stringify(artifactResult), tool), artifactTool)]), /包装/);
+  assert.deepEqual(collectArtifacts([user('old turn'), ...messages.slice(1), user()]), []);
+  assert.deepEqual(collectArtifacts([user(), { role: 'assistant', content: JSON.stringify(artifactResult) }]), []);
 });

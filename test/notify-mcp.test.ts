@@ -94,8 +94,35 @@ test('Hermes MCP exposes the handoff and synchronous consultation capabilities c
   child.stdin.write(JSON.stringify({ id: 1, method: 'tools/list' }) + '\n');
   child.stdin.write(JSON.stringify({ id: 2, method: 'tools/call', params: { name: 'request_feishu_completion_notification', arguments: { summary: 'test' } } }) + '\n');
   for (let count = 0; count < 200 && replies.length < 2; count++) await new Promise(resolve => setTimeout(resolve, 10));
-  assert.deepEqual(replies.find(reply => reply.id === 1)?.result.tools.map((tool: any) => tool.name), ['request_feishu_group_handoff', 'consult_feishu_group_agent', 'send_message_to_feishu']);
+  assert.deepEqual(replies.find(reply => reply.id === 1)?.result.tools.map((tool: any) => tool.name), ['send_artifact_to_feishu', 'request_feishu_group_handoff', 'consult_feishu_group_agent', 'send_message_to_feishu']);
   assert.equal(replies.find(reply => reply.id === 2)?.error.code, -32602);
+});
+
+test('Hermes artifact MCP submits only explicit existing files and reports validation failures without a success receipt', async t => {
+  const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'hermes-artifact-mcp-'));
+  const files = [path.join(directory, '图片.png'), path.join(directory, '报告.txt')];
+  await Promise.all(files.map(file => writeFile(file, 'fixture')));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const child = spawn(process.execPath, ['--import', 'tsx', path.join(root, 'src', 'notify-mcp.ts')], {
+    env: { ...process.env, FEISHU_CODEX_MCP_MODE: 'hermes' }, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true,
+  });
+  t.after(() => child.kill());
+  const replies: any[] = [];
+  createInterface({ input: child.stdout, crlfDelay: Infinity }).on('line', line => replies.push(JSON.parse(line)));
+  const inputs = [[...files, files[0]], [directory], ['relative.txt'], [path.join(directory, 'missing.txt')], [], Array(6).fill(files[0])];
+  inputs.forEach((paths, id) => child.stdin.write(`${JSON.stringify({ id, method: 'tools/call', params: { name: 'send_artifact_to_feishu', arguments: { paths } } })}\n`));
+  for (let i = 0; i < 300 && replies.length < inputs.length; i++) await new Promise(resolve => setTimeout(resolve, 10));
+  assert.equal(replies.length, inputs.length);
+  const receipt = replies.find(reply => reply.id === 0).result;
+  assert.equal(receipt.isError, false);
+  assert.deepEqual(receipt.structuredContent.paths, await Promise.all(files.map(file => import('node:fs/promises').then(fs => fs.realpath(file)))));
+  assert.match(receipt.content[0].text, /已提交 2 个/);
+  assert.doesNotMatch(receipt.content[0].text, /已送达|发送成功/);
+  for (let id = 1; id < inputs.length; id++) {
+    assert.equal(replies.find(reply => reply.id === id).error.code, -32602);
+    assert.equal(replies.find(reply => reply.id === id).result, undefined);
+  }
 });
 
 test('both runtimes synchronously receive a target answer and cancellations close the pending HTTP request', async t => {
