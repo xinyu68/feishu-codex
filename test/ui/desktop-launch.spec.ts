@@ -83,10 +83,40 @@ test('desktop update is checked, downloaded and installed only after a user acti
   await expect(page.getByText('发现新版本 0.3.3')).toBeVisible();
   await page.getByRole('button', { name: '下载更新' }).click();
   await expect(page.getByText('新版本 0.3.3 已下载，等待安装')).toBeVisible();
+  await expect(page.getByRole('button', { name: '检查更新' })).toBeDisabled();
   expect(await page.evaluate(() => (window as unknown as { nativeCalls: string[] }).nativeCalls)).toEqual(['checkForUpdates', 'downloadUpdate']);
   await page.getByRole('button', { name: '安装并重启' }).click();
   expect(await page.evaluate(() => (window as unknown as { nativeCalls: string[] }).nativeCalls)).toEqual(['checkForUpdates', 'downloadUpdate', 'installUpdate']);
   expect(await page.evaluate(() => document.querySelector('.application-settings')!.scrollHeight > document.querySelector('.application-settings')!.clientHeight)).toBe(false);
+});
+
+test('old desktop without update IPC keeps a visible download-page entry', async ({ page }) => {
+  await fixture(page);
+  await page.addInitScript(() => { Reflect.deleteProperty(window.feishuCodex!, 'checkForUpdates'); });
+  await page.reload();
+  await page.getByRole('button', { name: '设置', exact: true }).click();
+  await page.getByRole('button', { name: '应用与运行', exact: true }).click();
+  const entry = page.getByRole('link', { name: '检查更新' });
+  await expect(entry).toBeVisible();
+  await expect(entry).toHaveAttribute('href', 'https://github.com/xinyu68/feishu-codex/releases/latest');
+  await expect(page.getByText('点击检查更新，前往下载页更新。')).toBeVisible();
+  expect(await page.evaluate(() => (window as unknown as { nativeCalls: string[] }).nativeCalls)).toEqual([]);
+});
+
+test('unavailable updater retains its fallback; checking stays visible and prevents duplicate checks', async ({ page }) => {
+  await fixture(page, { ...ready, update: { phase: 'unavailable' } });
+  await page.getByRole('button', { name: '设置', exact: true }).click();
+  await page.getByRole('button', { name: '应用与运行', exact: true }).click();
+  await expect(page.getByRole('link', { name: '检查更新' })).toBeVisible();
+  await page.evaluate(status => (window as unknown as { updateNative: (status: DesktopStatus) => void }).updateNative(status), { ...ready, update: { phase: 'checking' } });
+  await expect(page.getByRole('button', { name: '检查中…' })).toBeDisabled();
+  await expect(page.getByText('正在检查更新…')).toBeVisible();
+  await page.evaluate(status => (window as unknown as { updateNative: (status: DesktopStatus) => void }).updateNative(status), { ...ready, update: { phase: 'current' } });
+  await expect(page.getByRole('button', { name: '检查更新' })).toBeEnabled();
+  await expect(page.getByText('已是最新版本')).toBeVisible();
+  await page.getByRole('button', { name: '检查更新' }).click();
+  await expect(page.getByRole('button', { name: '下载更新' })).toBeVisible();
+  expect(await page.evaluate(() => (window as unknown as { nativeCalls: string[] }).nativeCalls)).toEqual(['checkForUpdates']);
 });
 
 test('retained data offers recovery and never hides all actions behind an old migration result', async ({ page }) => {

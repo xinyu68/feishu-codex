@@ -498,7 +498,10 @@ function Settings({ state, configSave, openBots, desktop, action, perform, deskt
   };
   const busy = Boolean(action);
   const update = desktop?.update;
-  const updateText = update?.error ? `更新失败：${update.error}`
+  const nativeUpdates = typeof window.feishuCodex?.checkForUpdates === 'function' && update?.phase !== 'unavailable';
+  const updateBusy = nativeUpdates && ['checking', 'downloading', 'ready', 'installing'].includes(update?.phase || '');
+  const updateText = !nativeUpdates ? '点击检查更新，前往下载页更新。'
+    : update?.error ? `更新失败：${update.error}`
     : update?.phase === 'checking' ? '正在检查更新…'
     : update?.phase === 'available' ? `发现新版本 ${update.version}`
     : update?.phase === 'downloading' ? `正在下载 ${update.version} · ${update.percent ?? 0}%`
@@ -517,7 +520,7 @@ function Settings({ state, configSave, openBots, desktop, action, perform, deskt
         <label className="preference-row close-window-preference"><span><strong>点击窗口关闭按钮</strong><small>{preferences?.closeWindowAction === 'quit' ? '退出前会检查运行中的任务。' : '收起到托盘，任务和飞书连接继续运行。'}</small></span><Select aria-label="点击窗口关闭按钮" className="preference-select" value={preferences?.closeWindowAction || 'tray'} disabled={busy || !preferences} onChange={(event) => void saveDesktopPreferences({ closeWindowAction: event.target.value as 'tray' | 'quit' }, '关闭窗口方式已保存')}><option value="tray">收起到托盘</option><option value="quit">退出全部服务</option></Select></label>
         {preferencesError && <p className="field-error">无法读取桌面设置：{preferencesError}</p>}
       </div> : <p className="section-description">启动与关闭设置仅在桌面应用中可用。</p>}</section>
-      <section className="settings-section about-section"><Brand small /><div><strong>Feishu Codex</strong><p>版本 {desktop?.shellVersion || state.service.version} · 本机运行</p>{updateText && <p role="status" aria-live="polite" title={update?.error}>{updateText}</p>}</div><span className="about-actions">{update && update.phase !== 'unavailable' && <>{['idle', 'current', 'error'].includes(update.phase) && <button className="secondary-button" disabled={busy} onClick={() => void desktopAction('checkForUpdates')}>检查更新</button>}{update.phase === 'available' && <button className="secondary-button" disabled={busy} onClick={() => void desktopAction('downloadUpdate')}>下载更新</button>}{update.phase === 'ready' && <button className="primary-button" disabled={busy} onClick={() => void desktopAction('installUpdate')}>安装并重启</button>}</>}<button className="secondary-button" disabled={busy || update?.phase === 'installing'} onClick={() => void desktopAction('quit')}>退出应用</button></span></section>
+      <section className="settings-section about-section"><Brand small /><div><strong>Feishu Codex</strong><p>版本 {desktop?.shellVersion || state.service.version} · 本机运行</p>{updateText && <p role="status" aria-live="polite" title={updateText}>{updateText}</p>}</div><span className="about-actions">{nativeUpdates ? <button className="secondary-button" disabled={busy || updateBusy} onClick={() => void desktopAction('checkForUpdates')}>{update?.phase === 'checking' ? <><LoaderCircle size={14} className="spin" />检查中…</> : '检查更新'}</button> : <a className="secondary-button" href="https://github.com/xinyu68/feishu-codex/releases/latest" target="_blank" rel="noopener noreferrer">检查更新</a>}{nativeUpdates && update?.phase === 'available' && <button className="secondary-button" disabled={busy} onClick={() => void desktopAction('downloadUpdate')}>下载更新</button>}{nativeUpdates && update?.phase === 'ready' && <button className="primary-button" disabled={busy} onClick={() => void desktopAction('installUpdate')}>安装并重启</button>}<button className="secondary-button" disabled={busy || update?.phase === 'installing'} onClick={() => void desktopAction('quit')}>退出应用</button></span></section>
     </>}
   </div></main>;
 }
