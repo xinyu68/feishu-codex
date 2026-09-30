@@ -27,6 +27,8 @@ jobs:
           node-version: '24'
           cache: npm
       - run: npm ci
+      - name: Prepare Electron for native window tests
+        run: node node_modules/electron/install.js
       - run: npm run typecheck
       - run: npm test
       - run: npm run build
