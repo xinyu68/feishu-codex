@@ -44,6 +44,15 @@ await fs.writeFile(configFile, stringify(config));
 await fs.writeFile(path.join(hermesHome, 'sessions.db'), 'keep sessions');
 await fs.writeFile(path.join(codexHome, 'auth.json'), 'keep login');
 const original = await fs.readFile(configFile);
+const residue = ['attachments/image.png', 'engine-migrations/record.json', 'pending-setup/bot.json', 'hermes-runtime.json'];
+for (const file of residue) {
+  await fs.mkdir(path.dirname(path.join(dataDir, file)), { recursive: true });
+  await fs.writeFile(path.join(dataDir, file), 'app data');
+}
+await fs.writeFile(path.join(dataDir, 'config.json'), JSON.stringify({ defaultWorkspace: path.join(userHome, 'project') }));
+const profileDir = path.join(userHome, 'roaming', 'feishu-codex');
+await fs.mkdir(profileDir, { recursive: true });
+await fs.writeFile(path.join(profileDir, 'Cache'), 'cached');
 const env = canonicalEnvironment(process.env, { USERPROFILE: userHome, HOME: userHome,
   LOCALAPPDATA: path.join(userHome, 'local'), APPDATA: path.join(userHome, 'roaming'),
   CODEX_HOME: codexHome, HERMES_HOME: hermesHome, FEISHU_CODEX_DATA_DIR: dataDir });
@@ -65,8 +74,20 @@ async function run(command, args, environment = env) {
     child.once('exit', code => { clearTimeout(timer); resolve({ code, output }); });
   });
 }
-for (const upgrade of [true, false]) {
-  const mode = upgrade ? 'upgrade' : 'uninstall';
+// Windows Known Folders can ignore the fixture's APPDATA environment. Bind only
+// the cache default to the isolated profile; execute the real cleanup bodies.
+const fixtureSource = path.join(base, 'fixture-source');
+await fs.mkdir(path.join(fixtureSource, 'scripts'), { recursive: true });
+for (const name of ['desktop-uninstall.ps1', 'desktop-process-tree.ps1', 'desktop-clear-data.ps1']) {
+  let source = await fs.readFile(path.join(root, 'scripts', name), 'utf8');
+  if (name === 'desktop-clear-data.ps1') {
+    const originalDefault = "(Join-Path ([Environment]::GetFolderPath('ApplicationData')) 'feishu-codex')";
+    assert(source.includes(originalDefault));
+    source = source.replace(originalDefault, "'" + profileDir.replaceAll("'", "''") + "'");
+  }
+  await fs.writeFile(path.join(fixtureSource, 'scripts', name), source);
+}
+for (const [mode, upgrade, clearData] of [['upgrade', true, true], ['uninstall-keep-data', false, false], ['uninstall-clear-data', false, true]]) {
   const executable = path.join(base, `${mode}.exe`);
   const script = path.join(base, `${mode}.nsi`);
   const marker = path.join(base, `${mode}.passed`);
@@ -79,11 +100,11 @@ OutFile "${quote(executable)}"
 !include LogicLib.nsh
 !define BUILD_UNINSTALLER
 !define isUpdated '${upgrade ? '1' : '0'} == 1'
-!define PROJECT_DIR "${quote(root)}"
+!define PROJECT_DIR "${quote(fixtureSource)}"
 !include "${quote(path.join(root, 'scripts/nsis-uninstall.nsh'))}"
 InstallDir "${quote(installDir)}"
 Section
-  StrCpy $feishuClearData 0
+  StrCpy $feishuClearData ${clearData ? 1 : 0}
   !insertmacro customUnInstall
   FileOpen $0 "${quote(marker)}" w
   FileWrite $0 "passed"
@@ -95,6 +116,13 @@ SectionEnd
   const executed = await run(executable, ['/S']);
   assert.equal(executed.code, 0, executed.output);
   assert.equal(await fs.readFile(marker, 'utf8'), 'passed');
+  if (!upgrade && clearData) {
+    assert.equal(await fs.stat(dataDir).catch(() => null), null);
+    assert.equal(await fs.stat(profileDir).catch(() => null), null);
+  } else {
+    for (const file of residue) assert.equal(await fs.readFile(path.join(dataDir, file), 'utf8'), 'app data');
+    assert.equal(await fs.readFile(path.join(profileDir, 'Cache'), 'utf8'), 'cached');
+  }
   if (upgrade) {
     assert.deepEqual(await fs.readFile(configFile), original);
     await fs.access(skill.skillPath);
@@ -108,6 +136,6 @@ SectionEnd
 }
 assert.equal(await fs.readFile(path.join(hermesHome, 'sessions.db'), 'utf8'), 'keep sessions');
 assert.equal(await fs.readFile(path.join(codexHome, 'auth.json'), 'utf8'), 'keep login');
-const report = { passed: true, directory: base, realUserDataTouched: false, checks: ['actual NSIS hook skips upgrade cleanup', 'normal uninstall removes Codex and Hermes managed skills and Hermes MCP', 'no running Hermes required', 'Chinese installation/profile paths supported', 'sessions, login and other MCP settings retained'], checkedAt: new Date().toISOString() };
+const report = { passed: true, directory: base, realUserDataTouched: false, checks: ['actual NSIS hook skips upgrade cleanup', 'normal uninstall removes Codex and Hermes managed skills and Hermes MCP', 'clear-data checkbox removes attachments, setup and migration records, Hermes runtime config and app cache', 'unchecked checkbox and upgrades retain app data', 'no running Hermes required', 'Chinese installation/profile paths supported', 'sessions, login and other MCP settings retained'], checkedAt: new Date().toISOString() };
 await fs.writeFile(path.join(root, 'artifacts/hermes-uninstall-hook-verification.json'), JSON.stringify(report, null, 2));
 console.log(JSON.stringify(report, null, 2));

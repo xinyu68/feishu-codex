@@ -34,17 +34,18 @@
     # Unknown files and workspace directories are never swept with the root.
     $owned = @('config.json', 'state.json', 'runtime.json', 'service.lock', 'desktop', 'desktop-baseline', 'desktop-launcher',
         'launch-verification', 'migration', 'shared-migration', 'protocol-ts-current', 'launcher.pid',
+        'attachments', 'engine-migrations', 'pending-setup', 'hermes-runtime.json',
         'desktop-tools-relay.pid', 'desktop-tools-relay.pid.json', 'desktop-tools-relay.stderr.log', 'desktop-tools-relay.stdout.log',
         'service.stderr.log', 'service.stdout.log', 'shared-codex.pid.json', 'shared-codex.stderr.log', 'shared-codex.stdout.log')
     if (Test-Path -LiteralPath $dataRoot) {
-        $owned += @(Get-ChildItem -LiteralPath $dataRoot -File -Force | Where-Object { $_.Name -match '^(config|state|runtime)\.json\.(\d+|[0-9a-f-]{36})\.tmp$' } | ForEach-Object { $_.Name })
+        $owned += @(Get-ChildItem -LiteralPath $dataRoot -File -Force | Where-Object { $_.Name -match '^(config|state|runtime|hermes-runtime)\.json\.(\d+|[0-9a-f-]{36})\.tmp$' } | ForEach-Object { $_.Name })
     }
     $candidates = @($owned | ForEach-Object { Join-Path $dataRoot $_ }) + @($profileRoot)
     $targets = @()
     foreach ($candidate in $candidates) {
         $target = [IO.Path]::GetFullPath($candidate).TrimEnd('\')
         if ($target -ine $profileRoot -and [IO.Path]::GetDirectoryName($target) -ine $dataRoot) { throw '数据清理路径超出应用目录。' }
-        if (@($projects | Where-Object { Is-InDirectory $_ $target }).Count) { Write-Output '已保留包含项目文件的目录。'; continue }
+        if (@($projects | Where-Object { (Is-InDirectory $_ $target) -or (Is-InDirectory $target $_) }).Count) { Write-Output '已保留包含项目文件的目录。'; continue }
         if (-not (Test-Path -LiteralPath $target)) { continue }
         $pending = [Collections.Generic.Stack[string]]::new(); $pending.Push($target)
         while ($pending.Count) {

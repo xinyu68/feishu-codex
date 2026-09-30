@@ -67,7 +67,7 @@
     ${NSD_CreateCheckbox} 0 35u 100% 14u "清除本应用数据"
     Pop $feishuClearDataCheckbox
     ${NSD_SetState} $feishuClearDataCheckbox ${BST_UNCHECKED}
-    ${NSD_CreateLabel} 12u 58u 94% 42u "清除飞书凭据、授权名单、会话绑定、偏好、日志和缓存。此操作不可撤销。"
+    ${NSD_CreateLabel} 12u 58u 94% 42u "清除飞书凭据、授权、会话绑定、偏好、附件、临时记录、日志和缓存。此操作不可撤销。"
     Pop $0
     ${NSD_CreateLabel} 12u 110u 94% 35u "Codex 登录信息、Codex 会话历史和项目文件始终保留。"
     Pop $0
