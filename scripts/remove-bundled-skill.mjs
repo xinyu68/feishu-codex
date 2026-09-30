@@ -1,11 +1,14 @@
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { defaultCodexHome, managedSkillOwner, removeBundledSkill } from '../desktop/bundled-skill.mjs';
 
 const args = process.argv.slice(2);
+const includeHermes = args.length === 1 && args[0] === '--include-hermes';
+if (includeHermes) args.length = 0;
 if (args.length && (args.length !== 2 || args[0] !== '--codex-home' || !path.isAbsolute(args[1]))) {
-  throw new Error('Usage: remove-bundled-skill.mjs [--codex-home <absolute path>]');
+  throw new Error('Usage: remove-bundled-skill.mjs [--include-hermes | --codex-home <absolute path>]');
 }
 
 const homes = new Set(args.length ? [path.resolve(args[1])] : [defaultCodexHome()]);
@@ -23,5 +26,11 @@ if (!args.length) {
 }
 
 const results = [];
+if (includeHermes) {
+  const { removeHermesIntegrations } = await import('../build/server/hermes-cleanup.js');
+  const productRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+  const dataDir = path.resolve(process.env.FEISHU_CODEX_DATA_DIR || path.join(os.homedir(), '.feishu-codex'));
+  results.push(...await removeHermesIntegrations({ productRoot, dataDir }));
+}
 for (const codexHome of homes) results.push(await removeBundledSkill({ codexHome }));
 process.stdout.write(`${JSON.stringify(results)}\n`);

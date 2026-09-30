@@ -42,7 +42,7 @@ export async function startServer(options: { port?: number; dataDir?: string; co
   const managedHermes = !options.hermes && hermesConnection && !hermesConnection.baseUrl
     ? new ManagedHermesRuntime({ log: (level, text) => store.log(level, text) }) : undefined;
   const runtimes = new RuntimeRouter(codex, options.hermes ?? (hermesConnection ? new HermesClient({
-    ...hermesConnection, ...(managedHermes ? { discover: () => managedHermes.ensure() } : {}),
+    ...hermesConnection, integrationDataDir: store.dir, ...(managedHermes ? { discover: () => managedHermes.ensure() } : {}),
   }) : undefined));
   const releaseLock = acquireLock(store.dir);
   const projects = async () => {

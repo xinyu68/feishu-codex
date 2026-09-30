@@ -47,7 +47,8 @@
   "dependencies": {
     "@larksuiteoapi/node-sdk": "1.72.0",
     "electron-updater": "6.8.9",
-    "ws": "8.21.3"
+    "ws": "8.21.3",
+    "yaml": "2.8.2"
   },
   "devDependencies": {
     "lucide-react": "1.48.0",

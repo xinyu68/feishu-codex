@@ -81,19 +81,19 @@
 !endif
 
 !macro customUnInstall
-  ; The same uninstaller is used during upgrades. Keep the Skill until a real uninstall.
+  ; Keep Codex/Hermes Skills and MCP during upgrades; clean only on real uninstall.
   ${ifNot} ${isUpdated}
     !insertmacro feishuSafeStop Cleanup
     IfFileExists "$INSTDIR\resources\node\node.exe" 0 feishu_skill_done
     IfFileExists "$INSTDIR\resources\product\scripts\remove-bundled-skill.mjs" 0 feishu_skill_done
     Push $R0
     Push $R1
-    nsExec::ExecToStack '"$INSTDIR\resources\node\node.exe" "$INSTDIR\resources\product\scripts\remove-bundled-skill.mjs"'
+    nsExec::ExecToStack '"$INSTDIR\resources\node\node.exe" "$INSTDIR\resources\product\scripts\remove-bundled-skill.mjs" --include-hermes'
     Pop $R0
     Pop $R1
-    DetailPrint "Feishu Codex Skill cleanup: $R0 $R1"
+    DetailPrint "Feishu Codex Skill/MCP cleanup: $R0 $R1"
     ${If} $R0 != 0
-      MessageBox MB_OK|MB_ICONEXCLAMATION "内置 Skill 暂时无法清理，卸载已取消。请关闭占用该文件的程序后重试。" /SD IDOK
+      MessageBox MB_OK|MB_ICONEXCLAMATION "内置 Skill 或 MCP 暂时无法清理，卸载已取消。请关闭 Hermes 或占用配置文件的程序后重试，详情见卸载日志。" /SD IDOK
       SetErrorLevel 1
       Quit
     ${EndIf}

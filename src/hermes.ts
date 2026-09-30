@@ -4,6 +4,7 @@ import WebSocket from 'ws';
 import { discoverHermesDashboard, type HermesDashboardEndpoint } from './hermes-discovery.js';
 import { ensureHermesSkill, type HermesSkillResult } from './hermes-skill.js';
 import { ensureHermesMcp } from './hermes-mcp.js';
+import { recordManagedHermesHome } from './hermes-cleanup.js';
 import { GROUP_HANDOFF_TOOL_NAME, validateGroupHandoffRequest } from './group-handoff-request.js';
 import { collectHermesHandoffReceipts } from './hermes-handoff-receipts.js';
 import { consultationAborted, consultationInstructions, declineConsultationRequest } from './runtime-consult.js';
@@ -29,6 +30,7 @@ type Options = {
   requestTimeoutMs?: number; runTimeoutMs?: number; pollIntervalMs?: number; completionSettleMs?: number;
   discover?: () => Promise<HermesDashboardEndpoint>;
   bundleRoot?: string;
+  integrationDataDir?: string;
   ensureMcp?: typeof ensureHermesMcp;
 };
 
@@ -226,6 +228,7 @@ export class HermesClient implements CodexRuntime {
     const endpoint = this.endpoint!;
     if (!endpoint.hermesHome) throw new Error('Hermes 未提供本机 Skill 目录，消息尚未提交。');
     const skill = await ensureHermesSkill({ hermesHome: endpoint.hermesHome, bundleRoot: this.options.bundleRoot, roleInstructions });
+    if (this.options.integrationDataDir) await recordManagedHermesHome(this.options.integrationDataDir, endpoint.hermesHome);
     if (!this.integration) {
       this.integration = (async () => {
         await (this.options.ensureMcp ?? ensureHermesMcp)({ endpoint });
