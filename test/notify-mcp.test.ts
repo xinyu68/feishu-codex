@@ -94,7 +94,7 @@ test('Hermes MCP exposes the handoff and synchronous consultation capabilities c
   child.stdin.write(JSON.stringify({ id: 1, method: 'tools/list' }) + '\n');
   child.stdin.write(JSON.stringify({ id: 2, method: 'tools/call', params: { name: 'request_feishu_completion_notification', arguments: { summary: 'test' } } }) + '\n');
   for (let count = 0; count < 200 && replies.length < 2; count++) await new Promise(resolve => setTimeout(resolve, 10));
-  assert.deepEqual(replies.find(reply => reply.id === 1)?.result.tools.map((tool: any) => tool.name), ['request_feishu_group_handoff', 'consult_feishu_group_agent']);
+  assert.deepEqual(replies.find(reply => reply.id === 1)?.result.tools.map((tool: any) => tool.name), ['request_feishu_group_handoff', 'consult_feishu_group_agent', 'send_message_to_feishu']);
   assert.equal(replies.find(reply => reply.id === 2)?.error.code, -32602);
 });
 

@@ -5,6 +5,7 @@ import crypto from 'node:crypto';
 import type { ArtifactDelivery, BotProfile, BridgeConfig, ChatMessage, CompletionNotification, Conversation, DesktopNotificationTargetOption, GroupContextBoundary, GroupMessage, InboundMessage, LogEntry, Operation } from './types.js';
 import { conversationKey, DEFAULT_BOT_ID, parseRoute } from './routing.js';
 import { normalizeGroupWorkspace, planGroupContext, type GroupContextPlan } from './group-context.js';
+import type { MessageDelivery } from './message-request.js';
 
 type PendingActor = { actorId: string; chatId: string; botId?: string; lastSeenAt: string };
 type PendingGroup = { botId: string; chatId: string; actorId: string; lastSeenAt: string; title?: string };
@@ -23,6 +24,7 @@ type SavedState = {
   groupMessageSequence: number;
   notifications: Record<string, CompletionNotification>;
   artifacts: Record<string, ArtifactDelivery>;
+  messageSends: Record<string, MessageDelivery>;
   pendingGroups: PendingGroup[]; groupMessages: Record<string, GroupMessage[]>; groupProjects: Record<string, string>;
   botIdentities: Record<string, BotIdentity>; groupActorIdentities: Record<string, GroupActorIdentity[]>;
   consultationSessions: Record<string, { threadId: string; updatedAt: string }>;
@@ -49,7 +51,7 @@ export class Store {
     } satisfies BridgeConfig);
     this.state = readJson(path.join(dir, 'state.json'), {
       version: 1, conversations: {}, history: {}, pendingActors: [], seen: {},
-      logs: [], totalTurns: 0, dailyMessages: {}, operations: {}, deliveries: {}, completedTurns: {}, notifications: {}, artifacts: {},
+      logs: [], totalTurns: 0, dailyMessages: {}, operations: {}, deliveries: {}, completedTurns: {}, notifications: {}, artifacts: {}, messageSends: {},
       pendingGroups: [], groupMessages: {}, groupProjects: {}, threadBindings: {}, botIdentities: {}, groupActorIdentities: {}, consultationSessions: {}, groupContextReceipts: {}, groupMessageSequence: 0
     } satisfies SavedState);
     // Legacy entries have no sequence. Never reuse an order already persisted in the journal.
@@ -68,6 +70,8 @@ export class Store {
     for (const delivery of Object.values(this.state.deliveries)) if (delivery.status === 'sending') delivery.status = 'uncertain';
     this.state.notifications ??= {};
     this.state.artifacts ??= {};
+    this.state.messageSends ??= {};
+    for (const delivery of Object.values(this.state.messageSends)) if (delivery.status === 'sending') delivery.status = 'uncertain';
     this.state.consultationSessions ??= {};
     this.consultationThreadIds = new Set(Object.values(this.state.consultationSessions).map(item => item.threadId));
     for (const artifact of Object.values(this.state.artifacts)) if (artifact.status === 'sending') artifact.status = 'uncertain';

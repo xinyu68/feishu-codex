@@ -212,6 +212,7 @@ export async function startHost(options = {}) {
         '-c', `mcp_servers.feishu_completion.command=${JSON.stringify(notifyCommand)}`,
         '-c', `mcp_servers.feishu_completion.args=${JSON.stringify([notifyServer])}`,
         '-c', 'mcp_servers.feishu_completion.tool_timeout_sec=1830',
+        '-c', `mcp_servers.feishu_completion.env.FEISHU_CODEX_PORT=${JSON.stringify(String(bridgePort))}`,
         '--listen', wsUrl, '--analytics-default-enabled', '-c', 'plugins.codex-app-tools@openai-bundled.mcp_servers.codex_app.enabled=true'], port: Number(ws.port), entry: null };
     }
     const entry = path.join(root, 'build', 'server', name === 'bridge' ? 'server.js' : 'desktop-tools-relay.js');

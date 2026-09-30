@@ -32,6 +32,7 @@ type Options = {
   bundleRoot?: string;
   integrationDataDir?: string;
   ensureMcp?: typeof ensureHermesMcp;
+  bridgePort?: () => number;
 };
 
 const HERMES_HANDOFF_TOOL = `mcp_feishu_completion_${GROUP_HANDOFF_TOOL_NAME}`;
@@ -231,7 +232,7 @@ export class HermesClient implements CodexRuntime {
     if (this.options.integrationDataDir) await recordManagedHermesHome(this.options.integrationDataDir, endpoint.hermesHome);
     if (!this.integration) {
       this.integration = (async () => {
-        await (this.options.ensureMcp ?? ensureHermesMcp)({ endpoint });
+        await (this.options.ensureMcp ?? ensureHermesMcp)({ endpoint, ...(this.options.bridgePort ? { bridgePort: this.options.bridgePort() } : {}) });
         const list = await this.rpc('session.active_list', {});
         if (array(list.sessions).some(row => object(row).status !== 'idle')) {
           throw new Error('Hermes 正在处理其他任务，待其结束后重试以加载内置 Skill 和 MCP；消息尚未提交。');

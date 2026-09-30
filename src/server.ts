@@ -12,6 +12,8 @@ import { normalizeHermesDashboardUrl } from './hermes-discovery.js';
 import { RuntimeRouter } from './runtime-router.js';
 import { GroupConsultError } from './group-consult.js';
 import { GROUP_CONSULT_PATH } from './group-consult-request.js';
+import { MESSAGE_CONNECTION_PATH, MESSAGE_SEND_PATH, MessageSendError } from './message-request.js';
+import { DefaultMessageSender } from './message-sender.js';
 import { readRuntimeConfig } from './runtime-config.js';
 import { discoverProjects, discoverThreads } from './discovery.js';
 import { FeishuClient, FeishuCredentialVerificationError, verifyFeishuCredentials } from './feishu.js';
@@ -31,6 +33,7 @@ export async function startServer(options: { port?: number; dataDir?: string; co
     return safe.replace(/(Bearer\s+)[A-Za-z0-9._-]+/gi, '$1[已隐藏]').slice(0, 1500);
   };
   const port = options.port ?? Number(process.env.FEISHU_CODEX_PORT || 8790);
+  let mcpPort = port;
   if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error('无效的服务端口');
   const runtime = readRuntimeConfig(store.dir);
   const gateFile = options.writeGateFile ?? process.env.FEISHU_CODEX_WRITE_GATE_FILE;
@@ -42,7 +45,7 @@ export async function startServer(options: { port?: number; dataDir?: string; co
   const managedHermes = !options.hermes && hermesConnection && !hermesConnection.baseUrl
     ? new ManagedHermesRuntime({ log: (level, text) => store.log(level, text) }) : undefined;
   const runtimes = new RuntimeRouter(codex, options.hermes ?? (hermesConnection ? new HermesClient({
-    ...hermesConnection, integrationDataDir: store.dir, ...(managedHermes ? { discover: () => managedHermes.ensure() } : {}),
+    ...hermesConnection, integrationDataDir: store.dir, bridgePort: () => mcpPort, ...(managedHermes ? { discover: () => managedHermes.ensure() } : {}),
   }) : undefined));
   const releaseLock = acquireLock(store.dir);
   const projects = async () => {
@@ -86,6 +89,8 @@ export async function startServer(options: { port?: number; dataDir?: string; co
   type BotConnection = { status: ConnectionStatus; detail?: string };
   const connections = new Map<string, BotConnection>();
   const router = new TransportRouter();
+  const messageSender = new DefaultMessageSender(store, router);
+  const messageToken = crypto.randomBytes(32).toString('hex');
   bridge.transport = router;
   const connectionFor = (botId = 'default'): BotConnection => connections.get(botId) ?? { status: 'stopped' };
   const connectionSummary = () => {
@@ -295,6 +300,21 @@ export async function startServer(options: { port?: number; dataDir?: string; co
       response.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'self'; base-uri 'none'; form-action 'self'");
       const url = new URL(request.url ?? '/', host);
       if (url.pathname === '/health' && request.method === 'GET') return json(response, { status: 'ok', name: 'feishu-codex', version: PRODUCT_VERSION, pid: process.pid });
+      if (url.pathname === MESSAGE_CONNECTION_PATH || url.pathname === MESSAGE_SEND_PATH) {
+        if (origin || request.headers['sec-fetch-site']) throw new UserError('即时消息接口仅供本机 MCP 调用。', 403);
+        if (url.pathname === MESSAGE_CONNECTION_PATH && request.method === 'GET') return json(response, { name: 'feishu-codex-message', token: messageToken });
+        if (url.pathname !== MESSAGE_SEND_PATH || request.method !== 'POST') throw new UserError('请求方法不支持。', 405);
+        const token = request.headers['x-feishu-mcp-token'];
+        if (typeof token !== 'string' || !/^[a-f0-9]{64}$/.test(token) || !crypto.timingSafeEqual(Buffer.from(token), Buffer.from(messageToken))) throw new UserError('MCP 连接已失效，请重新连接。', 403);
+        if (request.headers['content-type']?.split(';')[0]?.trim().toLowerCase() !== 'application/json') throw new UserError('请使用 JSON 请求。', 415);
+        const input = await readBody(request);
+        const controller = new AbortController();
+        const cancel = () => controller.abort();
+        response.once('close', cancel);
+        if (response.destroyed || request.aborted) cancel();
+        try { return json(response, await messageSender.send(input, controller.signal)); }
+        finally { response.off('close', cancel); }
+      }
       if (url.pathname === GROUP_CONSULT_PATH) {
         // This narrow MCP endpoint uses a live operation capability, not the UI's CSRF token.
         if (request.method !== 'POST') throw new UserError('请使用 POST 咨询请求。', 405);
@@ -322,7 +342,7 @@ export async function startServer(options: { port?: number; dataDir?: string; co
             runtime: readDesktopRuntimeStatus(gateFile),
             stats: { messagesToday: store.state.dailyMessages[localDay()] ?? 0, totalTurns: store.state.totalTurns },
             conversations: bridge.conversations(), pendingActors: store.state.pendingActors, pendingGroups: store.state.pendingGroups,
-            activeWork: bridge.hasActiveWork(),
+            activeWork: bridge.hasActiveWork() || messageSender.hasPending(),
             notificationTargets: store.notificationTargets(),
             pendingRequests: bridge.pendingRequests(), logs: store.state.logs
           });
@@ -525,7 +545,7 @@ export async function startServer(options: { port?: number; dataDir?: string; co
       response.setHeader('Content-Type', contentTypes[path.extname(asset)]!);
       response.end(request.method === 'HEAD' ? undefined : fs.readFileSync(file));
     } catch (error) {
-      if (!response.headersSent) json(response, { error: safeText(errorText(error)) }, error instanceof UserError || error instanceof GroupConsultError ? error.status : 500);
+      if (!response.headersSent) json(response, { error: safeText(errorText(error)) }, error instanceof UserError || error instanceof GroupConsultError || error instanceof MessageSendError ? error.status : 500);
       else response.end();
     }
   });
@@ -536,6 +556,7 @@ export async function startServer(options: { port?: number; dataDir?: string; co
   catch (error) { releaseLock(); throw error; }
   const address = server.address();
   const actualPort = typeof address === 'object' && address ? address.port : port;
+  mcpPort = actualPort;
   bridge.setConsultationPort(actualPort);
   store.log('info', `管理页已启动：http://127.0.0.1:${actualPort}`);
   store.log('info', runtime.mode === 'shared' ? 'Codex 使用共享会话服务' : 'Codex 使用每轮独立进程');
@@ -561,6 +582,7 @@ export async function startServer(options: { port?: number; dataDir?: string; co
     subscribers.clear();
     await startup;
     const closeErrors: unknown[] = [];
+    await messageSender.close();
     try { await bridge.close(); } catch (error) { closeErrors.push(error); }
     try { await managedHermes?.close(); } catch (error) { closeErrors.push(error); }
     await router.close().catch(error => store.log('warn', `飞书连接关闭失败：${errorText(error)}`));

@@ -207,3 +207,18 @@ test('uses the configured Node runtime and falls back to the Bridge Node for an 
   await assert.rejects(fx.install({ command: undefined }), errorCode('invalid-runtime'));
   assert.equal((await fx.install({ command: process.execPath })).status, 'unchanged');
 });
+
+test('updates the owned bridge port for immediate messages without changing unrelated configuration', async t => {
+  const fx = await fixture(t);
+  const personal = structuredClone(fx.config.mcp_servers.personal);
+  assert.equal((await fx.install({ bridgePort: 18790 })).status, 'installed');
+  assert.equal(fx.config.mcp_servers.feishu_completion.env.FEISHU_CODEX_PORT, '18790');
+  assert.equal((await fx.install({ bridgePort: 18791 })).status, 'updated');
+  assert.equal(fx.config.mcp_servers.feishu_completion.env.FEISHU_CODEX_PORT, '18791');
+  assert.equal((await fx.install({ bridgePort: 18791 })).status, 'unchanged');
+  assert.deepEqual(fx.config.mcp_servers.personal, personal);
+  assert.equal(fx.config.model, 'existing-model');
+  fx.calls.length = 0;
+  for (const bridgePort of [0, 65536, 3.5, NaN]) await assert.rejects(fx.install({ bridgePort }), errorCode('invalid-runtime'));
+  assert.deepEqual(fx.calls, []);
+});

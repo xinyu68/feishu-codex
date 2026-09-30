@@ -4,6 +4,8 @@ import { createInterface } from 'node:readline';
 import { GROUP_HANDOFF_REQUEST_SCHEMA, GROUP_HANDOFF_TOOL_NAME, validateGroupHandoffRequest } from './group-handoff-request.js';
 import { GROUP_CONSULT_REQUEST_SCHEMA, GROUP_CONSULT_TOOL_NAME, validateGroupConsultRequest } from './group-consult-request.js';
 import { consultFeishuGroupAgent } from './group-consult-client.js';
+import { MESSAGE_REQUEST_SCHEMA, MESSAGE_TOOL_NAME, validateMessageRequest } from './message-request.js';
+import { sendMessageToFeishu } from './message-client.js';
 
 type RpcRequest = { jsonrpc?: string; id?: string | number | null; method?: string; params?: Record<string, unknown> };
 
@@ -13,10 +15,10 @@ const MAX_ARTIFACTS = 5;
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 const MAX_FILE_BYTES = 30 * 1024 * 1024;
 const IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp']);
-// Hermes supports bridge-owned group handoffs and synchronous consultations. Do not advertise
+// Hermes supports bridge-owned handoffs, consultations and immediate messages. Do not advertise
 // desktop notifications or artifact delivery without a bound Hermes runtime.
 const hermesMode = process.env.FEISHU_CODEX_MCP_MODE === 'hermes';
-const tools = [{
+const tools: Array<{ name: string; description: string; inputSchema: Record<string, unknown> }> = [{
   name: NOTIFICATION_TOOL_NAME,
   description: '当用户明确要求当前任务完成、失败或停止后通过飞书/Lark通知他时调用一次。应理解“做完飞书告诉我”“完成后给我发个飞书消息”等不同表达。仅讨论这个功能是否可行、询问如何使用、或任务本身来自飞书时不要调用。此工具只登记当前任务的完成通知，真正的消息会在本轮结束后由 Feishu Codex 发送。',
   inputSchema: {
@@ -47,7 +49,12 @@ const tools = [{
     description: '当前真实飞书群任务需要委派另一角色完成工作，等它返回后自己继续处理时调用。目标可按用户授权使用所有可用工具，包含查询、改文件、执行命令、测试和外部应用操作，不限定搜索方式。同步等待最多 30 分钟；不等待结果、由对方接手继续时使用交接。原样复制当前轮次的 context_token，选择名单中的一个其他角色并说明问题；桥接先以你的机器人身份公开问题并 @目标，再由目标在原群展示实际进度和答复，工具等待实际答复，返回后在同一轮继续。不要自行重复发送问题。根据返回的群回复送达状态说明结果，已送达时不要完整复述目标答复，只补充自己的结论和后续处理。只用于用户已授权的当前任务，不用于私聊、本地预览、桌面续聊或历史群上下文。不要转发凭据；失败或超时不要自动重试或改用交接重复派发。',
   inputSchema: GROUP_CONSULT_REQUEST_SCHEMA,
 }];
-const hermesTools = new Set([GROUP_HANDOFF_TOOL_NAME, GROUP_CONSULT_TOOL_NAME]);
+tools.push({
+  name: MESSAGE_TOOL_NAME,
+  description: '用户明确要求现在把一段文字发到自己的飞书时调用；通过应用已配置的默认通知机器人发到指定私聊，立即等待飞书确认，不必结束本轮。自行生成 request_id，同一次发送核对或重试复用原编号。普通飞书回复已自动转发，不调用此工具重复发送；“做完通知我”使用完成通知工具。通过本应用发给默认接收人优先用此工具；用户明确指定飞书 CLI 时遵循其选择，同一发送不得再调用 CLI 或其他工具补发。',
+  inputSchema: MESSAGE_REQUEST_SCHEMA,
+});
+const hermesTools = new Set([GROUP_HANDOFF_TOOL_NAME, GROUP_CONSULT_TOOL_NAME, MESSAGE_TOOL_NAME]);
 const consultations = new Map<string | number, { controller: AbortController; cancelled: boolean }>();
 
 function write(value: unknown): void { process.stdout.write(`${JSON.stringify(value)}\n`); }
@@ -97,6 +104,23 @@ input.on('line', line => {
     if (request.method === 'tools/call') {
       if (hermesMode && (typeof request.params?.name !== 'string' || !hermesTools.has(request.params.name))) { failure(request.id, -32602, 'This tool is not available for the Hermes bridge'); return; }
       const args = request.params?.arguments as Record<string, unknown> | undefined;
+      if (request.params?.name === MESSAGE_TOOL_NAME) {
+        if (typeof request.id !== 'string' && typeof request.id !== 'number') return;
+        const id = request.id;
+        if (consultations.has(id)) { failure(id, -32600, 'A request with this id is already in progress'); return; }
+        let message;
+        try { message = validateMessageRequest(args); }
+        catch (error) { failure(id, -32602, error instanceof Error ? error.message : 'Invalid message'); return; }
+        const pending = { controller: new AbortController(), cancelled: false };
+        consultations.set(id, pending);
+        try {
+          const sent = await sendMessageToFeishu(message, { signal: pending.controller.signal });
+          if (!pending.cancelled) result(id, { content: [{ type: 'text', text: `${sent.deduplicated ? '此前已发送，本次未重复发送' : '已发送'} · ${sent.botName}的默认通知私聊。` }], structuredContent: sent, isError: false });
+        } catch (error) {
+          if (!pending.cancelled) result(id, { content: [{ type: 'text', text: error instanceof Error ? error.message : '发送结果未确认，请勿重复发送。' }], isError: true });
+        } finally { if (consultations.get(id) === pending) consultations.delete(id); }
+        return;
+      }
       if (request.params?.name === NOTIFICATION_TOOL_NAME) {
         const summary = typeof args?.summary === 'string' ? args.summary.trim() : '';
         if (!summary || summary.length > 200) { failure(request.id, -32602, 'summary must be 1-200 characters'); return; }

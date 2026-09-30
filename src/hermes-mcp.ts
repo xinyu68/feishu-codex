@@ -12,6 +12,7 @@ export interface HermesMcpOptions {
   profile?: string;
   timeoutMs?: number;
   fetch?: typeof globalThis.fetch;
+  bridgePort?: number;
 }
 
 export interface HermesMcpResult {
@@ -64,7 +65,9 @@ async function desiredEntry(options: HermesMcpOptions): Promise<Json> {
   // install. Source development still targets the compiled server, never .ts.
   const defaultScript = fileURLToPath(new URL(import.meta.url.endsWith('.ts') ? '../build/server/notify-mcp.js' : './notify-mcp.js', import.meta.url));
   const script = await runtimeFile(options.scriptPath ?? defaultScript, false);
-  const env: Json = { [ownerKey]: 'hermes-v1', [modeKey]: 'hermes' };
+  const bridgePort = options.bridgePort ?? Number(process.env.FEISHU_CODEX_PORT || 8790);
+  if (!Number.isInteger(bridgePort) || bridgePort < 1 || bridgePort > 65535) throw new HermesMcpError('invalid-runtime', '飞书桥接端口无效');
+  const env: Json = { [ownerKey]: 'hermes-v1', [modeKey]: 'hermes', FEISHU_CODEX_PORT: String(bridgePort) };
   const entry = { command, args: [script], env, timeout: GROUP_CONSULT_MCP_TIMEOUT_SECONDS };
   env[hashKey] = fingerprint(entry);
   return entry;
