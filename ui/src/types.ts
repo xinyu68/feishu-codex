@@ -38,6 +38,8 @@ export type AppState = {
 };
 export type BotProfile = {
   id: string; name: string; appId: string; hasSecret: boolean; enabled: boolean;
+  engine?: 'codex' | 'hermes';
+  engineStatus?: { available: boolean; error?: string };
   allowedActors: string[]; allowedGroups: string[]; roleInstructions: string; model: string; effort: string;
   includeGroupContext?: boolean;
   privateRoleInstructions?: string;
@@ -51,10 +53,11 @@ export type DesktopStatus = {
   bridge?: { state?: string; status?: string; detail?: string };
   desktop?: { mode?: string; running?: boolean };
   launch?: { state: 'idle' | 'opening' | 'confirming' | 'switching' | 'error'; message?: string };
+  update?: { phase: 'unavailable' | 'idle' | 'checking' | 'current' | 'available' | 'downloading' | 'ready' | 'installing' | 'error'; version?: string; percent?: number; error?: string };
   [key: string]: unknown;
 };
 export type DesktopPreferences = { openCodexOnLaunch: boolean; openAtLogin: boolean; closeWindowAction: 'tray' | 'quit' };
-export type DesktopAction = 'openCodex' | 'retry' | 'openLogs' | 'quit' | 'switchToShared';
+export type DesktopAction = 'openCodex' | 'retry' | 'openLogs' | 'quit' | 'switchToShared' | 'checkForUpdates' | 'downloadUpdate' | 'installUpdate';
 export type DesktopResult = { ok?: boolean; error?: string; message?: string; [key: string]: unknown } | void;
 declare global {
   interface Window {
@@ -64,6 +67,9 @@ declare global {
       retry(): Promise<DesktopResult>;
       openLogs(): Promise<DesktopResult>;
       quit(): Promise<DesktopResult>;
+      checkForUpdates(): Promise<DesktopResult>;
+      downloadUpdate(): Promise<DesktopResult>;
+      installUpdate(): Promise<DesktopResult>;
       getPreferences(): Promise<DesktopPreferences>;
       setPreferences(preferences: DesktopPreferences): Promise<DesktopPreferences>;
       chooseWorkspace(): Promise<string | null>;

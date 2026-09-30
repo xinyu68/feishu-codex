@@ -87,7 +87,7 @@ test('an explicit clear remains cleared through setup, restart, and candidate ch
   assert.equal(new Store(store.dir).config.desktopNotificationTarget, null);
 });
 
-test('revocation, app replacement, and removal retain the pinned identity instead of selecting another recipient', t => {
+test('revocation and app replacement retain the pinned identity; deletion clears it without selecting another recipient', t => {
   for (const change of ['revoke', 'app-id', 'remove']) {
     const store = fixture(t);
     makeProductAvailable(store);
@@ -95,8 +95,8 @@ test('revocation, app replacement, and removal retain the pinned identity instea
     if (change === 'revoke') store.authorize('ou_b', false, 'product');
     else if (change === 'app-id') store.saveBot('product', { appId: 'cli_1111111111111111' });
     else store.removeBot('product');
-    assert.deepEqual(store.config.desktopNotificationTarget, targetB, change);
-    assert.deepEqual(new Store(store.dir).config.desktopNotificationTarget, targetB, change);
+    assert.deepEqual(store.config.desktopNotificationTarget, change === 'remove' ? null : targetB, change);
+    assert.deepEqual(new Store(store.dir).config.desktopNotificationTarget, change === 'remove' ? null : targetB, change);
   }
 });
 

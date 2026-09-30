@@ -1,4 +1,4 @@
-import type { FeishuTransport, MessageCard } from './types.js';
+import type { FeishuSendOptions, FeishuTransport, MessageCard } from './types.js';
 
 export type TaskProgressOptions = {
   transport: FeishuTransport;
@@ -22,6 +22,7 @@ export class TaskProgress {
   private timer?: ReturnType<typeof setTimeout>;
   private inFlight?: Promise<void>;
   private finalCard?: MessageCard;
+  private finalOptions?: FeishuSendOptions;
   private finalDelivered = false;
   private delivery?: Promise<string>;
   private finishing?: Promise<void>;
@@ -48,10 +49,11 @@ export class TaskProgress {
     this.timer = undefined;
   }
 
-  deliver(card: MessageCard): Promise<string> {
+  deliver(card: MessageCard, options?: FeishuSendOptions): Promise<string> {
     this.freeze();
     if (!this.delivery) {
       this.finalCard = withoutButtons(card);
+      this.finalOptions = options;
       this.delivery = this.deliverFinal();
     }
     return this.delivery;
@@ -107,10 +109,11 @@ export class TaskProgress {
 
   private async deliverFinal(): Promise<string> {
     await this.inFlight;
+    assertMayDeliver(this.finalOptions);
     if (this.messageId) {
-      await this.options.transport.updateCard(this.messageId, this.finalCard!);
+      await this.options.transport.updateCard(this.messageId, this.finalCard!, this.finalOptions);
     } else {
-      const id = await this.options.transport.sendCard(this.options.chatId, this.finalCard!);
+      const id = await this.options.transport.sendCard(this.options.chatId, this.finalCard!, this.finalOptions);
       if (!id) throw new Error('最终回复未返回消息编号，送达状态不确定');
       this.messageId = id;
     }
@@ -129,7 +132,10 @@ export class TaskProgress {
     }
     // Authorization changes must not leave the already-visible stop button actionable.
     // An uncertain final update must retain the complete answer instead of replacing it with a status.
-    try { await this.options.transport.updateCard(this.messageId, card); }
+    try {
+      assertMayDeliver(this.finalOptions);
+      await this.options.transport.updateCard(this.messageId, card, this.finalOptions);
+    }
     catch (error) { this.log(`进度卡片收尾失败：${errorMessage(error)}`); }
   }
 
@@ -155,4 +161,9 @@ function duration(value: number | undefined, fallback: number): number {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function assertMayDeliver(options?: FeishuSendOptions): void {
+  options?.signal?.throwIfAborted();
+  if (options?.canSend && !options.canSend()) throw new Error('消息发送已取消或授权已变化');
 }

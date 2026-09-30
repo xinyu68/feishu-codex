@@ -1,5 +1,5 @@
 import { messageKey, parseRoute } from './routing.js';
-import type { FeishuTransport, MessageCard } from './types.js';
+import type { FeishuSendOptions, FeishuTransport, MessageCard } from './types.js';
 
 /** Keeps every outbound action on the same Feishu application as its incoming route. */
 export class TransportRouter implements FeishuTransport {
@@ -33,12 +33,12 @@ export class TransportRouter implements FeishuTransport {
     return result ? messageKey(botId, result) : '';
   }
   sendText(chatId: string, text: string): Promise<string> { return this.send(chatId, (client, id) => client.sendText(id, text)); }
-  sendCard(chatId: string, card: MessageCard): Promise<string> { return this.send(chatId, (client, id) => client.sendCard(id, card)); }
+  sendCard(chatId: string, card: MessageCard, options?: FeishuSendOptions): Promise<string> { return this.send(chatId, (client, id) => client.sendCard(id, card, options)); }
   sendImage(chatId: string, imagePath: string): Promise<string> { return this.send(chatId, (client, id) => client.sendImage(id, imagePath)); }
   sendFile(chatId: string, filePath: string): Promise<string> { return this.send(chatId, (client, id) => client.sendFile(id, filePath)); }
-  async updateCard(messageId: string, card: MessageCard): Promise<void> {
+  async updateCard(messageId: string, card: MessageCard, options?: FeishuSendOptions): Promise<void> {
     const { id, client } = this.target(messageId);
-    await client.updateCard(id, card);
+    await client.updateCard(id, card, options);
   }
   async recallCard(messageId: string): Promise<void> {
     const { id, client } = this.target(messageId);

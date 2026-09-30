@@ -6,6 +6,11 @@ import { fileURLToPath } from 'node:url';
 import { Store, localDay } from './store.js';
 import { Bridge, UserError, errorText } from './bridge.js';
 import { CodexClient } from './codex.js';
+import { HermesClient } from './hermes.js';
+import { normalizeHermesDashboardUrl } from './hermes-discovery.js';
+import { RuntimeRouter } from './runtime-router.js';
+import { GroupConsultError } from './group-consult.js';
+import { GROUP_CONSULT_PATH } from './group-consult-request.js';
 import { readRuntimeConfig } from './runtime-config.js';
 import { discoverProjects, discoverThreads } from './discovery.js';
 import { FeishuClient, FeishuCredentialVerificationError, verifyFeishuCredentials } from './feishu.js';
@@ -16,8 +21,9 @@ import type { BotProfile, BridgeConfig, BridgeEvent, CodexRuntime, ConnectionSta
 
 const PRODUCT_VERSION = productVersion();
 
-export async function startServer(options: { port?: number; dataDir?: string; codex?: CodexRuntime; staticDir?: string; writeGateFile?: string; discovery?: { projects: () => Promise<Project[]>; threads: (cwd: string) => Promise<ThreadSummary[]> }; feishu?: { verifyCredentials?: (appId: string, appSecret: string) => Promise<void>; createTransport?: (options: FeishuOptions) => FeishuTransport } } = {}) {
+export async function startServer(options: { port?: number; dataDir?: string; codex?: CodexRuntime; hermes?: CodexRuntime; staticDir?: string; writeGateFile?: string; discovery?: { projects: () => Promise<Project[]>; threads: (cwd: string) => Promise<ThreadSummary[]> }; feishu?: { verifyCredentials?: (appId: string, appSecret: string) => Promise<void>; createTransport?: (options: FeishuOptions) => FeishuTransport } } = {}) {
   const store = new Store(options.dataDir);
+  const hermesConnection = readHermesConnection(store.dir, text => store.log('warn', text));
   const safeText = (text: string, ...extraSecrets: string[]) => {
     let safe = text;
     for (const secret of [...store.bots().map(bot => bot.appSecret), ...extraSecrets]) if (secret) safe = safe.split(secret).join('[已隐藏]');
@@ -30,7 +36,9 @@ export async function startServer(options: { port?: number; dataDir?: string; co
   const checkWrite = async () => { try { await assertWriteAllowed(gateFile); } catch (error) { throw new UserError(errorText(error), 503); } };
   const codex = options.codex ?? new CodexClient({ websocketUrl: runtime.websocketUrl,
     canWatch: async () => { try { await checkWrite(); return true; } catch { return false; } },
+    isConsultationThread: threadId => store.isConsultationThread(threadId),
   });
+  const runtimes = new RuntimeRouter(codex, options.hermes ?? (hermesConnection ? new HermesClient(hermesConnection) : undefined));
   const releaseLock = acquireLock(store.dir);
   const projects = async () => {
     const discovered = await (options.discovery?.projects ?? discoverProjects)();
@@ -41,7 +49,7 @@ export async function startServer(options: { port?: number; dataDir?: string; co
     return [...known.values()];
   };
   const threads = options.discovery?.threads ?? discoverThreads;
-  const bridge = new Bridge(store, codex, { projects, threads, assertCanWrite: checkWrite });
+  const bridge = new Bridge(store, runtimes, { projects, threads, assertCanWrite: checkWrite });
   void bridge.startNotificationTracking().catch((error) => store.log('warn', `桌面任务通知监听启动失败：${errorText(error)}`));
   const subscribers = new Set<http.ServerResponse>();
   let eventSequence = 0;
@@ -82,7 +90,18 @@ export async function startServer(options: { port?: number; dataDir?: string; co
       : bots.some(bot => connectionFor(bot.id).status === 'error') ? 'error' : 'stopped';
     return { status, connected: active, total: bots.length, detail: `${active} / ${bots.length} 个机器人已连接` };
   };
-  const publicBots = () => store.publicBots().map(bot => ({ ...bot, connection: connectionFor(bot.id) }));
+  let hermesStatus: Awaited<ReturnType<CodexRuntime['status']>> | undefined;
+  let hermesStatusAt = 0;
+  let hermesStatusPromise: Promise<void> | undefined;
+  const checkHermes = async () => {
+    if (!store.bots().some(bot => bot.engine === 'hermes') || (hermesStatusAt && Date.now() - hermesStatusAt < 10_000)) return;
+    hermesStatusPromise ??= Promise.resolve().then(() => runtimes.forEngine('hermes').status())
+      .then(status => { hermesStatus = { ...status, ...(status.error ? { error: safeText(status.error) } : {}) }; })
+      .catch(error => { hermesStatus = { available: false, error: safeText(errorText(error)) }; })
+      .finally(() => { hermesStatusAt = Date.now(); hermesStatusPromise = undefined; publish({ type: 'runtime' }); });
+    await hermesStatusPromise;
+  };
+  const publicBots = () => store.publicBots().map(bot => ({ ...bot, connection: connectionFor(bot.id), ...(bot.engine === 'hermes' ? { engineStatus: hermesStatus } : {}) }));
   const requireBot = (botId: string): BotProfile => {
     const bot = store.bot(botId);
     if (!bot) throw new UserError('这个机器人不存在，请刷新页面。', 404);
@@ -197,6 +216,8 @@ export async function startServer(options: { port?: number; dataDir?: string; co
     if (bridge.hasActiveWork()) throw new UserError('请等当前对话完成后再更换应用凭据。', 409);
     if (!/^cli_[\da-f]{16}$/i.test(appId) || !appSecret) throw new UserError('请填写有效的飞书 App ID 和 App Secret。');
     assertUniqueApp(botId, appId);
+    const existingBot = store.bot(botId);
+    if (patch.engine && existingBot && patch.engine !== (existingBot.engine ?? 'codex')) throw new UserError('请先保存应用凭据，再单独切换机器人执行端。');
     changingConnection = true;
     const previous = store.bot(botId);
     if (previous && previous.appId !== appId && (previous.allowedActors.length || previous.allowedGroups.length)) {
@@ -205,6 +226,14 @@ export async function startServer(options: { port?: number; dataDir?: string; co
     }
     let swapped = false;
     try {
+      if (!existingBot && patch.engine === 'hermes') {
+        const status = await Promise.resolve().then(() => runtimes.forEngine('hermes').status())
+          .catch(error => { throw new UserError(safeText(errorText(error)), 503); });
+        if (!status.available || status.authenticated === false) throw new UserError(status.error || 'Hermes 尚未就绪。', 503);
+        hermesStatus = { ...status, ...(status.error ? { error: safeText(status.error) } : {}) };
+        hermesStatusAt = Date.now();
+        patch.model = ''; patch.effort = '';
+      }
       try { await (options.feishu?.verifyCredentials ?? verifyFeishuCredentials)(appId, appSecret); }
       catch (error) {
         if (error instanceof FeishuCredentialVerificationError) throw new UserError(safeText(error.message, appSecret), error.invalid ? 400 : 503);
@@ -261,6 +290,19 @@ export async function startServer(options: { port?: number; dataDir?: string; co
       response.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'self'; base-uri 'none'; form-action 'self'");
       const url = new URL(request.url ?? '/', host);
       if (url.pathname === '/health' && request.method === 'GET') return json(response, { status: 'ok', name: 'feishu-codex', version: PRODUCT_VERSION, pid: process.pid });
+      if (url.pathname === GROUP_CONSULT_PATH) {
+        // This narrow MCP endpoint uses a live operation capability, not the UI's CSRF token.
+        if (request.method !== 'POST') throw new UserError('请使用 POST 咨询请求。', 405);
+        if (origin || request.headers['sec-fetch-site']) throw new UserError('群咨询接口仅供本机 MCP 调用。', 403);
+        if (request.headers['content-type']?.split(';')[0]?.trim().toLowerCase() !== 'application/json') throw new UserError('请使用 JSON 请求。', 415);
+        const input = await readBody(request);
+        const controller = new AbortController();
+        const cancel = () => controller.abort();
+        response.once('close', cancel);
+        if (response.destroyed || request.aborted) cancel();
+        try { return json(response, await bridge.consultInGroup(input, controller.signal)); }
+        finally { response.off('close', cancel); }
+      }
       if (url.pathname.startsWith('/api/')) {
         if (request.method !== 'GET') {
           if (request.headers['x-bridge-token'] !== csrfToken) throw new UserError('页面连接已更新，请刷新后重试。', 403);
@@ -268,6 +310,7 @@ export async function startServer(options: { port?: number; dataDir?: string; co
         }
         if (request.method === 'GET' && url.pathname === '/api/state') {
           void checkCodex();
+          void checkHermes();
           return json(response, {
             csrfToken, service: { name: 'Feishu Codex', version: PRODUCT_VERSION, startedAt, uptimeSeconds: Math.floor((Date.now() - Date.parse(startedAt)) / 1000) },
             config: store.publicConfig(), connection: connectionFor(), connectionSummary: connectionSummary(), bots: publicBots(), codex: { ...codexStatus, mode: runtime.mode },
@@ -290,14 +333,15 @@ export async function startServer(options: { port?: number; dataDir?: string; co
         }
         if (request.method === 'GET' && url.pathname === '/api/projects') return json(response, { projects: await projects() });
         if (request.method === 'GET' && url.pathname === '/api/sessions') {
-          const sessions = await threads(required(url.searchParams.get('cwd'), '项目目录'));
+          const cwd = required(url.searchParams.get('cwd'), '项目目录');
           const chatId = optional(url.searchParams.get('chatId'));
-          return json(response, { sessions: chatId && store.isGroup(chatId)
-            ? sessions.filter(session => store.state.threadBindings[session.id]?.chatId === chatId)
-            : sessions });
+          return json(response, { sessions: chatId ? await bridge.sessions(chatId, cwd) : await threads(cwd) });
         }
-        if (request.method === 'GET' && url.pathname === '/api/models') return json(response, { models: await codex.models() });
-        if (request.method === 'GET' && url.pathname === '/api/bots') return json(response, { bots: publicBots() });
+        if (request.method === 'GET' && url.pathname === '/api/models') {
+          const chatId = optional(url.searchParams.get('chatId'));
+          return json(response, { models: chatId && bridge.engineForChat(chatId) === 'hermes' ? [] : await codex.models() });
+        }
+        if (request.method === 'GET' && url.pathname === '/api/bots') { await checkHermes(); return json(response, { bots: publicBots() }); }
         if (request.method === 'GET' && url.pathname === '/api/history') {
           const chatId = required(url.searchParams.get('chatId'), '对话 ID');
           void bridge.watch(chatId).catch((error) => store.log('warn', errorText(error)));
@@ -335,23 +379,32 @@ export async function startServer(options: { port?: number; dataDir?: string; co
               const appSecret = patch.appSecret ?? (appId === current.appId ? current.appSecret : '');
               return json(response, await activateCredentials(appId, appSecret, botId, patch));
             }
-            store.saveBot(botId, patch);
-            await stopUnauthorized(botId);
+            changingConnection = true;
+            try {
+              if (patch.engine && patch.engine !== (current.engine ?? 'codex')) {
+                await bridge.setBotEngine(botId, patch.engine);
+                hermesStatusAt = 0;
+                await checkHermes();
+              }
+              requireBot(botId);
+              if ((patch.engine ?? current.engine) === 'hermes') { patch.model = ''; patch.effort = ''; }
+              store.saveBot(botId, patch);
+              await stopUnauthorized(botId);
+            } finally { changingConnection = false; publish({ type: 'state' }); }
             return json(response, { bot: publicBots().find(bot => bot.id === botId) });
           }
           if (!botRoute[2] && request.method === 'DELETE') {
-            if (botId === 'default') throw new UserError('默认机器人不能删除，可以关闭连接。');
-            if (changingConnection || bridge.hasActiveWork()) throw new UserError('请等当前任务和连接操作完成后再删除机器人。', 409);
+            if (changingConnection) throw new UserError('连接状态正在更新，请稍后重试。', 409);
             changingConnection = true;
             try {
-              await closeTransport(botId);
-              store.removeBot(botId);
+              await bridge.removeBot(botId, () => closeTransport(botId));
               connections.delete(botId);
             } finally { changingConnection = false; publish({ type: 'state' }); }
-            return json(response, { ok: true });
+            return json(response, { ok: true, bots: publicBots() });
           }
         }
         if (request.method === 'POST' && url.pathname === '/api/credentials') {
+          requireBot('default');
           const credentials = validateConfig(body);
           const appId = credentials.appId ?? store.config.appId;
           const appSecret = credentials.appSecret ?? (appId === store.config.appId ? store.config.appSecret : '');
@@ -360,6 +413,7 @@ export async function startServer(options: { port?: number; dataDir?: string; co
         if (request.method === 'PUT' && url.pathname === '/api/config') {
           if (changingConnection) throw new UserError('连接状态正在更新，请稍后重试。', 409);
           const patch = validateConfig(body);
+          if (['appId', 'appSecret', 'enabled', 'allowedActors', 'allowedGroups', 'botName', 'roleInstructions', 'privateRoleInstructions', 'includeGroupContext'].some(key => key in patch)) requireBot('default');
           assertUniqueApp('default', patch.appId ?? store.config.appId);
           const credentialsChanged = (patch.appId !== undefined && patch.appId !== store.config.appId) || Boolean(patch.appSecret && patch.appSecret !== store.config.appSecret);
           if (credentialsChanged && bridge.hasActiveWork()) throw new UserError('请等当前对话完成后再更换应用凭据。', 409);
@@ -468,7 +522,7 @@ export async function startServer(options: { port?: number; dataDir?: string; co
       response.setHeader('Content-Type', contentTypes[path.extname(asset)]!);
       response.end(request.method === 'HEAD' ? undefined : fs.readFileSync(file));
     } catch (error) {
-      if (!response.headersSent) json(response, { error: safeText(errorText(error)) }, error instanceof UserError ? error.status : 500);
+      if (!response.headersSent) json(response, { error: safeText(errorText(error)) }, error instanceof UserError || error instanceof GroupConsultError ? error.status : 500);
       else response.end();
     }
   });
@@ -479,6 +533,7 @@ export async function startServer(options: { port?: number; dataDir?: string; co
   catch (error) { releaseLock(); throw error; }
   const address = server.address();
   const actualPort = typeof address === 'object' && address ? address.port : port;
+  bridge.setConsultationPort(actualPort);
   store.log('info', `管理页已启动：http://127.0.0.1:${actualPort}`);
   store.log('info', runtime.mode === 'shared' ? 'Codex 使用共享会话服务' : 'Codex 使用每轮独立进程');
   void checkCodex();
@@ -508,6 +563,22 @@ export async function startServer(options: { port?: number; dataDir?: string; co
     releaseLock();
   };
   return { server, store, bridge, port: actualPort, close };
+}
+
+function readHermesConnection(dataDir: string, warn: (text: string) => void): { baseUrl?: string } | undefined {
+  const file = path.join(dataDir, 'hermes-runtime.json');
+  // A fresh installation discovers an already-running Desktop only when Hermes is used.
+  if (!fs.existsSync(file)) return {};
+  try {
+    const config = JSON.parse(fs.readFileSync(file, 'utf8')) as Record<string, unknown>;
+    if (config.type !== 'desktop' || config.apiKey !== undefined) throw new Error('invalid');
+    if (config.baseUrl === undefined) return {};
+    if (typeof config.baseUrl !== 'string') throw new Error('invalid');
+    return { baseUrl: normalizeHermesDashboardUrl(config.baseUrl) };
+  } catch {
+    warn('Hermes 本机接口配置无效，Hermes 机器人暂不可用；Codex 机器人不受影响。');
+    return;
+  }
 }
 
 function defaultStaticDir(): string {
@@ -596,6 +667,10 @@ function validateIdList(value: unknown, pattern: RegExp, error: string): string[
 }
 function validateBot(body: Record<string, unknown>): Partial<BotProfile> {
   const patch: Partial<BotProfile> = {};
+  if (body.engine !== undefined) {
+    if (body.engine !== 'codex' && body.engine !== 'hermes') throw new UserError('不支持的机器人执行端');
+    patch.engine = body.engine;
+  }
   for (const name of ['name', 'appId', 'appSecret', 'roleInstructions', 'privateRoleInstructions', 'model', 'effort'] as const) {
     if (body[name] === undefined) continue;
     const max = name === 'roleInstructions' || name === 'privateRoleInstructions' ? 12_000 : name === 'name' ? 80 : 1500;

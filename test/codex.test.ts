@@ -80,6 +80,42 @@ test('concurrent independent threads do not mix results', async () => {
   } finally { await fx.cleanup(); }
 });
 
+test('standalone consultation starts an ephemeral session and declines all approvals', async () => {
+  const fx = await fixture('approval');
+  try {
+    const result = await fx.client.consult({ cwd: fx.directory, prompt: 'analyze supplied text', roleInstructions: 'product perspective',
+      model: 'consult-model', effort: 'high', signal: new AbortController().signal });
+    assert.equal(result.text, 'new-thread: final answer');
+    const rows = await fx.trace();
+    const start = rows.find(row => row.method === 'thread/start').params;
+    assert.equal(start.ephemeral, true);
+    assert.equal(start.sandbox, 'danger-full-access');
+    assert.equal(start.model, 'consult-model');
+    assert.match(start.developerInstructions, /不要调用任何工具/);
+    assert.match(start.developerInstructions, /product perspective/);
+    assert.equal(rows.some(row => ['thread/resume', 'turn/steer'].includes(row.method)), false);
+    const answers = rows.filter(row => String(row.id).startsWith('approval-'));
+    assert.deepEqual(answers.slice(0, 3).map(row => row.result), [{ decision: 'decline' }, { decision: 'decline' }, { permissions: {}, scope: 'turn' }]);
+    assert.match(answers[3].result.answers.pick.answers[0], /独立咨询/);
+  } finally { await fx.cleanup(); }
+});
+
+test('standalone consultation cancellation interrupts only its temporary session', async () => {
+  const fx = await fixture('hang');
+  try {
+    let ready!: () => void;
+    const running = new Promise<void>(resolve => { ready = resolve; });
+    const controller = new AbortController();
+    const result = fx.client.consult({ cwd: fx.directory, prompt: 'wait', signal: controller.signal, onProgress: ready });
+    const rejected = assert.rejects(result, /咨询已取消或超时/);
+    await running;
+    controller.abort();
+    await rejected;
+    const interrupts = (await fx.trace()).filter(row => row.method === 'turn/interrupt');
+    assert.deepEqual(interrupts.map(row => row.params), [{ threadId: 'new-thread', turnId: 'turn-1' }]);
+  } finally { await fx.cleanup(); }
+});
+
 test('process exits and foreign writer locks fail clearly and release local ownership', async () => {
   for (const [scenario, pattern] of [['crash', /进程已退出/], ['busy', /桌面回复结束不代表已释放/], ['active-writer', /桌面回复结束不代表已释放/]] as const) {
     const fx = await fixture(scenario);

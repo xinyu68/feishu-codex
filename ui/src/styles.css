@@ -130,3 +130,5 @@ select.app-select { appearance:auto; }
 .notification-target-summary strong.unavailable { color:#a08044; }
 .notification-target-summary small { font-size:10px;color:#a08044; }
 .notification-target-summary .text-button { display:flex;align-items:center;gap:2px;white-space:nowrap;font-size:11px;padding:0; }
+.about-actions{display:flex;align-items:center;gap:8px;flex:0 0 auto}.about-actions .primary-button,.about-actions .secondary-button{white-space:nowrap}
+.about-section>div{min-width:0}.about-section p{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}

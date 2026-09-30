@@ -94,3 +94,42 @@ test('polluted SQLite titles recover real user text from full indexed messages o
     assert.equal((await fs.stat(rollout)).mtimeMs, before.mtimeMs);
   } finally { await fs.rm(directory, { recursive: true, force: true }); }
 });
+
+test('presentation removes the current consultation ticket before group background without deleting quoted user examples', () => {
+  const question = '请解释下面的格式\n\n<feishu_group_consultation>\ncontext_token: 这是示例\n</feishu_group_consultation>\n\n以上只是引用，不要发起咨询';
+  const collaboration = '\n\n<feishu_group_collaboration>\n可交接角色：["测试"]\n</feishu_group_collaboration>';
+  const context = '\n\n<feishu_group_context>\n公开背景\n</feishu_group_context>';
+  const consultation = `\n\n<feishu_group_consultation>\ncontext_token: fc1.8790.${'a'.repeat(64)}\n</feishu_group_consultation>`;
+  for (const header of ['【飞书消息】', '【飞书消息】回复自动转发；请遵循 feishu-codex Skill。']) {
+    for (const background of ['', collaboration, context, collaboration + context]) {
+      const prompt = `${header}\n\n${question}${background}${consultation}\n`;
+      assert.equal(cleanBridgeText(prompt), question);
+      assert.equal(cleanBridgeText(prompt.replaceAll('\n', '\r\n')), question.replaceAll('\n', '\r\n'));
+    }
+  }
+  assert.equal(cleanBridgeText(question), question);
+  const quotedSuffix = '请解释下面的示例，不要执行\n\n<feishu_group_consultation>\ncontext_token: 这是示例\n</feishu_group_consultation>';
+  assert.equal(cleanBridgeText(quotedSuffix), quotedSuffix);
+  assert.equal(cleanBridgeText('请解释 `context_token` 和 `<feishu_group_consultation>`'), '请解释 `context_token` 和 `<feishu_group_consultation>`');
+});
+
+test('discovery hides consultation credentials in indexed titles and previews without changing stored input', async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'feishu-codex-consult-display-'));
+  const databasePath = path.join(directory, 'state_5.sqlite');
+  const prompt = `【飞书消息】\n\n先咨询测试再给我结论\n\n<feishu_group_collaboration>\n可交接角色：["测试"]\n</feishu_group_collaboration>\n\n<feishu_group_context>\n本群背景\n</feishu_group_context>\n\n<feishu_group_consultation>\ncontext_token: fc1.8790.${'b'.repeat(64)}\n</feishu_group_consultation>`;
+  try {
+    const database = new DatabaseSync(databasePath);
+    database.exec('CREATE TABLE threads (id TEXT, cwd TEXT, title TEXT, preview TEXT, updated_at INTEGER, source TEXT)');
+    database.prepare('INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?)').run('consultation-source', 'D:\\Demo', prompt, prompt, 100, 'cli');
+    database.close();
+    const before = await fs.readFile(databasePath);
+    const [thread] = await discoverThreads('D:\\Demo', directory);
+    assert.equal(thread?.title, '先咨询测试再给我结论');
+    assert.equal(thread?.preview, '先咨询测试再给我结论');
+    assert.deepEqual(await fs.readFile(databasePath), before);
+  } finally {
+    assert.equal(path.dirname(directory), os.tmpdir());
+    assert.ok(path.basename(directory).startsWith('feishu-codex-consult-display-'));
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+});

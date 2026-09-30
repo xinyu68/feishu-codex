@@ -39,6 +39,7 @@ function setup(t: test.TestContext, options: { linked?: boolean; progress?: bool
     ? '登录方案：验证码五分钟有效。\n交接给 @开发人员：实现上述验证码登录，并验证过期场景。'
     : '登录功能已经实现，测试通过。';
   let deliver: (item: SentCard) => Promise<void> = async () => {};
+  let writeGuard = async () => {};
   let submission = (index: number): { turnId: string; mode: 'start' | 'steer' } => ({ turnId: `turn-${index}`, mode: 'start' });
   const runtime: CodexRuntime = {
     supportsSteering: true,
@@ -59,6 +60,7 @@ function setup(t: test.TestContext, options: { linked?: boolean; progress?: bool
     async threadInfo(threadId) { return { threadId, cwd: dir, title: '独立角色会话', isUserThread: true }; },
   };
   const bridge = new Bridge(store, runtime, {
+    assertCanWrite: () => writeGuard(),
     projects: async () => [],
     threads: async cwd => Object.keys(store.state.threadBindings).map(id => ({ id, cwd, title: id, preview: '', updatedAt: '' })),
   });
@@ -106,6 +108,7 @@ function setup(t: test.TestContext, options: { linked?: boolean; progress?: bool
   });
   return { dir, store, bridge, runs, runThreads, sent, attempts, stopped, unavailable, message, send, gate, idle,
     runWith: (fn: typeof runner) => { runner = fn; }, deliverWith: (fn: typeof deliver) => { deliver = fn; },
+    guardWith: (fn: typeof writeGuard) => { writeGuard = fn; },
     submitWith: (fn: typeof submission) => { submission = fn; } };
 }
 
@@ -140,6 +143,20 @@ test('a confirmed group result relays to the linked user in the target role own 
   assert.ok(h.sent.some(item => item.chatId === 'oc_team' && item.card.title.includes('产品经理')));
   assert.ok(h.sent.some(item => item.chatId === conversationKey('dev', 'oc_team') && item.card.title.includes('开发人员')));
   assert.equal(h.runs.length, 2);
+});
+
+test('roles reset with /new still receive explicit handoffs without pre-reset group background', async t => {
+  const h = setup(t);
+  h.store.observeGroup(h.message('default', 'PRE-RESET-UNRELATED-DISCUSSION'));
+  await h.send('default', '/new');
+  await h.send('dev', '/new');
+  await h.send('default', '设计并实现验证码登录。');
+  await h.idle();
+  assert.equal(h.runs.length, 2);
+  for (const input of h.runs) assert.doesNotMatch(input.prompt, /PRE-RESET-UNRELATED-DISCUSSION/);
+  assert.match(h.runs[1]!.prompt, /明确引用[\s\S]*验证码五分钟有效/);
+  assert.match(h.runs[1]!.prompt, /交接来源/);
+  assert.notEqual(h.runThreads[0], h.runThreads[1]);
 });
 
 test('a target allowlist alone cannot link a user across applications', async t => {
@@ -539,7 +556,7 @@ test('existing role threads migrate once to Skill guidance without replacing the
   assert.equal(updates.length, 1);
   assert.equal(updates[0]!.threadId, threadId);
   assert.match(updates[0]!.instructions, /feishu-codex Skill/);
-  assert.equal(binding.groupHandoffPolicyVersion, 2);
+  assert.equal(binding.groupHandoffPolicyVersion, 3);
   assert.match(binding.roleInstructions!, /产品经理：保留已有角色与需求历史/);
   assert.deepEqual(h.runThreads, [threadId, threadId, threadId]);
   assert.deepEqual(h.stopped, []);
@@ -561,4 +578,168 @@ test('automatic handoff retains source quote and original task when target suppl
   assert.notEqual(h.runThreads[0], h.runThreads[1]);
   assert.equal(target.allowSteering, false);
   assert.equal(h.store.bot('default')!.includeGroupContext, true);
+});
+
+test('deleting an idle handoff source waits for its live relay but unrelated bots remain removable', async t => {
+  const h = setup(t); const held = h.gate();
+  h.store.saveBot('observer', { name: 'Observer' });
+  h.runWith(async (_input, index) => index === 1 ? '方案完成。\n交接给 @开发人员：实现方案。' : (await held.promise, '实现完成。'));
+  await h.send('default', '整理方案并交给开发。');
+  await until(() => h.runs.length === 2, 'developer relay');
+  let disconnected = 0;
+  const disconnect = async () => { disconnected++; };
+  await assert.rejects(h.bridge.removeBot('default', disconnect), /交接/);
+  await assert.rejects(h.bridge.removeBot('dev', disconnect), /交接/);
+  assert.equal(disconnected, 0);
+  await h.bridge.removeBot('observer', disconnect);
+  assert.equal(disconnected, 1); assert.deepEqual(h.stopped, []);
+  held.resolve(); await h.idle();
+  await h.bridge.removeBot('default', disconnect);
+  assert.equal(disconnected, 2); assert.deepEqual(h.stopped, []);
+  assert.ok(h.store.bot('dev'));
+});
+
+test('a human followup submitted during final-card delivery owns the one next handoff', async t => {
+  const h = setup(t);
+  const delivery = h.gate();
+  const finishFollowup = h.gate();
+  const finalText = '方案已确认。\n交接给 @开发人员：实现确认的方案。';
+  const latestTask = '交接时加上最新的无障碍验收要求。';
+  h.submitWith(index => ({ turnId: index <= 2 ? 'native-delivery-followup' : `turn-${index}`, mode: index === 2 ? 'steer' : 'start' }));
+  h.runWith(async (_input, index) => {
+    if (index === 2) await finishFollowup.promise;
+    return index <= 2 ? finalText : '实现完成。';
+  });
+  h.deliverWith(async item => { if (item.card.text === finalText) await delivery.promise; });
+  const original = h.message('default', '准备方案并交给开发。');
+  const first = h.bridge.receive(original);
+  await until(() => h.attempts.some(item => item.card.text === finalText), 'final card waiting on network');
+  const latest = h.message('default', latestTask);
+  const second = h.bridge.receive(latest);
+  await until(() => h.runs.length === 2, 'followup submitted during delivery');
+  finishFollowup.resolve(); delivery.resolve();
+  await Promise.all([first, second]); await h.idle();
+  assert.equal(h.runs.length, 3);
+  assert.equal(h.sent.filter(item => item.card.text === finalText).length, 1);
+  assert.ok(h.runs[2]!.prompt.includes(`原始用户任务：${JSON.stringify(latestTask)}`));
+  assert.equal(Object.values(h.store.state.operations).filter(operation => operation.id.startsWith('relay:')).length, 1);
+});
+
+test('a target revision race reports one handoff failure to the source without replaying work', async t => {
+  const h = setup(t);
+  const originalReceive = h.bridge.receive.bind(h.bridge);
+  h.bridge.receive = async message => {
+    if (message.handoff) h.store.conversation(message.chatId).revision!++;
+    await originalReceive(message);
+  };
+  const original = h.message('default', '整理登录需求后交给开发。');
+  await h.bridge.receive(original); await h.idle();
+  await h.bridge.receive(original); await h.idle();
+  assert.equal(h.runs.length, 1);
+  const notices = h.sent.filter(item => item.card.title === '交接未执行');
+  assert.equal(notices.length, 1);
+  assert.equal(notices[0]!.chatId, 'oc_team');
+  assert.match(notices[0]!.card.text, /未能接收交接/);
+  assert.equal(h.store.state.operations[original.id]!.status, 'completed');
+  assert.ok(h.store.state.history.oc_team?.some(item => item.role === 'system' && /未能接收交接/.test(item.text)));
+});
+
+test('a write guard rejecting the target reports the unsubmitted handoff without a second target card', async t => {
+  const h = setup(t);
+  let block = false;
+  h.guardWith(async () => { if (block) throw new Error('桌面状态无法确认'); });
+  h.deliverWith(async item => { if (item.card.text.includes('验证码五分钟有效')) block = true; });
+  const original = h.message('default', '整理登录需求后交给开发。');
+  await h.bridge.receive(original); await h.idle();
+  assert.equal(h.runs.length, 1);
+  const notices = h.sent.filter(item => item.card.title === '交接未执行');
+  assert.equal(notices.length, 1); assert.equal(notices[0]!.chatId, 'oc_team');
+  assert.match(notices[0]!.card.text, /桌面状态无法确认/);
+  assert.equal(h.sent.some(item => parseRoute(item.chatId).botId === 'dev'), false);
+  assert.equal(h.store.state.operations[original.id]!.status, 'completed');
+});
+
+test('a preparation exception remains visible without changing the completed source result', async t => {
+  const h = setup(t);
+  h.deliverWith(async item => {
+    if (item.card.text.includes('验证码五分钟有效')) h.store.resolveGroupActor = () => { throw new Error('身份关联暂不可用'); };
+  });
+  const original = h.message('default', '整理登录需求后交给开发。');
+  await h.bridge.receive(original); await h.idle();
+  assert.equal(h.runs.length, 1);
+  const notices = h.sent.filter(item => item.card.title === '交接未执行');
+  assert.equal(notices.length, 1); assert.match(notices[0]!.card.text, /交接准备失败.*身份关联暂不可用/);
+  assert.equal(h.store.state.operations[original.id]!.status, 'completed');
+});
+
+test('a lost handoff-failure acknowledgement preserves the reason without resending a card', async t => {
+  const h = setup(t, { linked: false });
+  h.deliverWith(async item => { if (item.card.title === '交接未执行') throw new Error('lost failure-card acknowledgement'); });
+  const original = h.message('default', '整理登录需求后交给开发。');
+  await h.bridge.receive(original); await h.idle();
+  await h.bridge.receive(original); await h.idle();
+  assert.equal(h.runs.length, 1);
+  assert.equal(h.attempts.filter(item => item.card.title === '交接未执行').length, 1);
+  assert.equal(h.store.state.deliveries[`handoff-notice:${original.id}`]!.status, 'uncertain');
+  assert.ok(h.store.state.history.oc_team?.some(item => item.role === 'system' && /账号授权/.test(item.text)));
+  assert.equal(h.store.state.operations[original.id]!.status, 'completed');
+});
+
+test('the latest delivered source survives listener cleanup while completion reactions wait', async t => {
+  for (const reaction of ['typing', 'completed'] as const) await t.test(reaction, async child => {
+    const h = setup(child);
+    const delivery = h.gate();
+    const finishReaction = h.gate();
+    const finalText = '最新方案已确认。\n交接给 @开发人员：实现确认的双因素登录方案。';
+    const latestTask = '最新任务：按双因素登录的验收要求交给开发人员。';
+    const original = h.message('default', '先整理验证码登录方案。');
+    let reactionStarted = false;
+    let latestFinished = false;
+    const waitForReaction = async (messageId: string) => {
+      if (messageId !== original.id) return;
+      reactionStarted = true;
+      await finishReaction.promise;
+    };
+    h.bridge.transport!.markCompleted = reaction === 'completed' ? waitForReaction : async () => {};
+    if (reaction === 'typing') h.bridge.transport!.startTyping = async id => () => waitForReaction(id);
+    h.submitWith(index => ({ turnId: index <= 2 ? 'native-reaction-followup' : `turn-${index}`, mode: index === 2 ? 'steer' : 'start' }));
+    h.runWith(async (_input, index) => index <= 2 ? finalText : '双因素登录已实现。');
+    h.deliverWith(async item => { if (item.card.text === finalText) await delivery.promise; });
+    const first = h.bridge.receive(original);
+    await until(() => h.attempts.some(item => item.card.text === finalText), 'source final card awaiting delivery');
+    const latest = h.send('default', latestTask).then(() => { latestFinished = true; });
+    await until(() => h.runs.length === 2, 'latest human task submitted during delivery');
+    assert.equal(latestFinished, false, 'the latest listener shares the pending final delivery');
+    delivery.resolve();
+    await until(() => reactionStarted && latestFinished, 'latest listener to finish while the source reaction is pending');
+    assert.equal(h.runs.length, 2, 'the target still waits for the source workspace to be released');
+    finishReaction.resolve();
+    await Promise.all([first, latest]); await h.idle();
+    assert.equal(h.runs.length, 3);
+    assert.equal(h.sent.filter(item => item.card.text === finalText).length, 1);
+    assert.ok(h.runs[2]!.prompt.includes(`原始用户任务：${JSON.stringify(latestTask)}`));
+    assert.equal(Object.values(h.store.state.operations).filter(operation => operation.id.startsWith('relay:')).length, 1);
+  });
+});
+
+test('human takeover during a completion reaction cancels the prepared handoff before dispatch', async t => {
+  const h = setup(t);
+  const finishReaction = h.gate();
+  const original = h.message('default', '整理方案后交给开发。');
+  let reactionStarted = false;
+  h.bridge.transport!.markCompleted = async id => {
+    if (id !== original.id) return;
+    reactionStarted = true;
+    await finishReaction.promise;
+  };
+  h.runWith(async (_input, index) => index === 1
+    ? '方案已确认。\n交接给 @开发人员：实现确认的方案。'
+    : '已按用户要求结束，不再交接。');
+  const source = h.bridge.receive(original);
+  await until(() => reactionStarted, 'source completion reaction waiting');
+  await h.send('default', '取消后续开发，只保留整理结果。');
+  finishReaction.resolve();
+  await source; await h.idle();
+  assert.equal(h.runs.length, 2);
+  assert.equal(Object.values(h.store.state.operations).filter(operation => operation.id.startsWith('relay:')).length, 0);
 });

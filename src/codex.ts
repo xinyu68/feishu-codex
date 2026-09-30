@@ -9,7 +9,8 @@ import { CHANNEL_INSTRUCTIONS, channelContextParameters } from './channel-contex
 import { readTurnTiming } from './turn-timing.js';
 import { isThreadInitializationRace, isThreadWriterConflict, THREAD_WRITER_MESSAGE } from './codex-errors.js';
 import { CodexRpcError, IGNORE_SERVER_REQUEST, WebsocketCodexConnection, validateCodexWebsocketUrl, type CodexConnection } from './codex-websocket.js';
-import type { CodexRunInput, CodexRuntime, CodexUsage, HistoryMessage, ModelInfo, RuntimeAnswer, RuntimeRequest, RuntimeEvent, UsageLimit, UsageWindow } from './types.js';
+import { consultationAborted, consultationInstructions, declineConsultationRequest } from './runtime-consult.js';
+import type { CodexRunInput, CodexRuntime, CodexUsage, HistoryMessage, ModelInfo, RuntimeAnswer, RuntimeRequest, RuntimeConsultInput, RuntimeEvent, UsageLimit, UsageWindow } from './types.js';
 
 type RecordValue = Record<string, unknown>;
 type Wire = { id?: string | number; method?: string; params?: RecordValue; result?: unknown; error?: { message?: string; code?: number } };
@@ -22,6 +23,8 @@ export type CodexClientOptions = {
   idleTimeoutMs?: number;
   /** A passive watcher must obey the same desktop ownership gate as a writer. */
   canWatch?: () => Promise<boolean>;
+  /** Consultation threads are persisted but must never be watched as desktop work. */
+  isConsultationThread?: (threadId: string) => boolean;
   /** Executable and arguments are separate; never invoke a command shell. Also useful for protocol fixtures. */
   command?: Command;
 };
@@ -58,6 +61,8 @@ export class CodexClient implements CodexRuntime {
   private loadedWatchTimer?: NodeJS.Timeout;
   private loadedWatchBusy = false;
   private observedLoaded = new Set<string>();
+  /** Retain identities after cleanup so late broadcasts cannot become public notifications. */
+  private consultationThreads = new Set<string>();
 
   get supportsSteering(): boolean { return Boolean(this.options.websocketUrl); }
   subscribe(listener: (event: RuntimeEvent) => void): () => void {
@@ -65,6 +70,7 @@ export class CodexClient implements CodexRuntime {
     return () => this.listeners.delete(listener);
   }
   private emit(method: string, params: RecordValue): void {
+    if (this.consultationThreads.has(string(params.threadId)) || this.options.isConsultationThread?.(string(params.threadId))) return;
     const event: RuntimeEvent = { method, threadId: string(params.threadId) || undefined, turnId: string(params.turnId) || string(record(params.turn).id) || undefined, params };
     for (const listener of this.listeners) { try { listener(event); } catch { /* A view cannot break the protocol. */ } }
   }
@@ -84,7 +90,7 @@ export class CodexClient implements CodexRuntime {
   }
 
   async watch(threadId: string): Promise<void> {
-    if (!this.options.websocketUrl || this.closed) return;
+    if (!this.options.websocketUrl || this.closed || this.consultationThreads.has(threadId) || this.options.isConsultationThread?.(threadId)) return;
     if (this.options.canWatch && !await this.options.canWatch()) { await this.unwatch(threadId); return; }
     let watcher = this.watchers.get(threadId);
     if (!watcher) { watcher = {}; this.watchers.set(threadId, watcher); }
@@ -119,8 +125,10 @@ export class CodexClient implements CodexRuntime {
           // acquire its writer lock in a second app-server process.
           const metadata = record(await connection.request('thread/read', { threadId, includeTurns: false }));
           const thread = record(metadata.thread);
+          if (thread.ephemeral === true) this.consultationThreads.add(threadId);
           const loaded = string(thread.id) === threadId && ['active', 'idle', 'systemError'].includes(string(record(thread.status).type));
-          const allowed = loaded && (!this.options.canWatch || await this.options.canWatch());
+          const allowed = loaded && thread.ephemeral !== true && !this.consultationThreads.has(threadId)
+            && !this.options.isConsultationThread?.(threadId) && (!this.options.canWatch || await this.options.canWatch());
           if (!allowed || this.closed || this.watchers.get(threadId) !== entry) {
             connection.onFailure = undefined;
             if (entry.connection === connection) entry.connection = undefined;
@@ -187,9 +195,11 @@ export class CodexClient implements CodexRuntime {
           return result;
         });
         for (const threadId of ids) {
+          if (this.consultationThreads.has(threadId) || this.options.isConsultationThread?.(threadId)) continue;
           const firstSeen = !this.observedLoaded.has(threadId);
           this.observedLoaded.add(threadId);
           await this.watch(threadId).catch(() => undefined);
+          if (this.consultationThreads.has(threadId) || this.options.isConsultationThread?.(threadId)) continue;
           if (!firstSeen) continue;
           await this.withConnection(async connection => {
             const turns = await readRecentSharedTurnsBestEffort(connection, threadId);
@@ -620,6 +630,81 @@ export class CodexClient implements CodexRuntime {
       usage.fetchedAt = new Date().toISOString();
       return usage;
     });
+  }
+
+  async consult(input: RuntimeConsultInput): Promise<{ threadId: string; text: string }> {
+    if (input.signal.aborted) throw consultationAborted();
+    const connection = this.connect(input.cwd);
+    const runInput: CodexRunInput = { cwd: input.cwd, prompt: input.prompt, onProgress: input.onProgress, onRequest: declineConsultationRequest };
+    const tracker = new TurnTracker(runInput, this.options.idleTimeoutMs ?? 15 * 60_000, Boolean(this.options.websocketUrl));
+    let threadId = '';
+    let turnId = '';
+    let submitted = false;
+    let completed = false;
+    let stopping: Promise<void> | undefined;
+    const interrupt = (): Promise<void> => {
+      if (!threadId || !turnId || connection.isClosed) return Promise.resolve();
+      return stopping ??= connection.request('turn/interrupt', { threadId, turnId }, 2_000).then(() => undefined).catch(() => undefined);
+    };
+    const aborted = () => {
+      tracker.fail(consultationAborted());
+      void interrupt();
+    };
+    const check = () => { if (input.signal.aborted) throw consultationAborted(); };
+    input.signal.addEventListener('abort', aborted, { once: true });
+    connection.onFailure = error => tracker.fail(error);
+    connection.onNotification = (method, params) => {
+      if (string(params.threadId) !== threadId) return;
+      if (method === 'turn/started') {
+        turnId ||= string(record(params.turn).id);
+        if (input.signal.aborted) void interrupt();
+      }
+      tracker.notification(method, params);
+    };
+    connection.onRequest = (method, params) => {
+      if (method !== 'currentTime/read' && string(params.threadId) !== threadId) return Promise.resolve(IGNORE_SERVER_REQUEST);
+      return handleRuntimeRequest(runInput, method, params);
+    };
+    try {
+      await connection.initialize();
+      check();
+      const started = record(await connection.request(input.threadId ? 'thread/resume' : 'thread/start', input.threadId
+        ? { threadId: input.threadId, excludeTurns: true, developerInstructions: consultationInstructions(input) }
+        : { cwd: input.cwd, ephemeral: !input.persistent, sandbox: 'danger-full-access', approvalPolicy: 'never', config: ACCESS_CONFIG,
+          ...(input.model ? { model: input.model } : {}), developerInstructions: consultationInstructions(input) }));
+      threadId = string(record(started.thread).id);
+      if (!threadId) throw new Error('Codex 没有返回咨询会话编号。');
+      this.consultationThreads.add(threadId);
+      tracker.threadId = threadId;
+      check();
+      await input.onBeforeSubmit?.();
+      check();
+      submitted = true;
+      const result = record(await connection.request('turn/start', {
+        threadId, cwd: input.cwd, input: [{ type: 'text', text: input.prompt, text_elements: [] }],
+        approvalPolicy: 'never', sandboxPolicy: { type: 'dangerFullAccess' },
+        ...(input.model ? { model: input.model } : {}), ...(input.effort ? { effort: input.effort } : {}),
+      }));
+      turnId ||= string(record(result.turn).id);
+      if (!turnId) throw new Error('Codex 没有返回咨询任务编号。');
+      tracker.setTurn(turnId);
+      check();
+      const snapshot = record(result.turn);
+      if (['completed', 'failed', 'interrupted'].includes(string(snapshot.status))) tracker.notification('turn/completed', { threadId, turn: snapshot });
+      const text = await tracker.result;
+      check();
+      completed = true;
+      return { threadId, text };
+    } catch (error) {
+      throw input.signal.aborted ? consultationAborted() : readableError(error);
+    } finally {
+      input.signal.removeEventListener('abort', aborted);
+      if (submitted && !completed) await interrupt();
+      tracker.dispose();
+      // Unsubscribe unloads an ephemeral thread after its last client detaches.
+      if (threadId && this.options.websocketUrl && !connection.isClosed) await connection.request('thread/unsubscribe', { threadId }, 2_000).catch(() => undefined);
+      await this.disconnect(connection);
+    }
   }
 }
 

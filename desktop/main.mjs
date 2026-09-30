@@ -1,6 +1,7 @@
 import { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, screen, shell, Tray } from 'electron';
 import path from 'node:path';
 import fs from 'node:fs/promises';
+import { createRequire } from 'node:module';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { recordedProcessState, samePath } from './lifecycle.mjs';
 import { atomicJson, inspectWindows, readJson, runPowerShell, runWindowlessScript } from './windows.mjs';
@@ -8,6 +9,7 @@ import { MigrationRunner, migrationActive } from './migration.mjs';
 import { LaunchCoordinator, LaunchPreferences, validatePreferences } from './launch-coordinator.mjs';
 import { changeLoginStartup, loginStartupEnabled } from './login-startup.mjs';
 import { restoreInstallation } from './installation.mjs';
+import { UpdateCoordinator } from './update-coordinator.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const productRoot = app.isPackaged ? path.join(process.resourcesPath, 'product') : path.dirname(here);
@@ -19,6 +21,7 @@ const bridgeOrigin = 'http://127.0.0.1:8790';
 let window, tray, quitting = false, hostStarted = false, lastStatus = { state: 'starting', canWrite: false, reason: '正在检查本机服务…' };
 let pollBusy = false, retryRequired = false, hostStartRequestedAt = 0;
 let quitPromise;
+let updates;
 let freshSetupBusy = false, freshSetupJustCompleted = false;
 let restorePromise, restoreAttempted = false, restoreError = '';
 const migration = new MigrationRunner({ productRoot, dataDir, onChange: () => { void poll(); } });
@@ -64,7 +67,7 @@ else {
 }
 
 function showWindow() { if (!window || process.env.FEISHU_CODEX_TEST_HIDDEN === '1') return; if (window.isMinimized()) window.restore(); window.show(); window.focus(); }
-function currentStatus() { return { ...lastStatus, shellVersion: app.getVersion(), launch: launch.getState() }; }
+function currentStatus() { return { ...lastStatus, shellVersion: app.getVersion(), launch: launch.getState(), update: updates?.getState() ?? { phase: 'unavailable' } }; }
 function publishStatus() { if (window && !window.isDestroyed()) window.webContents.send('desktop:status', currentStatus()); }
 
 async function control(action, timeout = 35_000, params = {}) {
@@ -202,7 +205,7 @@ function quitAll() {
   return quitPromise;
 }
 
-async function performQuit() {
+async function performQuit({ forUpdate = false } = {}) {
   try {
     launch.cancelPending();
     if (launch.inFlight) throw new Error('Codex 正在打开或切换连接，请等操作完成后再退出。');
@@ -227,8 +230,10 @@ async function performQuit() {
         if (presence.children !== 'dead') throw new Error('本机服务连接已中断，但 Codex 或飞书仍在运行。请先重试连接，再安全退出；不会强行终止可能正在运行的任务。');
       }
     }
-    quitting = true; app.quit(); return { ok: true };
-  } catch (error) { showWindow(); lastStatus = { ...lastStatus, actionError: error.message }; publishStatus(); if (process.env.FEISHU_CODEX_TEST_HIDDEN !== '1') await dialog.showMessageBox(window, { type: 'info', title: '暂时不能退出', message: error.message, buttons: ['知道了'] }); throw error; }
+    quitting = true;
+    if (!forUpdate) app.quit();
+    return { ok: true };
+  } catch (error) { showWindow(); lastStatus = { ...lastStatus, actionError: error.message }; publishStatus(); if (!forUpdate && process.env.FEISHU_CODEX_TEST_HIDDEN !== '1') await dialog.showMessageBox(window, { type: 'info', title: '暂时不能退出', message: error.message, buttons: ['知道了'] }); throw error; }
 }
 
 async function migrate() {
@@ -239,6 +244,21 @@ async function migrate() {
 
 async function start() {
   await preferences.load();
+  if (app.isPackaged && process.env.FEISHU_CODEX_TEST_HIDDEN !== '1') {
+    const requireProduct = createRequire(path.join(productRoot, 'package.json'));
+    const { autoUpdater } = requireProduct('electron-updater');
+    updates = new UpdateCoordinator({ updater: autoUpdater, onChange: publishStatus,
+      currentVersion: app.getVersion(),
+      latestReleaseTag: async () => {
+        const response = await fetch('https://api.github.com/repos/xinyu68/feishu-codex/releases/latest', {
+          headers: { Accept: 'application/vnd.github+json', 'User-Agent': 'Feishu-Codex' }, signal: AbortSignal.timeout(8_000) });
+        if (!response.ok) throw new Error(`GitHub Release 查询失败：${response.status}`);
+        const result = await response.json();
+        if (typeof result.tag_name !== 'string') throw new Error('GitHub Release 版本无效');
+        return result.tag_name;
+      },
+      beforeInstall: () => performQuit({ forUpdate: true }) });
+  }
   app.setAppUserModelId('local.feishu-codex.desktop');
   const area = screen.getPrimaryDisplay().workAreaSize;
   window = new BrowserWindow({ width: Math.min(1240, area.width), height: Math.min(800, area.height), minWidth: Math.min(900, area.width), minHeight: Math.min(620, area.height),
@@ -282,6 +302,16 @@ async function start() {
     switchToShared: () => launch.switchToShared(),
     retry: async () => { hostStarted = false; retryRequired = false; await startHost(); if (hostStarted) await control('retry'); await poll(); return currentStatus(); },
     openLogs: async () => { const directory = path.join(dataDir, 'desktop'); await fs.mkdir(directory, { recursive: true }); const error = await shell.openPath(directory); if (error) throw new Error(error); return { ok: true }; },
+    checkForUpdates: async () => updates ? updates.check() : { phase: 'unavailable' },
+    downloadUpdate: async () => { if (!updates) throw new Error('请先安装正式版应用。'); return updates.download(); },
+    installUpdate: async () => {
+      if (!updates) throw new Error('请先安装正式版应用。');
+      try { return await updates.install(); }
+      catch (error) {
+        if (quitting) { quitting = false; hostStarted = false; retryRequired = false; void poll(); }
+        throw error;
+      }
+    },
     quit: quitAll,
     migrate,
     setupFresh,
@@ -292,6 +322,10 @@ async function start() {
   await window.loadURL(bootstrapUrl);
   launch.start(preferences.get());
   setInterval(() => { void poll(); }, 2_000).unref();
+  if (updates) {
+    setTimeout(() => { void updates.check(); }, 15_000).unref();
+    setInterval(() => { void updates.check(); }, 6 * 60 * 60 * 1000).unref();
+  }
   await poll();
 }
 

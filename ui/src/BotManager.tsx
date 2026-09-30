@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react';
+import { createPortal } from 'react-dom';
 import { Bot, Check, ExternalLink, LoaderCircle, Plus, ShieldCheck, Trash2, Unplug, Users, Wifi, X } from 'lucide-react';
 import { Select } from './Select';
 import { errorMessage, request } from './api';
@@ -10,6 +11,7 @@ type Perform = (name: string, operation: () => Promise<unknown>, success?: strin
 type Refresh = () => Promise<void>;
 type Model = { id: string; name: string; efforts: string[]; defaultEffort: string };
 type Section = 'conversation' | 'access' | 'connection';
+type BotEngineName = 'codex' | 'hermes';
 type FieldName = 'name' | 'roleInstructions' | 'privateRoleInstructions' | 'model' | 'effort' | 'includeGroupContext';
 type SaveStatus = 'idle' | 'draft' | 'saving' | 'saved' | 'error';
 type FieldState<T> = { value: T; status: SaveStatus; error: string; change: (value: T) => void; save: (value?: T) => Promise<void> };
@@ -21,7 +23,7 @@ const botRoute = (id: string) => `/api/bots/${encodeURIComponent(id)}`;
 const notificationTargetKey = (target: DesktopNotificationTarget) => JSON.stringify([target.botAppId, target.chatId, target.actorId]);
 
 export function botsFromState(state: AppState): BotProfile[] {
-  if (state.bots?.length) return state.bots;
+  if (Array.isArray(state.bots)) return state.bots;
   return [{ id: 'default', name: 'Codex', appId: state.config.appId, hasSecret: state.config.hasSecret,
     enabled: state.config.enabled, allowedActors: state.config.allowedActors, allowedGroups: [], roleInstructions: '',
     model: '', effort: '', connection: state.connection }];
@@ -37,6 +39,8 @@ function useBotField<T extends string | boolean>(bot: BotProfile, field: FieldNa
   const dirty = useRef(false);
   const active = useRef(false);
   const queued = useRef(false);
+  const mounted = useRef(true);
+  useEffect(() => { mounted.current = true; return () => { mounted.current = false; queued.current = false; }; }, []);
   useEffect(() => {
     if (!dirty.current && !active.current) { current.current = remote; saved.current = remote; setValue(remote); }
   }, [remote]);
@@ -45,12 +49,13 @@ function useBotField<T extends string | boolean>(bot: BotProfile, field: FieldNa
     setValue(next); setError(''); setStatus(active.current ? 'saving' : dirty.current ? 'draft' : 'idle');
   };
   async function save(next?: T) {
+    if (!mounted.current) return;
     if (next !== undefined) change(next);
     queued.current = true;
     if (active.current) return;
     active.current = true;
     try {
-      while (queued.current) {
+      while (queued.current && mounted.current) {
         queued.current = false;
         const input = current.current;
         const normalized = (typeof input === 'string' ? input.trim() : input) as T;
@@ -59,11 +64,13 @@ function useBotField<T extends string | boolean>(bot: BotProfile, field: FieldNa
         setStatus('saving'); setError('');
         try {
           const result = await request<{ bot?: BotProfile }>(botRoute(bot.id), { [field]: normalized }, 'PATCH');
+          if (!mounted.current) return;
           saved.current = (result.bot?.[field] ?? normalized) as T;
           if (current.current === input) { current.current = saved.current; setValue(saved.current); dirty.current = false; }
           setStatus(dirty.current ? 'draft' : 'saved');
           void refresh().catch(() => {});
         } catch (caught) {
+          if (!mounted.current) return;
           dirty.current = true; queued.current = false; setStatus('error'); setError(errorMessage(caught)); break;
         }
       }
@@ -84,6 +91,8 @@ function useModelPreferences(bot: BotProfile, models: Model[], refresh: Refresh)
   const failed = useRef({ model: false, effort: false });
   const active = useRef(false);
   const queued = useRef(false);
+  const mounted = useRef(true);
+  useEffect(() => { mounted.current = true; return () => { mounted.current = false; queued.current = false; }; }, []);
   useEffect(() => {
     for (const key of ['model', 'effort'] as const) {
       if (!active.current && !failed.current[key] && current.current[key] === saved.current[key]) {
@@ -100,12 +109,13 @@ function useModelPreferences(bot: BotProfile, models: Model[], refresh: Refresh)
     for (const item of keys) { failed.current[item] = false; setErrors(previous => ({ ...previous, [item]: '' })); setStatuses(previous => ({ ...previous, [item]: 'draft' })); }
   }
   async function save(key: Key, value?: string) {
+    if (!mounted.current) return;
     if (value !== undefined) change(key, value);
     queued.current = true;
     if (active.current) return;
     active.current = true;
     try {
-      while (queued.current) {
+      while (queued.current && mounted.current) {
         queued.current = false;
         const input = { ...current.current };
         const modelChanged = input.model !== saved.current.model || failed.current.model;
@@ -115,6 +125,7 @@ function useModelPreferences(bot: BotProfile, models: Model[], refresh: Refresh)
         for (const item of keys) { setStatuses(previous => ({ ...previous, [item]: 'saving' })); setErrors(previous => ({ ...previous, [item]: '' })); }
         try {
           const result = await request<{ bot?: BotProfile }>(botRoute(bot.id), patch, 'PATCH');
+          if (!mounted.current) return;
           for (const item of keys) {
             saved.current[item] = result.bot?.[item] ?? input[item]; failed.current[item] = false;
             if (current.current[item] === input[item]) current.current = { ...current.current, [item]: saved.current[item] };
@@ -122,6 +133,7 @@ function useModelPreferences(bot: BotProfile, models: Model[], refresh: Refresh)
           }
           setValues(current.current); void refresh().catch(() => {});
         } catch (caught) {
+          if (!mounted.current) return;
           queued.current = false;
           for (const item of keys) { failed.current[item] = true; setErrors(previous => ({ ...previous, [item]: errorMessage(caught) })); setStatuses(previous => ({ ...previous, [item]: 'error' })); }
           break;
@@ -157,7 +169,7 @@ export function BotManager({ state, action, perform, refresh, configSave, focusB
   const pendingCount = (id: string) => state.pendingActors.filter(item => (item.botId || 'default') === id).length + (state.pendingGroups || []).filter(item => item.botId === id).length;
   const firstUse = !state.conversations.some(item => item.chatId !== 'local-preview');
   const explicitSetup = new URLSearchParams(window.location.search).get('setup') === 'feishu';
-  const [selected, setSelected] = useState(() => (explicitSetup ? bots.find(item => item.id === 'default') : firstUse ? bots.find(item => pendingCount(item.id)) || bots.find(item => !configured(item)) || bots.find(item => !item.allowedActors.length) : null)?.id || bots[0].id);
+  const [selected, setSelected] = useState(() => (explicitSetup ? bots.find(item => item.id === 'default') : firstUse ? bots.find(item => pendingCount(item.id)) || bots.find(item => !configured(item)) || bots.find(item => !item.allowedActors.length) : null)?.id || bots[0]?.id || '');
   useEffect(() => { if (focusBot) setSelected(focusBot.id); }, [focusBot]);
   const [adding, setAdding] = useState(false);
   const [tabs, setTabs] = useState<Record<string, Section>>(() => Object.fromEntries(bots.map(bot => [bot.id, !configured(bot) || (explicitSetup && bot.id === 'default') ? 'connection' : firstUse && (pendingCount(bot.id) || !bot.allowedActors.length) ? 'access' : 'conversation'])));
@@ -183,7 +195,7 @@ export function BotManager({ state, action, perform, refresh, configSave, focusB
       <p className="bot-sidebar-note">每个机器人使用独立的飞书应用和访问权限。</p>
       {defaultUnavailable && <div className="bot-default-warning" role="status"><p>默认通知已失效，请重新设置。</p><button type="button" className="text-button" disabled={configSave.feedback.phase === 'saving'} onClick={() => void configSave.save({ desktopNotificationTarget: null })}>清除失效默认</button></div>}
     </aside>
-    <div className="bot-detail-stack">{bots.map(bot => <BotDetail key={bot.id} state={state} bot={bot} hidden={bot.id !== selectedBot.id} section={tabs[bot.id] || (configured(bot) ? 'conversation' : 'connection')} changeSection={section => selectTab(bot.id, section)} pending={pendingCount(bot.id)} models={models} modelError={modelError} retryModels={loadModels} busy={Boolean(action)} perform={perform} refresh={refresh} configSave={configSave} onboarding={Boolean(onboarding[bot.id])} startAccess={() => startAccess(bot.id)} removed={() => setSelected('default')} />)}</div>
+    <div className="bot-detail-stack">{bots.map(bot => <BotDetail key={bot.id} state={state} bot={bot} hidden={bot.id !== selectedBot?.id} section={tabs[bot.id] || (configured(bot) ? 'conversation' : 'connection')} changeSection={section => selectTab(bot.id, section)} pending={pendingCount(bot.id)} models={models} modelError={modelError} retryModels={loadModels} busy={Boolean(action)} perform={perform} refresh={refresh} configSave={configSave} onboarding={Boolean(onboarding[bot.id])} startAccess={() => startAccess(bot.id)} removed={() => setSelected(bots.find(item => item.id !== bot.id)?.id || '')} />)}{!bots.length && <section className="bot-empty-state"><span className="bot-empty-icon"><Bot size={27} /></span><h2>还没有机器人</h2><p>点击左侧“添加机器人”，连接你的飞书应用。</p></section>}</div>
     {adding && <AddBotDialog close={closeDialog} created={id => { closeDialog(); startAccess(id); }} perform={perform} />}
   </main>;
 }
@@ -193,22 +205,24 @@ function BotDetail({ state, bot, hidden, section, changeSection, pending, models
   busy: boolean; perform: Perform; refresh: Refresh; configSave: ConfigAutosave; onboarding: boolean; startAccess: () => void; removed: () => void;
 }) {
   const tabsRef = useRef<HTMLDivElement>(null);
+  const [removing, setRemoving] = useState(false);
+  const [switchingEngine, setSwitchingEngine] = useState(false);
   const tabId = (id: Section) => `bot-${bot.id}-tab-${id}`;
   const panelId = (id: Section) => `bot-${bot.id}-panel-${id}`;
   return <section className="bot-detail" hidden={hidden} aria-label={`${bot.name}设置`}>
-    <header className="bot-detail-heading"><div><h2>{bot.name}</h2><p>管理这个机器人的对话方式与使用范围</p></div><span className={`bot-connection-status ${bot.connection.status}`}><span className={`status-dot ${bot.connection.status === 'connected' ? 'good' : bot.connection.status === 'connecting' ? 'busy' : ''}`} />{configured(bot) ? labels[bot.connection.status] : '等待连接飞书'}</span></header>
+    <header className="bot-detail-heading"><div><h2>{bot.name}</h2><p>{bot.engine === 'hermes' ? '由 Hermes 处理对话 · 本机试验接入' : '管理这个机器人的对话方式与使用范围'}</p></div><div className="bot-detail-actions"><span className={`bot-connection-status ${bot.connection.status}`}><span className={`status-dot ${bot.connection.status === 'connected' ? 'good' : bot.connection.status === 'connecting' ? 'busy' : ''}`} />{configured(bot) ? labels[bot.connection.status] : '等待连接飞书'}</span><BotRemoval bot={bot} busy={busy || configSave.feedback.phase === 'saving'} perform={perform} removed={removed} isNotificationTarget={state.config.desktopNotificationTarget?.botAppId === bot.appId} onOpenChange={setRemoving} /></div></header>
     <div className="bot-tabs" role="tablist" aria-label="机器人设置" ref={tabsRef} onKeyDown={event => {
       if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
       event.preventDefault(); const index = sections.findIndex(item => item.id === section);
       const next = event.key === 'Home' ? 0 : event.key === 'End' ? sections.length - 1 : (index + (event.key === 'ArrowRight' ? 1 : -1) + sections.length) % sections.length;
       changeSection(sections[next].id); tabsRef.current?.querySelectorAll<HTMLButtonElement>('[role="tab"]')[next]?.focus();
     }}>{sections.map(item => <button key={item.id} type="button" role="tab" id={tabId(item.id)} aria-controls={panelId(item.id)} aria-selected={section === item.id} tabIndex={section === item.id ? 0 : -1} onClick={() => changeSection(item.id)}>{item.label}{item.id === 'access' && pending > 0 && <span className="count-badge">{pending}</span>}</button>)}</div>
-    <div className="bot-panel-scroll">
-      <DefaultNotificationBot state={state} bot={bot} configSave={configSave} startAccess={() => changeSection('access')} />
-      <div className="bot-tab-panel" role="tabpanel" id={panelId('conversation')} aria-labelledby={tabId('conversation')} hidden={section !== 'conversation'}><ConversationSettings bot={bot} models={models} modelError={modelError} retryModels={retryModels} refresh={refresh} /></div>
+    <div className="bot-panel-scroll"><fieldset className="bot-settings-fields" disabled={removing || switchingEngine}>
+      {bot.engine !== 'hermes' && <DefaultNotificationBot state={state} bot={bot} configSave={configSave} startAccess={() => changeSection('access')} />}
+      <div className="bot-tab-panel" role="tabpanel" id={panelId('conversation')} aria-labelledby={tabId('conversation')} hidden={section !== 'conversation'}><BotEngine bot={bot} busy={busy || configSave.feedback.phase === 'saving'} perform={perform} onOpenChange={setSwitchingEngine} isNotificationTarget={state.config.desktopNotificationTarget?.botAppId === bot.appId} /><ConversationSettings bot={bot} models={models} modelError={modelError} retryModels={retryModels} refresh={refresh} /></div>
       <div className="bot-tab-panel" role="tabpanel" id={panelId('access')} aria-labelledby={tabId('access')} hidden={section !== 'access'}><BotAccess state={state} bot={bot} busy={busy} perform={perform} onboarding={onboarding} /></div>
-      <div className="bot-tab-panel" role="tabpanel" id={panelId('connection')} aria-labelledby={tabId('connection')} hidden={section !== 'connection'}><BotCredentials bot={bot} refresh={refresh} startAccess={startAccess} /><BotRemoval bot={bot} busy={busy} perform={perform} removed={removed} /></div>
-    </div>
+      <div className="bot-tab-panel" role="tabpanel" id={panelId('connection')} aria-labelledby={tabId('connection')} hidden={section !== 'connection'}><BotCredentials bot={bot} refresh={refresh} startAccess={startAccess} /></div>
+    </fieldset></div>
   </section>;
 }
 
@@ -220,16 +234,16 @@ function ConversationSettings({ bot, models, modelError, retryModels, refresh }:
   const efforts = models.find(item => item.id === model.value)?.efforts || ['low', 'medium', 'high', 'xhigh'];
   return <div className="bot-conversation-settings">
     <div className="bot-role-grid">
-      <BotField name="privateRoleInstructions" label="私聊角色说明" field={privateRole} hint="可选；留空使用普通 Codex"><textarea aria-label="私聊角色说明" rows={5} maxLength={12000} value={privateRole.value} placeholder="例如：协助我处理日常开发，先确认需求，再实施修改" onChange={event => privateRole.change(event.target.value)} onBlur={() => void privateRole.save()} /></BotField>
+      <BotField name="privateRoleInstructions" label="私聊角色说明" field={privateRole} hint={bot.engine === 'hermes' ? '可选；留空沿用 Hermes 的角色' : '可选；留空使用普通 Codex'}><textarea aria-label="私聊角色说明" rows={5} maxLength={12000} value={privateRole.value} placeholder="例如：协助我处理日常开发，先确认需求，再实施修改" onChange={event => privateRole.change(event.target.value)} onBlur={() => void privateRole.save()} /></BotField>
       <BotField name="roleInstructions" label="群聊角色说明" field={groupRole} hint="可选；只用于群聊中的角色分工"><textarea aria-label="群聊角色说明" rows={5} maxLength={12000} value={groupRole.value} placeholder="例如：负责开发实现，与产品和测试协作，说明变更和验证结果" onChange={event => groupRole.change(event.target.value)} onBlur={() => void groupRole.save()} /></BotField>
     </div>
-    <div className="bot-model-grid">
+    {bot.engine === 'hermes' ? <p className="section-description">使用 Hermes 当前配置的模型；请保持 Hermes 打开。会话独立保存在 Hermes 中。</p> : <><div className="bot-model-grid">
       <BotField name="model" label="机器人模型" field={model}><Select aria-label="机器人模型" value={model.value} onChange={event => void model.save(event.target.value)}><option value="">沿用本机 Codex 配置</option>{model.value && !models.some(item => item.id === model.value) && <option value={model.value}>{model.value}</option>}{models.map(item => <option key={item.id} value={item.id}>{item.name}</option>)}</Select></BotField>
       <BotField name="effort" label="机器人思考深度" field={effort}><Select aria-label="机器人思考深度" value={effort.value} onChange={event => void effort.save(event.target.value)}><option value="">沿用本机 Codex 配置</option>{effort.value && !efforts.includes(effort.value) && <option value={effort.value}>{effortName(effort.value)}</option>}{efforts.map(value => <option key={value} value={value}>{effortName(value)}</option>)}</Select></BotField>
     </div>
-    {modelError && <p className="bot-model-error">模型列表暂不可用，仍可保留当前配置。<button className="text-button" onClick={() => void retryModels()}>重新加载</button></p>}
+    {modelError && <p className="bot-model-error">模型列表暂不可用，仍可保留当前配置。<button className="text-button" onClick={() => void retryModels()}>重新加载</button></p>}</>}
     <div className="bot-field bot-context-field" data-field="includeGroupContext"><div className="toggle-row group-context-preference"><span><strong>补充群聊背景</strong><small>{context.value ? '后续消息带入本群新增讨论，不清除已有历史。' : '仅处理 @我的消息，保留历史、引用和交接。'}</small></span><label className="toggle-control"><input type="checkbox" aria-label="补充群聊背景" checked={context.value} onChange={event => void context.save(event.target.checked)} /><span aria-hidden="true" className={`toggle ${context.value ? 'on' : ''}`} /></label></div><FieldStatus field={context} /></div>
-    <div className="bot-save-note"><span><Check size={13} />离开输入框自动保存；每个设置独立保存</span><p>角色修改在新会话生效，可用 /new 新建。会话内单独指定的模型和思考深度优先。</p></div>
+    <div className="bot-save-note"><span><Check size={13} />离开输入框自动保存；每个设置独立保存</span><p>角色修改在新会话生效，可用 /new 新建。{bot.engine !== 'hermes' && '会话内单独指定的模型和思考深度优先。'}</p></div>
   </div>;
 }
 
@@ -289,10 +303,35 @@ function BotCredentials({ bot, refresh, startAccess }: { bot: BotProfile; refres
   </div>;
 }
 
-function BotRemoval({ bot, busy, perform, removed }: { bot: BotProfile; busy: boolean; perform: Perform; removed: () => void }) {
+function BotRemoval({ bot, busy, perform, removed, isNotificationTarget, onOpenChange }: { bot: BotProfile; busy: boolean; perform: Perform; removed: () => void; isNotificationTarget: boolean; onOpenChange: (open: boolean) => void }) {
+  const [open, setOpen] = useState(false);
   const [deleting, setDeleting] = useState(false);
-  if (bot.id === 'default') return null;
-  return <div className="bot-removal">{deleting ? <><p>移除后会断开这个机器人的飞书连接。Codex 会话历史会保留。</p><div className="row-buttons"><button className="danger-button" disabled={busy} onClick={() => void perform('remove-bot', async () => { await request(botRoute(bot.id), {}, 'DELETE'); removed(); }, '已移除机器人')}>确认移除</button><button className="text-button" disabled={busy} onClick={() => setDeleting(false)}>取消</button></div></> : <button className="text-button" disabled={busy} onClick={() => setDeleting(true)}><Trash2 size={13} />移除这个机器人</button>}</div>;
+  const [error, setError] = useState('');
+  const trigger = useRef<HTMLButtonElement>(null);
+  const cancel = useRef<HTMLButtonElement>(null);
+  const dialog = useRef<HTMLDivElement>(null);
+  const submitting = useRef(false);
+  useEffect(() => { if (open) cancel.current?.focus(); }, [open]);
+  function close() { if (submitting.current) return; setOpen(false); onOpenChange(false); trigger.current?.focus(); }
+  async function remove() {
+    if (submitting.current || busy) return;
+    submitting.current = true; setDeleting(true); setError('');
+    try {
+      await perform('remove-bot', async () => {
+        try { await request(botRoute(bot.id), {}, 'DELETE'); }
+        catch (caught) { setError(errorMessage(caught)); return; }
+        removed();
+      });
+    } finally { submitting.current = false; setDeleting(false); }
+  }
+  return <><button ref={trigger} type="button" className="bot-delete-button" disabled={busy} onClick={() => { setError(''); setOpen(true); onOpenChange(true); }}><Trash2 size={14} />删除机器人</button>{open && <div className="overlay modal-overlay" onMouseDown={event => { if (event.target === event.currentTarget) close(); }}><div className="bot-dialog bot-delete-dialog" role="alertdialog" aria-modal="true" aria-labelledby={`delete-bot-${bot.id}`} aria-describedby={`delete-bot-description-${bot.id}`} ref={dialog} onKeyDown={event => {
+    if (event.key === 'Escape') { event.stopPropagation(); close(); }
+    if (event.key !== 'Tab') return;
+    const items = [...(dialog.current?.querySelectorAll<HTMLButtonElement>('button:not(:disabled)') || [])];
+    const first = items[0], last = items.at(-1);
+    if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
+    else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
+  }}><div className="drawer-title"><h2 id={`delete-bot-${bot.id}`}>删除「{bot.name}」？</h2><button type="button" className="icon-button" aria-label="关闭删除确认" disabled={deleting} onClick={close}><X size={18} /></button></div><p className="section-description" id={`delete-bot-description-${bot.id}`}>删除本机配置并断开飞书连接。已保存的 Codex / Hermes 会话历史保留。</p>{isNotificationTarget && <p className="bot-delete-warning">它是默认通知机器人，删除后需重新设置通知接收位置。</p>}{error && <p className="field-error" role="alert">{error}</p>}<div className="bot-dialog-footer"><button ref={cancel} type="button" className="secondary-button" disabled={deleting} onClick={close}>取消</button><button type="button" className="danger-button" disabled={busy || deleting} onClick={() => void remove()}>{deleting ? <LoaderCircle size={14} className="spin" /> : <Trash2 size={14} />}{deleting ? '正在删除…' : '确认删除'}</button></div></div></div>}</>;
 }
 
 function IdentityDetails({ kind, id }: { kind: '账号' | '群聊'; id: string }) {
@@ -328,6 +367,7 @@ function BotAccess({ state, bot, busy, perform, onboarding }: { state: AppState;
 
 function AddBotDialog({ close, created, perform }: { close: () => void; created: (id: string) => void; perform: Perform }) {
   const [name, setName] = useState('');
+  const [engine, setEngine] = useState<BotEngineName>('codex');
   const [appId, setAppId] = useState('');
   const [secret, setSecret] = useState('');
   const [saving, setSaving] = useState(false);
@@ -344,7 +384,7 @@ function AddBotDialog({ close, created, perform }: { close: () => void; created:
       let newId = '';
       await perform('add-bot', async () => {
         try {
-          const result = await request<{ id?: string; bot?: { id: string } }>('/api/bots', { name: name.trim(), appId: appId.trim(), appSecret: secret.trim() });
+          const result = await request<{ id?: string; bot?: { id: string } }>('/api/bots', { name: name.trim(), engine, appId: appId.trim(), appSecret: secret.trim() });
           newId = result.bot?.id || result.id || '';
           if (!newId) throw new Error('未收到机器人编号，请刷新机器人列表后确认');
         } catch (caught) { setError(errorMessage(caught)); }
@@ -355,11 +395,11 @@ function AddBotDialog({ close, created, perform }: { close: () => void; created:
   return <div className="overlay modal-overlay" onMouseDown={event => { if (event.target === event.currentTarget && !saving) close(); }}><div className="bot-dialog" role="dialog" aria-modal="true" aria-labelledby="add-bot-title" ref={dialog} onKeyDown={event => {
     if (event.key === 'Escape' && !saving) { event.stopPropagation(); close(); }
     if (event.key !== 'Tab') return;
-    const items = [...(dialog.current?.querySelectorAll<HTMLElement>('button:not(:disabled), input:not(:disabled), a[href]') || [])];
+    const items = [...(dialog.current?.querySelectorAll<HTMLElement>('button:not(:disabled):not([tabindex="-1"]), input:not(:disabled), select:not(:disabled), a[href]') || [])];
     const first = items[0]; const last = items.at(-1);
     if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
     else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
-  }}><div className="drawer-title"><div><span className="eyebrow">FEISHU BOT</span><h2 id="add-bot-title">添加机器人</h2></div><button className="icon-button" aria-label="关闭添加机器人" disabled={saving} onClick={close}><X size={19} /></button></div><p className="section-description">每个机器人使用独立的飞书应用。连接成功后，给它发消息并授权自己的账号，即可开始使用。</p><form onSubmit={event => { event.preventDefault(); void create(); }}><div className="bot-dialog-fields"><label className="field-label">机器人名称<input ref={nameInput} aria-label="机器人名称" disabled={saving} value={name} maxLength={60} placeholder="例如：开发人员" onChange={event => setName(event.target.value)} /></label><div className="form-grid"><label className="field-label">App ID<input aria-label="App ID" disabled={saving} value={appId} autoComplete="off" spellCheck={false} placeholder="cli_…" onChange={event => setAppId(event.target.value)} /></label><label className="field-label">App Secret<input aria-label="App Secret" disabled={saving} type="password" value={secret} autoComplete="new-password" placeholder="填写应用密钥" onChange={event => setSecret(event.target.value)} /></label></div></div><a className="settings-external-link" href="https://open.feishu.cn/app" target="_blank" rel="noopener noreferrer">飞书开发者后台<ExternalLink size={12} /></a>{error && <p className="field-error" role="alert">{error}</p>}<div className="bot-dialog-footer"><span>{saving ? '正在验证应用凭据…' : '角色说明可稍后设置'}</span><button type="button" className="secondary-button" disabled={saving} onClick={close}>取消</button><button type="submit" className="primary-button" disabled={saving || !name.trim() || !appId.trim() || !secret.trim()}>{saving ? <LoaderCircle className="spin" size={14} /> : <Check size={14} />}{saving ? '正在连接…' : '验证并添加'}</button></div></form></div></div>;
+  }}><div className="drawer-title"><div><span className="eyebrow">FEISHU BOT</span><h2 id="add-bot-title">添加机器人</h2></div><button className="icon-button" aria-label="关闭添加机器人" disabled={saving} onClick={close}><X size={19} /></button></div><p className="section-description">每个机器人使用独立的飞书应用。连接成功后，给它发消息并授权自己的账号，即可开始使用。</p><form onSubmit={event => { event.preventDefault(); void create(); }}><div className="bot-dialog-fields"><div className="form-grid"><label className="field-label">机器人名称<input ref={nameInput} aria-label="机器人名称" disabled={saving} value={name} maxLength={60} placeholder="例如：开发人员" onChange={event => setName(event.target.value)} /></label><label className="field-label">处理对话的 AI<Select aria-label="处理对话的 AI" disabled={saving} value={engine} onChange={event => { setEngine(event.target.value as BotEngineName); setError(''); }}><option value="codex">Codex</option><option value="hermes">Hermes</option></Select></label></div><p className="bot-engine-add-hint">{engine === 'hermes' ? '请先打开本机 Hermes，模型沿用 Hermes 的设置。' : '可在 Codex 桌面和飞书接着同一会话继续。'}</p><div className="form-grid"><label className="field-label">App ID<input aria-label="App ID" disabled={saving} value={appId} autoComplete="off" spellCheck={false} placeholder="cli_…" onChange={event => setAppId(event.target.value)} /></label><label className="field-label">App Secret<input aria-label="App Secret" disabled={saving} type="password" value={secret} autoComplete="new-password" placeholder="填写应用密钥" onChange={event => setSecret(event.target.value)} /></label></div></div><a className="settings-external-link" href="https://open.feishu.cn/app" target="_blank" rel="noopener noreferrer">飞书开发者后台<ExternalLink size={12} /></a>{error && <p className="field-error" role="alert">{error}</p>}<div className="bot-dialog-footer"><span>{saving ? '正在验证连接…' : '角色说明可稍后设置'}</span><button type="button" className="secondary-button" disabled={saving} onClick={close}>取消</button><button type="submit" className="primary-button" disabled={saving || !name.trim() || !appId.trim() || !secret.trim()}>{saving ? <LoaderCircle className="spin" size={14} /> : <Check size={14} />}{saving ? '正在连接…' : '验证并添加'}</button></div></form></div></div>;
 }
 
 function DefaultNotificationBot({ state, bot, configSave, startAccess }: { state: AppState; bot: BotProfile; configSave: ConfigAutosave; startAccess: () => void }) {
@@ -392,4 +432,50 @@ function DefaultNotificationBot({ state, bot, configSave, startAccess }: { state
     {invalidHere && <p className="bot-default-error">原接收位置已失效，请重新设置。<button type="button" className="text-button" onClick={() => void configSave.save({ desktopNotificationTarget: null })}>取消默认</button></p>}
     {hasDraft && (selectedTarget || savedHere || !target) && <p className={`bot-default-feedback ${failed ? 'error' : ''}`} role="status">{failed ? '默认通知设置尚未保存。' : '正在保存默认通知设置…'}{failed && <button type="button" className="text-button" onClick={() => void configSave.retry()}>重试</button>}</p>}
   </section>;
+}
+
+function BotEngine({ bot, busy, perform, onOpenChange, isNotificationTarget }: {
+  bot: BotProfile; busy: boolean; perform: Perform; onOpenChange: (open: boolean) => void; isNotificationTarget: boolean;
+}) {
+  const engine = bot.engine || 'codex';
+  const [pending, setPending] = useState<BotEngineName | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
+  const submitting = useRef(false);
+  const control = useRef<HTMLDivElement>(null);
+  const cancel = useRef<HTMLButtonElement>(null);
+  const dialog = useRef<HTMLDivElement>(null);
+  useEffect(() => { if (pending) cancel.current?.focus(); }, [pending]);
+  function close() {
+    if (submitting.current) return;
+    setPending(null); onOpenChange(false);
+    requestAnimationFrame(() => control.current?.querySelector('select')?.focus());
+  }
+  async function save() {
+    if (!pending || submitting.current || busy) return;
+    submitting.current = true; setSaving(true); setError('');
+    let saved = false;
+    try {
+      await perform('switch-bot-engine', async () => {
+        try { await request(botRoute(bot.id), { engine: pending }, 'PATCH'); saved = true; }
+        catch (caught) { setError(errorMessage(caught)); }
+      });
+    } finally { submitting.current = false; setSaving(false); }
+    if (saved) close();
+  }
+  const nextName = pending === 'hermes' ? 'Hermes' : 'Codex';
+  return <><div className="bot-engine-row" ref={control}><div><label className="field-label" htmlFor={`bot-engine-${bot.id}`}>处理对话的 AI</label><p>{engine === 'hermes' ? '使用本机 Hermes，模型在 Hermes 中设置。' : '在 Codex 桌面和飞书接续同一会话。'}</p></div><Select id={`bot-engine-${bot.id}`} aria-label="处理对话的 AI" disabled={busy || saving} value={engine} onChange={event => {
+    const next = event.target.value as BotEngineName;
+    if (next !== engine) { setError(''); setPending(next); onOpenChange(true); }
+  }}><option value="codex">Codex</option><option value="hermes">Hermes</option></Select></div>
+    {engine === 'hermes' && bot.engineStatus?.available === false && <p className="bot-engine-error" role="status">{bot.engineStatus.error || '暂时无法连接 Hermes，请先打开本机 Hermes。'}</p>}
+    {pending && createPortal(<div className="overlay modal-overlay" onMouseDown={event => { if (event.target === event.currentTarget) close(); }}><div className="bot-dialog bot-engine-dialog" role="alertdialog" aria-modal="true" aria-labelledby={`switch-engine-${bot.id}`} aria-describedby={`switch-engine-description-${bot.id}`} ref={dialog} onKeyDown={event => {
+      if (event.key === 'Escape') { event.stopPropagation(); close(); }
+      if (event.key !== 'Tab') return;
+      const items = [...(dialog.current?.querySelectorAll<HTMLButtonElement>('button:not(:disabled)') || [])];
+      const first = items[0], last = items.at(-1);
+      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
+      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
+    }}><div className="drawer-title"><h2 id={`switch-engine-${bot.id}`}>切换到 {nextName}？</h2><button className="icon-button" type="button" aria-label="关闭切换确认" disabled={saving} onClick={close}><X size={18} /></button></div><p className="section-description" id={`switch-engine-description-${bot.id}`}>「{bot.name}」的私聊和群聊将从新的 {nextName} 会话开始，原有会话历史保留。</p>{pending === 'hermes' && <p className="bot-engine-dialog-hint">请先启动 Hermes 并配置模型，应用会自动检测连接。</p>}{pending === 'hermes' && isNotificationTarget && <p className="bot-engine-warning">它是默认通知机器人；切换后需重新选择 Codex 桌面通知的接收机器人。</p>}{error && <p className="field-error" role="alert">{error}</p>}<div className="bot-dialog-footer"><button ref={cancel} type="button" className="secondary-button" disabled={saving} onClick={close}>取消</button><button type="button" className="primary-button" disabled={busy || saving} onClick={() => void save()}>{saving && <LoaderCircle size={14} className="spin" />}{saving ? '正在切换…' : '确认切换'}</button></div></div></div>, document.body)}
+  </>;
 }

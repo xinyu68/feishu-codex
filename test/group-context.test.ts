@@ -449,3 +449,120 @@ test('thread snapshots preserve an absent or explicitly empty role across rebind
     assert.equal(restored.state.threadBindings[conversation.threadId]!.roleManaged, role !== undefined);
   }
 });
+
+test('a captured reset boundary excludes old background while preserving new discussion and other scopes', t => {
+  const { store, dir } = setup(t);
+  store.rememberGroup(entry('om_before_reset', 'Discussion before the reset', dir));
+  const boundary = { afterSequence: store.state.groupMessageSequence, startedAt: at };
+  store.conversation('oc_team', 'user', dir, 'group').groupContextBoundary = boundary;
+  store.rememberGroup(entry('om_after_reset', 'Discussion after the reset', dir));
+
+  const reset = store.planGroupContext(message(), dir, 'thread-reset', boundary);
+  assert.deepEqual(records(reset.text), [{ text: 'Discussion after the reset' }]);
+  assert.equal(Object.hasOwn(reset.seen, 'om_before_reset'), false);
+  submit(store, 'op-reset-background', message(), dir, 'thread-reset', reset);
+  assert.equal(store.planGroupContext(message(), dir, 'thread-reset', boundary).text, '');
+
+  const oldCapture = store.planGroupContext(message(), dir, undefined, undefined);
+  assert.match(oldCapture.text, /Discussion before the reset/);
+  const otherBot = namespaceMessage('dev', message({ actorId: 'dev-user' }));
+  assert.match(store.planGroupContext(otherBot, dir, 'thread-dev', undefined).text, /Discussion before the reset/);
+  assert.equal(store.state.groupMessages.oc_team!.length, 2);
+});
+
+test('reset boundaries distinguish same-millisecond messages and reject delayed old events', t => {
+  const { store, dir } = setup(t);
+  store.rememberGroup(entry('om_same_millisecond_old', 'Old message at the exact reset timestamp', dir));
+  const boundary = { afterSequence: store.state.groupMessageSequence, startedAt: at };
+  store.rememberGroup(entry('om_same_millisecond_new', 'New message at the exact reset timestamp', dir));
+  store.rememberGroup(entry('om_delayed_old', 'Old event delivered after the reset', dir,
+    { at: '2026-09-28T11:59:59.999Z' }));
+  store.rememberGroup(entry('om_later_new', 'Later discussion', dir, { at: '2026-09-28T12:00:00.001Z' }));
+
+  const plan = store.planGroupContext(message(), dir, 'thread-reset', boundary);
+  assert.deepEqual(records(plan.text), [
+    { text: 'New message at the exact reset timestamp' },
+    { text: 'Later discussion' },
+  ]);
+  assert.equal(Object.hasOwn(plan.seen, 'om_same_millisecond_old'), false);
+  assert.equal(Object.hasOwn(plan.seen, 'om_delayed_old'), false);
+});
+
+test('quoting a long pre-reset message does not make its remaining tail automatic background', t => {
+  const { store, dir } = setup(t);
+  const oldText = 'Explicit old reference: ' + 'x'.repeat(11000) + ' Old tail must stay excluded';
+  store.rememberGroup(entry('om_old_long_quote', oldText, dir));
+  const boundary = { afterSequence: store.state.groupMessageSequence, startedAt: at };
+  const quotedInput = message({ replyTo: 'om_old_long_quote' });
+  const quoted = store.planGroupContext(quotedInput, dir, 'thread-reset', boundary);
+  assert.match(quoted.text, /明确引用的群消息/);
+  assert.match(quoted.text, /Explicit old reference/);
+  assert.doesNotMatch(quoted.text, /Old tail must stay excluded|新增群聊/);
+  assert.ok(quoted.seen.om_old_long_quote! > 0 && quoted.seen.om_old_long_quote! < oldText.length);
+  submit(store, 'op-reset-quote', quotedInput, dir, 'thread-reset', quoted);
+
+  const next = store.planGroupContext(message({ id: 'om_after_quote' }), dir, 'thread-reset', boundary);
+  assert.deepEqual(next, { text: '', seen: {} });
+  assert.match(store.planGroupContext(quotedInput, dir, 'thread-reset', boundary).text, /Explicit old reference/);
+  store.rememberGroup(entry('om_new_after_quote', 'New discussion after the explicit quote', dir));
+  assert.deepEqual(records(store.planGroupContext(message(), dir, 'thread-reset', boundary).text),
+    [{ text: 'New discussion after the explicit quote' }]);
+});
+
+test('pending and native reset boundaries and message sequences survive store restarts', t => {
+  const { store, dir } = setup(t);
+  store.rememberGroup(entry('om_before_restart', 'Old persisted background', dir));
+  const boundary = { afterSequence: store.state.groupMessageSequence, startedAt: at };
+  store.conversation('oc_team', 'user', dir, 'group').groupContextBoundary = boundary;
+  store.save();
+
+  const pendingStore = new Store(dir);
+  const pending = pendingStore.conversation('oc_team');
+  assert.equal(pending.threadId, undefined);
+  assert.deepEqual(pending.groupContextBoundary, boundary);
+  assert.equal(pendingStore.planGroupContext(message(), dir, undefined, pending.groupContextBoundary).text, '');
+  pendingStore.rememberGroup(entry('om_after_pending_restart', 'New persisted background', dir, { sequence: 999999 }));
+  const nextSequence = pendingStore.state.groupMessages.oc_team!.at(-1)!.sequence!;
+  assert.equal(nextSequence, boundary.afterSequence + 1);
+  pending.threadId = 'thread-reset-persisted';
+  pendingStore.rememberThread(pending);
+  pendingStore.save();
+
+  const nativeStore = new Store(dir);
+  const native = nativeStore.conversation('oc_team');
+  const binding = nativeStore.state.threadBindings['thread-reset-persisted']!;
+  assert.deepEqual(native.groupContextBoundary, boundary);
+  assert.deepEqual(binding.groupContextBoundary, boundary);
+  assert.equal(nativeStore.state.groupMessageSequence, nextSequence);
+  assert.deepEqual(records(nativeStore.planGroupContext(message(), dir, native.threadId, binding.groupContextBoundary).text),
+    [{ text: 'New persisted background' }]);
+  nativeStore.rememberGroup(entry('om_after_native_restart', 'Discussion after native restart', dir));
+  assert.equal(nativeStore.state.groupMessages.oc_team!.at(-1)!.sequence, nextSequence + 1);
+
+  native.threadId = undefined;
+  native.groupContextBoundary = { afterSequence: nativeStore.state.groupMessageSequence, startedAt: at };
+  nativeStore.save();
+  const laterStore = new Store(dir);
+  assert.deepEqual(laterStore.state.threadBindings['thread-reset-persisted']!.groupContextBoundary, boundary);
+  assert.deepEqual(laterStore.conversation('oc_team').groupContextBoundary, native.groupContextBoundary);
+});
+
+test('legacy journal entries without sequences remain available only outside a reset boundary or by quote', t => {
+  const { store, dir } = setup(t);
+  store.rememberGroup(entry('om_legacy_reset', 'Legacy discussion without a sequence', dir));
+  const legacy = JSON.parse(fs.readFileSync(path.join(dir, 'state.json'), 'utf8'));
+  delete legacy.groupMessageSequence;
+  delete legacy.groupMessages.oc_team[0].sequence;
+  fs.writeFileSync(path.join(dir, 'state.json'), JSON.stringify(legacy), 'utf8');
+  const migrated = new Store(dir);
+  const boundary = { afterSequence: migrated.state.groupMessageSequence, startedAt: at };
+  assert.match(migrated.planGroupContext(message(), dir, 'thread-legacy', undefined).text, /Legacy discussion/);
+  assert.equal(migrated.planGroupContext(message(), dir, 'thread-reset', boundary).text, '');
+  assert.match(migrated.planGroupContext(message({ replyTo: 'om_legacy_reset' }), dir, 'thread-reset', boundary).text,
+    /Legacy discussion/);
+
+  migrated.rememberGroup(entry('om_new_legacy_migration', 'New discussion after legacy migration', dir));
+  assert.ok(migrated.state.groupMessages.oc_team!.at(-1)!.sequence! > boundary.afterSequence);
+  assert.deepEqual(records(migrated.planGroupContext(message(), dir, 'thread-reset', boundary).text),
+    [{ text: 'New discussion after legacy migration' }]);
+});

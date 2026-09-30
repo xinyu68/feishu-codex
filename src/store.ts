@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import crypto from 'node:crypto';
-import type { ArtifactDelivery, BotProfile, BridgeConfig, ChatMessage, CompletionNotification, Conversation, DesktopNotificationTargetOption, GroupMessage, InboundMessage, LogEntry, Operation } from './types.js';
+import type { ArtifactDelivery, BotProfile, BridgeConfig, ChatMessage, CompletionNotification, Conversation, DesktopNotificationTargetOption, GroupContextBoundary, GroupMessage, InboundMessage, LogEntry, Operation } from './types.js';
 import { conversationKey, DEFAULT_BOT_ID, parseRoute } from './routing.js';
 import { normalizeGroupWorkspace, planGroupContext, type GroupContextPlan } from './group-context.js';
 
@@ -20,11 +20,13 @@ type SavedState = {
   operations: Record<string, Operation>; deliveries: Record<string, { status: 'sending' | 'sent' | 'uncertain'; at: string }>;
   completedTurns: Record<string, string>;
   groupContextReceipts: Record<string, { seen: Record<string, number>; updatedAt: string }>;
+  groupMessageSequence: number;
   notifications: Record<string, CompletionNotification>;
   artifacts: Record<string, ArtifactDelivery>;
   pendingGroups: PendingGroup[]; groupMessages: Record<string, GroupMessage[]>; groupProjects: Record<string, string>;
   botIdentities: Record<string, BotIdentity>; groupActorIdentities: Record<string, GroupActorIdentity[]>;
-  threadBindings: Record<string, { chatId: string; actorId: string; cwd: string; chatType: 'p2p' | 'group'; roleManaged?: boolean; roleInstructions?: string; groupHandoffPolicyVersion?: number }>;
+  consultationSessions: Record<string, { threadId: string; updatedAt: string }>;
+  threadBindings: Record<string, { chatId: string; actorId: string; cwd: string; chatType: 'p2p' | 'group'; roleManaged?: boolean; roleInstructions?: string; groupHandoffPolicyVersion?: number; title?: string; preview?: string; updatedAt?: string; groupContextBoundary?: GroupContextBoundary; consultationIdentity?: string }>;
 };
 
 export function defaultDataDir(): string {
@@ -33,6 +35,7 @@ export function defaultDataDir(): string {
 
 export class Store {
   private listeners = new Set<() => void>();
+  private consultationThreadIds = new Set<string>();
   readonly dir: string;
   config: BridgeConfig;
   state: SavedState;
@@ -47,9 +50,15 @@ export class Store {
     this.state = readJson(path.join(dir, 'state.json'), {
       version: 1, conversations: {}, history: {}, pendingActors: [], seen: {},
       logs: [], totalTurns: 0, dailyMessages: {}, operations: {}, deliveries: {}, completedTurns: {}, notifications: {}, artifacts: {},
-      pendingGroups: [], groupMessages: {}, groupProjects: {}, threadBindings: {}, botIdentities: {}, groupActorIdentities: {}, groupContextReceipts: {}
+      pendingGroups: [], groupMessages: {}, groupProjects: {}, threadBindings: {}, botIdentities: {}, groupActorIdentities: {}, consultationSessions: {}, groupContextReceipts: {}, groupMessageSequence: 0
     } satisfies SavedState);
-    for (const conversation of Object.values(this.state.conversations)) conversation.revision ??= 0;
+    // Legacy entries have no sequence. Never reuse an order already persisted in the journal.
+    this.state.groupMessageSequence = Object.values(this.state.groupMessages).reduce((maximum, entries) =>
+      entries.reduce((current, item) => Math.max(current, item.sequence ?? 0), maximum), this.state.groupMessageSequence);
+    for (const conversation of Object.values(this.state.conversations)) {
+      conversation.revision ??= 0;
+      if (conversation.threadId) conversation.consultationIdentity ??= this.state.threadBindings[conversation.threadId]?.consultationIdentity ?? conversation.threadId;
+    }
     // A process restart cannot prove whether an in-flight mutation reached Codex.
     // Keep its message identity permanently claimed; recovery only reads history.
     for (const operation of Object.values(this.state.operations)) {
@@ -59,6 +68,8 @@ export class Store {
     for (const delivery of Object.values(this.state.deliveries)) if (delivery.status === 'sending') delivery.status = 'uncertain';
     this.state.notifications ??= {};
     this.state.artifacts ??= {};
+    this.state.consultationSessions ??= {};
+    this.consultationThreadIds = new Set(Object.values(this.state.consultationSessions).map(item => item.threadId));
     for (const artifact of Object.values(this.state.artifacts)) if (artifact.status === 'sending') artifact.status = 'uncertain';
     if (this.initializeNotificationTarget()) this.atomicWrite('config.json', this.config);
   }
@@ -76,6 +87,13 @@ export class Store {
     this.atomicWrite('state.json', this.state);
     if (this.initializeNotificationTarget()) this.atomicWrite('config.json', this.config);
     this.emit();
+  }
+  consultationSession(key: string): string | undefined { return this.state.consultationSessions[key]?.threadId; }
+  isConsultationThread(threadId: string): boolean { return this.consultationThreadIds.has(threadId); }
+  rememberConsultationSession(key: string, threadId: string): void {
+    this.state.consultationSessions[key] = { threadId, updatedAt: new Date().toISOString() };
+    this.consultationThreadIds.add(threadId);
+    this.save();
   }
   subscribe(listener: () => void): () => void { this.listeners.add(listener); return () => this.listeners.delete(listener); }
   private emit(): void { for (const listener of this.listeners) { try { listener(); } catch { /* Persistence must not depend on a UI subscriber. */ } } }
@@ -115,6 +133,8 @@ export class Store {
         conversation.preview = text.slice(0, 140);
         if (!conversation.threadId && firstUserMessage) conversation.title = Array.from(text.replace(/\s+/g, ' ').trim()).slice(0, 80).join('') || '新会话';
       }
+      const binding = conversation.threadId ? this.state.threadBindings[conversation.threadId] : undefined;
+      if (binding) Object.assign(binding, { title: conversation.title, preview: conversation.preview, updatedAt: conversation.updatedAt });
     }
     if (role === 'user') this.countInbound();
     this.save();
@@ -210,34 +230,54 @@ export class Store {
   }
 
   bots(config = this.config): BotProfile[] {
-    return [{ id: DEFAULT_BOT_ID, name: config.botName || 'Codex', appId: config.appId, appSecret: config.appSecret,
+    return [...(config.defaultBotRemoved ? [] : [{ id: DEFAULT_BOT_ID, name: config.botName || 'Codex', appId: config.appId, appSecret: config.appSecret,
       enabled: config.enabled, allowedActors: config.allowedActors, allowedGroups: config.allowedGroups ?? [],
       roleInstructions: config.roleInstructions ?? '', privateRoleInstructions: config.privateRoleInstructions ?? '', model: config.model, effort: config.effort,
-      includeGroupContext: config.includeGroupContext ?? true },
-      ...(config.bots ?? []).map(bot => ({ ...bot, privateRoleInstructions: bot.privateRoleInstructions ?? '', includeGroupContext: bot.includeGroupContext ?? true }))];
+      engine: config.engine ?? 'codex',
+      includeGroupContext: config.includeGroupContext ?? true } satisfies BotProfile]),
+      ...(config.bots ?? []).map(bot => ({ ...bot, engine: bot.engine ?? 'codex', privateRoleInstructions: bot.privateRoleInstructions ?? '', includeGroupContext: bot.includeGroupContext ?? true }))];
   }
   bot(id = DEFAULT_BOT_ID): BotProfile | undefined { return this.bots().find(bot => bot.id === id); }
   botForChat(chatId: string): BotProfile | undefined { return this.bot(parseRoute(chatId).botId); }
   publicBots() { return this.bots().map(({ appSecret, ...bot }) => ({ ...bot, hasSecret: Boolean(appSecret) })); }
   saveBot(id: string, patch: Partial<BotProfile>): void {
+    if (id === DEFAULT_BOT_ID && this.config.defaultBotRemoved) throw new Error('这个机器人已移除，请重新添加机器人');
     const previous = this.bot(id);
     const next: BotProfile = { name: 'Codex', appId: '', appSecret: '', enabled: false, allowedActors: [], allowedGroups: [],
       roleInstructions: '', privateRoleInstructions: '', model: '', effort: '', ...previous, ...patch, id };
     next.includeGroupContext ??= true;
     next.privateRoleInstructions ??= '';
+    if (next.engine !== undefined && next.engine !== 'codex' && next.engine !== 'hermes') throw new Error('不支持的机器人执行端');
     if (!/^[a-zA-Z0-9_-]{1,80}$/.test(id)) throw new Error('无效的机器人编号');
     if (next.appId && this.bots().some(bot => bot.id !== id && bot.appId === next.appId)) throw new Error('这个飞书应用已经配置过，每个应用只能连接一次');
     if (id === DEFAULT_BOT_ID) {
       this.saveConfig({ botName: next.name, appId: next.appId, appSecret: next.appSecret, enabled: next.enabled,
         allowedActors: next.allowedActors, allowedGroups: next.allowedGroups, roleInstructions: next.roleInstructions, privateRoleInstructions: next.privateRoleInstructions, model: next.model, effort: next.effort,
-        includeGroupContext: next.includeGroupContext });
+        includeGroupContext: next.includeGroupContext, engine: next.engine });
     } else this.saveConfig({ bots: [...(this.config.bots ?? []).filter(bot => bot.id !== id), next] });
   }
   removeBot(id: string): void {
-    if (id === DEFAULT_BOT_ID) throw new Error('默认机器人不能删除，可以关闭连接');
-    this.saveConfig({ bots: (this.config.bots ?? []).filter(bot => bot.id !== id) });
-    this.state.pendingActors = this.state.pendingActors.filter(actor => actor.botId !== id);
+    if (!this.bot(id)) throw new Error('机器人不存在');
+    const belongs = (chatId: string) => chatId !== 'local-preview' && parseRoute(chatId).botId === id;
+    this.clearBotIdentities(id);
+    for (const chatId of Object.keys(this.state.conversations)) if (belongs(chatId)) {
+      delete this.state.conversations[chatId]; delete this.state.history[chatId];
+    }
+    for (const [threadId, binding] of Object.entries(this.state.threadBindings)) if (belongs(binding.chatId)) delete this.state.threadBindings[threadId];
+    for (const key of Object.keys(this.state.groupContextReceipts)) {
+      try { if (JSON.parse(key)[0] === id) delete this.state.groupContextReceipts[key]; } catch { /* Keep legacy receipt keys. */ }
+    }
+    this.state.pendingActors = this.state.pendingActors.filter(actor => (actor.botId ?? DEFAULT_BOT_ID) !== id);
     this.state.pendingGroups = this.state.pendingGroups.filter(group => group.botId !== id);
+    for (const notification of Object.values(this.state.notifications)) if (belongs(notification.chatId) && notification.status === 'registered') notification.status = 'cancelled';
+    for (const artifact of Object.values(this.state.artifacts)) if (belongs(artifact.chatId) && artifact.status === 'registered') artifact.status = 'failed';
+    // Retain native agent sessions, completed operations and public group history.
+    // Other robots can still reference the same public discussion after removal.
+    const patch: Partial<BridgeConfig> = { bots: (this.config.bots ?? []).filter(bot => bot.id !== id) };
+    if (id === DEFAULT_BOT_ID) Object.assign(patch, { defaultBotRemoved: true, appId: '', appSecret: '', enabled: false,
+      botName: '', allowedActors: [], allowedGroups: [], roleInstructions: '', privateRoleInstructions: '', engine: 'codex' });
+    if (this.config.desktopNotificationTarget && belongs(this.config.desktopNotificationTarget.chatId)) patch.desktopNotificationTarget = null;
+    this.saveConfig(patch);
     this.save();
   }
   resetBotBindings(botId: string): void {
@@ -257,12 +297,44 @@ export class Store {
   rememberThread(conversation: Conversation, roleInstructions?: string): void {
     if (!conversation.threadId) return;
     const previous = this.state.threadBindings[conversation.threadId];
+    conversation.consultationIdentity ??= previous?.consultationIdentity ?? conversation.threadId;
+    const current = this.state.conversations[conversation.chatId];
+    if (current?.threadId === conversation.threadId && current.cwd === conversation.cwd
+      && current.revision === conversation.revision) current.consultationIdentity ??= conversation.consultationIdentity;
     this.state.threadBindings[conversation.threadId] = { chatId: conversation.chatId, actorId: conversation.actorId, cwd: conversation.cwd,
       chatType: this.isGroup(conversation.chatId) ? 'group' : 'p2p',
+      title: conversation.title, preview: conversation.preview, updatedAt: conversation.updatedAt,
+      consultationIdentity: conversation.consultationIdentity,
       // An existing snapshot also pins the absence of a role, including native threads.
       roleManaged: previous ? previous.roleManaged : roleInstructions !== undefined,
       roleInstructions: previous ? previous.roleInstructions : roleInstructions,
+      groupContextBoundary: previous ? previous.groupContextBoundary : conversation.groupContextBoundary,
       ...(previous?.groupHandoffPolicyVersion !== undefined ? { groupHandoffPolicyVersion: previous.groupHandoffPolicyVersion } : {}) };
+  }
+  switchBotEngine(botId: string, engine: 'codex' | 'hermes'): void {
+    const bot = this.bot(botId);
+    if (!bot) throw new Error('机器人不存在');
+    if ((bot.engine ?? 'codex') === engine) return;
+    const conversations = Object.values(this.state.conversations).filter(item => item.chatId !== 'local-preview' && parseRoute(item.chatId).botId === botId);
+    const snapshot = { botId, from: bot.engine ?? 'codex', to: engine, at: new Date().toISOString(),
+      conversations, history: Object.fromEntries(conversations.map(item => [item.chatId, this.state.history[item.chatId] ?? []])) };
+    const directory = path.join(this.dir, 'engine-migrations');
+    fs.mkdirSync(directory, { recursive: true });
+    this.atomicWrite(path.join('engine-migrations', `${Date.now()}-${botId}.json`), snapshot);
+    for (const conversation of conversations) {
+      this.rememberThread(conversation);
+      Object.assign(conversation, { threadId: undefined, consultationIdentity: undefined, groupContextBoundary: undefined, model: '', effort: '', title: '新会话', preview: '',
+        revision: (conversation.revision ?? 0) + 1, updatedAt: new Date().toISOString() });
+      this.state.history[conversation.chatId] = [];
+    }
+    for (const notification of Object.values(this.state.notifications)) if (parseRoute(notification.chatId).botId === botId && notification.status === 'registered') notification.status = 'cancelled';
+    for (const artifact of Object.values(this.state.artifacts)) if (parseRoute(artifact.chatId).botId === botId && artifact.status === 'registered') artifact.status = 'failed';
+    this.save();
+    this.saveBot(botId, { engine, model: '', effort: '' });
+    if (engine === 'hermes' && this.config.desktopNotificationTarget
+      && parseRoute(this.config.desktopNotificationTarget.chatId).botId === botId) {
+      this.saveConfig({ desktopNotificationTarget: null });
+    }
   }
   isGroup(chatId: string, config = this.config): boolean {
     const route = parseRoute(chatId);
@@ -308,7 +380,7 @@ export class Store {
     // A human message may be delivered to every configured bot. Store the shared event once.
     const id = message.role === 'user' ? parseRoute(message.id).id : message.id;
     if (journal.some(item => item.id === id)) return false;
-    journal.push({ ...message, id, text: message.text.slice(0, 12000) });
+    journal.push({ ...message, id, text: message.text.slice(0, 12000), sequence: ++this.state.groupMessageSequence });
     if (journal.length > 100) journal.splice(0, journal.length - 100);
     const groups = Object.entries(this.state.groupMessages).sort((a, b) => (b[1].at(-1)?.at ?? '').localeCompare(a[1].at(-1)?.at ?? ''));
     for (const [key] of groups.slice(100)) delete this.state.groupMessages[key];
@@ -325,11 +397,11 @@ export class Store {
     const route = parseRoute(chatId);
     return JSON.stringify([route.botId, this.bot(route.botId)?.appId ?? '', route.id, normalizeGroupWorkspace(cwd), threadId]);
   }
-  planGroupContext(message: InboundMessage, cwd: string, threadId?: string): GroupContextPlan {
+  planGroupContext(message: InboundMessage, cwd: string, threadId?: string, boundary?: GroupContextBoundary): GroupContextPlan {
     if (!this.isGroup(message.chatId) || !this.isAuthorized(message.chatId, message.actorId)) return { text: '', seen: {} };
     const known = threadId ? this.state.groupContextReceipts[this.groupContextKey(message.chatId, cwd, threadId)]?.seen : undefined;
     return planGroupContext(this.state.groupMessages[parseRoute(message.chatId).id] ?? [], message, cwd, known, threadId,
-      this.botForChat(message.chatId)?.includeGroupContext ?? true);
+      this.botForChat(message.chatId)?.includeGroupContext ?? true, boundary);
   }
   groupContext(message: InboundMessage, cwd: string, threadId?: string): string {
     return this.planGroupContext(message, cwd, threadId).text;
@@ -441,7 +513,7 @@ export class Store {
       const bot = bots.get(route.botId);
       if (!/^oc_[\w-]+$/.test(route.id) || conversationKey(route.botId, route.id) !== conversation.chatId
         || !/^ou_[\w-]+$/.test(conversation.actorId) || this.isGroup(conversation.chatId, config)
-        || !bot?.appId.trim() || !bot.appSecret.trim() || !bot.allowedActors.includes(conversation.actorId)) return [];
+        || !bot?.appId.trim() || !bot.appSecret.trim() || bot.engine === 'hermes' || !bot.allowedActors.includes(conversation.actorId)) return [];
       return [{ chatId: conversation.chatId, actorId: conversation.actorId, botAppId: bot.appId, botId: bot.id, botName: bot.name }];
     });
   }

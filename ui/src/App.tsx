@@ -123,7 +123,7 @@ export function App() {
   currentBinding.current = bindingKey;
   currentThread.current = threadId;
   const busy = Boolean(active?.busy);
-  const canWrite = !offline && desktop?.canWrite !== false;
+  const canWrite = !offline && (activeBot?.engine === 'hermes' ? activeBot.engineStatus?.available !== false : desktop?.canWrite !== false);
   const independentDesktop = desktop?.desktop?.mode === 'independent';
   const switchingDesktop = desktop?.launch?.state === 'switching' || desktop?.launch?.state === 'confirming';
   const openingDesktop = desktop?.launch?.state === 'opening';
@@ -348,7 +348,7 @@ export function App() {
       <div className="rail-items">
         <button className={`rail-button ${page === 'chat' ? 'selected' : ''}`} onClick={() => setPage('chat')} title="对话"><MessageSquare size={21} /><span>对话</span></button>
         <button className={`rail-button ${page === 'bots' ? 'selected' : ''}`} onClick={() => setPage('bots')} title="机器人"><Bot size={21} /><span>机器人</span>{Boolean(state && (state.pendingActors.length + (state.pendingGroups?.length || 0))) && <i className="notification-dot" />}</button>
-        <button className={`rail-button ${page === 'settings' ? 'selected' : ''}`} onClick={() => setPage('settings')} title="设置"><Settings2 size={21} /><span>设置</span></button>
+        <button className={`rail-button ${page === 'settings' ? 'selected' : ''}`} onClick={() => setPage('settings')} title={desktop?.update?.phase === 'available' || desktop?.update?.phase === 'ready' ? '设置 · 有新版本' : '设置'}><Settings2 size={21} /><span>设置</span>{(desktop?.update?.phase === 'available' || desktop?.update?.phase === 'ready') && <i className="notification-dot" />}</button>
       </div>
       <div className="rail-bottom"><IconButton title="使用帮助" onClick={() => setHelpOpen(true)}><CircleHelp size={20} /></IconButton><span className="rail-version">{isDemo ? '演示' : 'FC'}</span></div>
     </nav>
@@ -422,6 +422,12 @@ export function App() {
 }
 
 function collaborationStatus(state: AppState | undefined, desktop: DesktopStatus | undefined, offline: boolean, botId?: string) {
+  const bot = state?.bots?.find(item => item.id === botId);
+  if (bot?.engine === 'hermes') {
+    if (offline || bot.connection.status !== 'connected') return { text: '当前机器人尚未连接飞书', good: false };
+    if (bot.engineStatus?.available === false) return { text: 'Hermes 尚未连接，请确认 Hermes 已打开', good: false };
+    return { text: '由本机 Hermes 处理对话', good: true };
+  }
   if (desktop?.desktop?.mode === 'independent') return { text: 'Codex 未接入飞书，飞书发送已暂停', good: false };
   if (offline || !state?.codex.available || desktop?.runtime?.state !== 'ready' || desktop?.bridge?.state !== 'ready') return { text: '连接尚未就绪，飞书暂不可用', good: false };
   const connection = botId ? state.bots?.find(bot => bot.id === botId)?.connection || globalConnection(state) : globalConnection(state);
@@ -491,6 +497,15 @@ function Settings({ state, configSave, openBots, desktop, action, perform, deskt
     if (minutes !== state.config.desktopNotificationMinMinutes || configSave.draft.desktopNotificationMinMinutes !== undefined) savePreference({ desktopNotificationMinMinutes: minutes });
   };
   const busy = Boolean(action);
+  const update = desktop?.update;
+  const updateText = update?.error ? `更新失败：${update.error}`
+    : update?.phase === 'checking' ? '正在检查更新…'
+    : update?.phase === 'available' ? `发现新版本 ${update.version}`
+    : update?.phase === 'downloading' ? `正在下载 ${update.version} · ${update.percent ?? 0}%`
+    : update?.phase === 'ready' ? `新版本 ${update.version} 已下载，等待安装`
+    : update?.phase === 'installing' ? '正在安全退出并安装更新…'
+    : update?.phase === 'current' ? '已是最新版本'
+    : update?.phase === 'error' ? '检查或下载失败，请重试' : '';
   return <main className="settings-page"><aside className="settings-nav"><span className="eyebrow">偏好设置</span><h1>通用偏好</h1><p>管理对话通知和应用运行方式。</p><button className={tab === 'defaults' ? 'active' : ''} onClick={() => setTab('defaults')}><Code2 size={17} />对话与通知</button><button className={tab === 'application' ? 'active' : ''} onClick={() => setTab('application')}><Monitor size={17} />应用与运行</button><div className={`settings-save-status ${configSave.feedback.phase}`} role="status" aria-live="polite">{configSave.feedback.phase === 'saving' ? <><LoaderCircle size={13} className="spin" />正在保存…</> : configSave.feedback.phase === 'saved' ? <><Check size={13} />已保存</> : configSave.feedback.phase === 'error' ? '尚未保存，请重试' : '修改后自动保存'}</div></aside><div className={`settings-content ${tab === 'application' ? 'application-settings' : tab === 'defaults' ? 'defaults-settings' : ''}`}>
     {tab === 'defaults' && <><div className="settings-title"><span className="section-icon"><Code2 size={22} /></span><div><h2>对话与通知</h2><p>这些设置对所有机器人生效。模型与角色在各机器人中设置。</p></div></div><section className="settings-section"><h3>默认工作空间</h3>{window.feishuCodex?.chooseWorkspace && !isDemo ? <div className="field-label">本机项目目录<div className="workspace-folder-picker"><span className="workspace-folder-path" title={form.defaultWorkspace || '尚未选择文件夹'}>{form.defaultWorkspace || '尚未选择文件夹'}</span><button className="secondary-button" type="button" disabled={workspacePicking} onClick={() => void chooseWorkspace()}><Folder size={14} />{workspacePicking ? '正在选择…' : '选择文件夹'}</button></div>{workspaceError && <p className="field-error" role="alert">{workspaceError}</p>}</div> : <label className="field-label">本机项目目录<input value={form.defaultWorkspace} placeholder="D:\\projectdemo\\my-project" onChange={(event) => setForm({ ...form, defaultWorkspace: event.target.value })} onBlur={(event) => { const defaultWorkspace = event.target.value.trim(); if (defaultWorkspace !== state.config.defaultWorkspace || configSave.draft.defaultWorkspace !== undefined) savePreference({ defaultWorkspace }); }} onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.blur(); }} /></label>}<p className="section-description">历史项目会自动发现。默认目录用于尚未选择项目的新对话。</p></section><section className="settings-section"><div className="toggle-row"><span><strong>在飞书显示处理进度</strong><small>有中途说明时显示进度，完成后原卡展示结果。</small></span><label className="toggle-control"><input type="checkbox" aria-label="在飞书显示处理进度" checked={form.progress} onChange={(event) => savePreference({ progress: event.target.checked })} /><span aria-hidden="true" className={`toggle ${form.progress ? 'on' : ''}`} /></label></div><div className="toggle-row desktop-notification-preference"><span><strong>桌面任务完成后通知飞书</strong><small>{form.autoNotifyDesktop ? "仅通知从本应用打开的 Codex；飞书任务不重复通知。" : "需要时可说“做完飞书通知我”，仅通知本轮。"}</small></span><label className="toggle-control"><input type="checkbox" aria-label="桌面任务完成后通知飞书" checked={form.autoNotifyDesktop === true} onChange={(event) => savePreference({ autoNotifyDesktop: event.target.checked })} /><span aria-hidden="true" className={`toggle ${form.autoNotifyDesktop ? 'on' : ''}`} /></label></div><NotificationTargetSummary targets={state.notificationTargets || []} value={notificationTarget} pending={configSave.draft.desktopNotificationTarget !== undefined} openBots={openBots} />{form.autoNotifyDesktop && <div className="notification-options"><div className="notification-options-row"><label>通知范围<Select aria-label="桌面通知范围" value={form.desktopNotificationMode || 'all'} onChange={(event) => savePreference({ desktopNotificationMode: event.target.value as 'all' | 'long' })}><option value="all">每轮都通知</option><option value="long">仅通知长任务</option></Select></label>{form.desktopNotificationMode === 'long' && <label className="notification-duration">耗时超过<input type="number" aria-label="长任务通知阈值（分钟）" min="1" max="1440" step="1" value={notificationMinutes} aria-invalid={Boolean(notificationMinutesError)} aria-describedby="notification-duration-hint" onChange={(event) => { setNotificationMinutes(event.target.value); setNotificationMinutesError(''); }} onBlur={saveNotificationMinutes} onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.blur(); }} />分钟</label>}</div><p id="notification-duration-hint" className="notification-duration-hint">从本轮开始执行到结束计时；明确要求的通知不受时长限制。</p>{form.desktopNotificationMode === 'long' && notificationMinutesError && <p className="field-error" role="alert">{notificationMinutesError}</p>}</div>}</section></>}
     {tab === 'application' && <>
@@ -502,7 +517,7 @@ function Settings({ state, configSave, openBots, desktop, action, perform, deskt
         <label className="preference-row close-window-preference"><span><strong>点击窗口关闭按钮</strong><small>{preferences?.closeWindowAction === 'quit' ? '退出前会检查运行中的任务。' : '收起到托盘，任务和飞书连接继续运行。'}</small></span><Select aria-label="点击窗口关闭按钮" className="preference-select" value={preferences?.closeWindowAction || 'tray'} disabled={busy || !preferences} onChange={(event) => void saveDesktopPreferences({ closeWindowAction: event.target.value as 'tray' | 'quit' }, '关闭窗口方式已保存')}><option value="tray">收起到托盘</option><option value="quit">退出全部服务</option></Select></label>
         {preferencesError && <p className="field-error">无法读取桌面设置：{preferencesError}</p>}
       </div> : <p className="section-description">启动与关闭设置仅在桌面应用中可用。</p>}</section>
-      <section className="settings-section about-section"><Brand small /><div><strong>Feishu Codex</strong><p>版本 {desktop?.shellVersion || state.service.version} · 本机运行</p></div><button className="secondary-button" disabled={busy} onClick={() => void desktopAction('quit')}>退出应用</button></section>
+      <section className="settings-section about-section"><Brand small /><div><strong>Feishu Codex</strong><p>版本 {desktop?.shellVersion || state.service.version} · 本机运行</p>{updateText && <p role="status" aria-live="polite" title={update?.error}>{updateText}</p>}</div><span className="about-actions">{update && update.phase !== 'unavailable' && <>{['idle', 'current', 'error'].includes(update.phase) && <button className="secondary-button" disabled={busy} onClick={() => void desktopAction('checkForUpdates')}>检查更新</button>}{update.phase === 'available' && <button className="secondary-button" disabled={busy} onClick={() => void desktopAction('downloadUpdate')}>下载更新</button>}{update.phase === 'ready' && <button className="primary-button" disabled={busy} onClick={() => void desktopAction('installUpdate')}>安装并重启</button>}</>}<button className="secondary-button" disabled={busy || update?.phase === 'installing'} onClick={() => void desktopAction('quit')}>退出应用</button></span></section>
     </>}
   </div></main>;
 }

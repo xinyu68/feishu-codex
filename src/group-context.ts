@@ -1,7 +1,7 @@
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { parseRoute } from './routing.js';
-import type { GroupMessage, InboundMessage } from './types.js';
+import type { GroupContextBoundary, GroupMessage, InboundMessage } from './types.js';
 
 export type GroupContextPlan = { text: string; seen: Record<string, number> };
 export const GROUP_CONTEXT_LIMIT = 16000;
@@ -9,7 +9,8 @@ export const normalizeGroupWorkspace = (cwd: string): string => path.resolve(cwd
 
 /** Receipts count original text characters, so an omitted tail remains eligible next time. */
 export function planGroupContext(journal: GroupMessage[], message: InboundMessage, cwd: string,
-  known: Record<string, number> = {}, threadId?: string, includeGroupContext = true): GroupContextPlan {
+  known: Record<string, number> = {}, threadId?: string, includeGroupContext = true,
+  boundary?: GroupContextBoundary): GroupContextPlan {
   const route = parseRoute(message.chatId);
   const currentId = parseRoute(message.id).id;
   const quoteId = message.replyTo ? parseRoute(message.replyTo).id : undefined;
@@ -33,7 +34,10 @@ export function planGroupContext(journal: GroupMessage[], message: InboundMessag
   if (!includeGroupContext) return { text: parts.join('\n\n'), seen };
   const recent: string[] = [];
   let remaining = GROUP_CONTEXT_LIMIT - parts.join('\n\n').length - 100;
-  const previous = scoped.filter(item => parseRoute(item.id).id !== currentId);
+  const startedAt = boundary ? Date.parse(boundary.startedAt) : undefined;
+  const previous = scoped.filter(item => parseRoute(item.id).id !== currentId
+    && (!boundary || ((item.sequence ?? 0) > boundary.afterSequence
+      && Date.parse(item.at) >= startedAt!)));
   const recentIds = new Set(previous.slice(-20).map(item => item.id));
   const eligible = previous.filter(item => recentIds.has(item.id)
     || (Object.hasOwn(known, item.id) && known[item.id]! < item.text.length));

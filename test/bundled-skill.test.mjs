@@ -135,3 +135,11 @@ test('uninstall helper finds a recorded custom Codex home', async t => {
   assert.equal(JSON.parse(stdout).some(item => item.status === 'removed' && item.path === fx.directory), true);
   assert.equal(await fs.access(fx.directory).then(() => true, () => false), false);
 });
+
+test('installs the packaged Codex Skill without dropping bundled guidance', async t => {
+  const fx = await fixture(t);
+  const root = fileURLToPath(new URL('..', import.meta.url));
+  const source = path.join(root, 'skills', 'feishu-codex', 'SKILL.md');
+  assert.equal((await installBundledSkill({ root, codexHome: fx.codexHome })).status, 'installed');
+  assert.equal(await fs.readFile(fx.file, 'utf8'), await fs.readFile(source, 'utf8'));
+});

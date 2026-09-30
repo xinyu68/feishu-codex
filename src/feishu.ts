@@ -4,8 +4,10 @@ import { mkdir, readFile, rename, rm, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
+import { setTimeout as delay } from 'node:timers/promises';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import * as Lark from '@larksuiteoapi/node-sdk';
-import type { ConnectionStatus, FeishuOptions, FeishuTransport, InboundMessage, MessageCard } from './types.js';
+import type { ConnectionStatus, FeishuOptions, FeishuSendOptions, FeishuTransport, InboundMessage, MessageCard } from './types.js';
 
 const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
 const MAX_OUTBOUND_IMAGE_BYTES = 10 * 1024 * 1024;
@@ -13,6 +15,7 @@ const MAX_OUTBOUND_FILE_BYTES = 30 * 1024 * 1024;
 const MAX_QUOTED_TEXT = 12_000;
 const MAX_POST_ATTACHMENTS = 8;
 const COMMAND_NAMES = new Set(['help', 'project', 'session', 'sessions', 'new', 'stop', 'model', 'effort', 'approve', 'reject', 'deny', 'answer', 'status', 'usage', 'notification']);
+const MULTI_MENTION_COMMANDS = new Set(['new', 'status', 'stop', 'session']);
 const MENU_COMMANDS: Record<string, string> = {
   'codex.workbench': '/help', 'codex.project': '/project', 'codex.session': '/session',
   'codex.new': '/new', 'codex.stop': '/stop',
@@ -23,7 +26,16 @@ type MessageParsingOptions = { botOpenId?: string; observeGroup?: boolean };
 type Dependencies = {
   api?: Lark.Client;
   ws?: Pick<Lark.WSClient, 'start' | 'close'>;
+  retryDelay?: (milliseconds: number, signal: AbortSignal) => Promise<void>;
 };
+
+// Generated SDK methods do not forward a signal; retain per-call options across token lookup.
+const outboundContext = new AsyncLocalStorage<FeishuSendOptions>();
+
+function assertMaySend(options?: FeishuSendOptions): void {
+  options?.signal?.throwIfAborted();
+  if (options?.canSend && !options.canSend()) throw new Error('消息发送已取消或授权已变化');
+}
 
 function boundedHttpClient(): Lark.HttpInstance {
   // Keep the SDK's response interceptors; axios.create() would discard them.
@@ -32,8 +44,11 @@ function boundedHttpClient(): Lark.HttpInstance {
       const method = Reflect.get(target, property, receiver) as unknown;
       if (typeof property !== 'string' || typeof method !== 'function' || !['request', 'get', 'delete', 'head', 'options', 'post', 'put', 'patch'].includes(property)) return method;
       return (...args: unknown[]) => {
+        const publication = outboundContext.getStore();
+        assertMaySend(publication);
         const optionsIndex = property === 'request' ? 0 : ['post', 'put', 'patch'].includes(property) ? 2 : 1;
-        args[optionsIndex] = { ...(args[optionsIndex] as object | undefined), timeout: 20_000 };
+        args[optionsIndex] = { ...(args[optionsIndex] as object | undefined), timeout: 20_000,
+          ...(publication?.signal ? { signal: publication.signal } : {}) };
         return Reflect.apply(method, target, args);
       };
     },
@@ -129,7 +144,8 @@ export function parseMessageEvent(input: unknown, options: MessageParsingOptions
   const timestamp = Number(message.create_time);
   if (Number.isFinite(timestamp) && timestamp > 0 && timestamp < 8.64e15) base.at = new Date(timestamp).toISOString();
   if (message.message_type === 'text' && typeof content.text === 'string') {
-    base.text = replaceMentionKeys(content.text, message.mentions, observation ? undefined : options.botOpenId).trim();
+    base.text = (isGroup && mentioned ? groupCommandAfterMentions(content.text, message.mentions) : undefined)
+      ?? replaceMentionKeys(content.text, message.mentions, observation ? undefined : options.botOpenId).trim();
     return base.text ? { message: base, ...(observation ? { observation: true } : {}) } : undefined;
   }
   if (message.message_type === 'post') {
@@ -193,6 +209,20 @@ function replaceMentionKeys(text: string, mentions: Lark.RawMessageEvent['messag
     text = text.split(mention.key).join(label);
   }
   return text;
+}
+
+function groupCommandAfterMentions(text: string, mentions: Lark.RawMessageEvent['message']['mentions']): string | undefined {
+  let remainder = text.trim();
+  const keys = (mentions ?? []).map(mention => mention.key).filter(Boolean).sort((a, b) => b.length - a.length);
+  let removed = 0;
+  while (true) {
+    const key = keys.find(value => remainder.startsWith(value) && /^\s/.test(remainder.slice(value.length, value.length + 1)));
+    if (!key) break;
+    remainder = remainder.slice(key.length).trimStart();
+    removed++;
+  }
+  const command = /^\/([a-z]+)$/i.exec(remainder)?.[1]?.toLowerCase();
+  return removed > 0 && command && MULTI_MENTION_COMMANDS.has(command) ? `/${command}` : undefined;
 }
 
 export function quotedMessageText(type: string, rawContent: string): string | undefined {
@@ -292,6 +322,12 @@ export function parseCardEvent(raw: Lark.RawCardActionEvent, secret: string): In
 
 export function renderCard(card: MessageCard, chatId: string, secret: string): object {
   const elements: object[] = [{ tag: 'markdown', content: renderMarkdown(card.text || ' ') }];
+  if (card.mention) {
+    if (typeof card.mention.openId !== 'string' || !/^ou_[a-zA-Z0-9_-]{1,180}$/.test(card.mention.openId)) {
+      throw new Error('卡片提及对象的 open_id 无效');
+    }
+    elements.unshift({ tag: 'markdown', content: `<at id=${card.mention.openId}></at>` });
+  }
   const buttons = (card.buttons ?? []).filter(button => isAllowedCommand(button.command));
   // At most five buttons per action row, as required by the Feishu card schema.
   for (let index = 0; index < buttons.length; index += 5) {
@@ -316,11 +352,14 @@ export class FeishuClient implements FeishuTransport {
   private readonly cardChats = new Map<string, string>();
   private readonly pending = new Set<Promise<void>>();
   private readonly reactionCleanups = new Set<() => Promise<void>>();
+  private retryStop = new AbortController();
+  private readonly retryDelay: NonNullable<Dependencies['retryDelay']>;
   private botOpenId?: string;
   private identityAttemptAt = 0;
   private identityPending?: Promise<void>;
 
   constructor(private readonly options: FeishuOptions, dependencies: Dependencies = {}) {
+    this.retryDelay = dependencies.retryDelay ?? ((milliseconds, signal) => delay(milliseconds, undefined, { signal }));
     this.logger = {
       error: (...args: unknown[]) => this.sdkLog('error', args),
       warn: (...args: unknown[]) => this.sdkLog('warn', args),
@@ -344,6 +383,7 @@ export class FeishuClient implements FeishuTransport {
       throw new Error('Invalid Feishu app credentials');
     }
     this.closed = false;
+    if (this.retryStop.signal.aborted) this.retryStop = new AbortController();
     this.active = true;
     this.setStatus('connecting', '正在建立飞书长连接');
     if (this.options.allowGroup || this.options.onGroupMessage || this.options.onBotIdentity) await this.resolveBotIdentity();
@@ -379,6 +419,7 @@ export class FeishuClient implements FeishuTransport {
 
   async close(): Promise<void> {
     this.closed = true;
+    this.retryStop.abort();
     this.active = false;
     this.ws.close({ force: true });
     await Promise.allSettled([...this.reactionCleanups].map(cleanup => cleanup()));
@@ -388,31 +429,21 @@ export class FeishuClient implements FeishuTransport {
   async sendText(chatId: string, text: string): Promise<string> {
     let messageId = '';
     for (const part of splitText(text || '（无文本内容）')) {
-      const result = await this.api.im.v1.message.create({
-        params: { receive_id_type: recipientType(chatId) },
-        data: { receive_id: chatId, msg_type: 'text', content: JSON.stringify({ text: part }) },
-      });
-      this.checkResult(result, '发送消息');
-      if (!result.data?.message_id) throw new Error('Feishu send response is missing message_id');
-      messageId = result.data.message_id;
+      const result = await this.createMessage(chatId, 'text', JSON.stringify({ text: part }), '发送消息');
+      messageId = result.message_id;
     }
     return messageId;
   }
 
-  async sendCard(chatId: string, card: MessageCard): Promise<string> {
-    const result = await this.api.im.v1.message.create({
-      params: { receive_id_type: recipientType(chatId) },
-      data: { receive_id: chatId, msg_type: 'interactive', content: JSON.stringify(renderCard(card, chatId, this.options.appSecret)) },
-    });
-    this.checkResult(result, '发送卡片');
-    if (!result.data?.message_id) throw new Error('Feishu send response is missing message_id');
+  async sendCard(chatId: string, card: MessageCard, options?: FeishuSendOptions): Promise<string> {
+    const result = await this.createMessage(chatId, 'interactive', JSON.stringify(renderCard(card, chatId, this.options.appSecret)), '发送卡片', options);
     // A native menu addresses a person by open_id; callbacks carry the actual chat_id.
     // Rebind signatures immediately when the API returns that canonical chat id.
-    const canonicalChatId = result.data.chat_id ?? chatId;
-    this.cardChats.set(result.data.message_id, canonicalChatId);
-    if (canonicalChatId !== chatId && card.buttons?.length) await this.updateCard(result.data.message_id, card);
+    const canonicalChatId = result.chat_id ?? chatId;
+    this.cardChats.set(result.message_id, canonicalChatId);
+    if (canonicalChatId !== chatId && card.buttons?.length) await this.updateCard(result.message_id, card, options);
     if (this.cardChats.size > 2000) this.cardChats.delete(this.cardChats.keys().next().value!);
-    return result.data.message_id;
+    return result.message_id;
   }
 
   async sendImage(chatId: string, imagePath: string): Promise<string> {
@@ -424,13 +455,8 @@ export class FeishuClient implements FeishuTransport {
     });
     const imageKey = uploaded?.image_key;
     if (!imageKey) throw new Error('飞书上传图片未返回 image_key');
-    const result = await this.api.im.v1.message.create({
-      params: { receive_id_type: recipientType(chatId) },
-      data: { receive_id: chatId, msg_type: 'image', content: JSON.stringify({ image_key: imageKey }) },
-    });
-    this.checkResult(result, '发送图片');
-    if (!result.data?.message_id) throw new Error('Feishu image response is missing message_id');
-    return result.data.message_id;
+    const result = await this.createMessage(chatId, 'image', JSON.stringify({ image_key: imageKey }), '发送图片');
+    return result.message_id;
   }
 
   async sendFile(chatId: string, filePath: string): Promise<string> {
@@ -442,23 +468,17 @@ export class FeishuClient implements FeishuTransport {
     });
     const fileKey = uploaded?.file_key;
     if (!fileKey) throw new Error('飞书上传文件未返回 file_key');
-    const result = await this.api.im.v1.message.create({
-      params: { receive_id_type: recipientType(chatId) },
-      data: { receive_id: chatId, msg_type: 'file', content: JSON.stringify({ file_key: fileKey }) },
-    });
-    this.checkResult(result, '发送文件');
-    if (!result.data?.message_id) throw new Error('Feishu file response is missing message_id');
-    return result.data.message_id;
+    const result = await this.createMessage(chatId, 'file', JSON.stringify({ file_key: fileKey }), '发送文件');
+    return result.message_id;
   }
 
-  async updateCard(messageId: string, card: MessageCard): Promise<void> {
+  async updateCard(messageId: string, card: MessageCard, options?: FeishuSendOptions): Promise<void> {
     const chatId = this.cardChats.get(messageId);
     if (!chatId && card.buttons?.length) throw new Error('Unknown card destination; cannot sign interactive actions');
-    const result = await this.api.im.v1.message.patch({
+    await this.retryTransient(() => this.api.im.v1.message.patch({
       path: { message_id: messageId },
       data: { content: JSON.stringify(renderCard(card, chatId ?? '', this.options.appSecret)) },
-    });
-    this.checkResult(result, '更新卡片');
+    }), '更新卡片', options);
   }
 
   async recallCard(messageId: string): Promise<void> {
@@ -484,15 +504,18 @@ export class FeishuClient implements FeishuTransport {
       reactionId = result.data?.reaction_id;
     } catch (error) { this.options.log('warn', `处理表情不可用：${this.errorText(error)}`); }
     let cleared = false;
-    const cleanup = async (): Promise<void> => {
-      if (cleared) return;
-      cleared = true;
-      this.reactionCleanups.delete(cleanup);
-      if (!reactionId) return;
-      try {
-        const result = await this.api.im.v1.messageReaction.delete({ path: { message_id: messageId, reaction_id: reactionId } });
-        this.checkResult(result, '移除处理表情');
-      } catch (error) { this.options.log('warn', `清理处理表情失败：${this.errorText(error)}`); }
+    let cleanupPending: Promise<void> | undefined;
+    const cleanup = (): Promise<void> => {
+      if (cleared || !reactionId) return Promise.resolve();
+      if (cleanupPending) return cleanupPending;
+      cleanupPending = this.retryTransient(() => this.api.im.v1.messageReaction.delete({ path: { message_id: messageId, reaction_id: reactionId! } }), '移除处理表情')
+        .then(() => {
+          cleared = true;
+          this.reactionCleanups.delete(cleanup);
+        })
+        .catch(error => this.options.log('warn', `清理处理表情失败，表情可能仍保留：${this.errorText(error)}`))
+        .finally(() => { cleanupPending = undefined; });
+      return cleanupPending;
     };
     if (reactionId) this.reactionCleanups.add(cleanup);
     if (this.closed) await cleanup();
@@ -620,7 +643,7 @@ export class FeishuClient implements FeishuTransport {
 
   private checkResult(result: { code?: number; msg?: string } | undefined, operation: string): void {
     if (!result || (result.code !== undefined && result.code !== 0)) {
-      throw new Error(`${operation}失败（飞书错误码 ${result?.code ?? 'unknown'}）：${this.errorText(result?.msg ?? '空响应')}`);
+      throw Object.assign(new Error(`${operation}失败（飞书错误码 ${result?.code ?? 'unknown'}）：${this.errorText(result?.msg ?? '空响应')}`), { code: result?.code });
     }
   }
 
@@ -636,8 +659,54 @@ export class FeishuClient implements FeishuTransport {
   private errorText(error: unknown): string {
     return redactLogText(error instanceof Error ? error.message : String(error), this.options.appSecret).slice(0, 400);
   }
+
+  private async createMessage(chatId: string, type: string, content: string, operation: string, options?: FeishuSendOptions): Promise<{ message_id: string; chat_id?: string }> {
+    // Feishu deduplicates create requests with the same UUID for one hour. Keep
+    // one UUID per logical message (including each text chunk), never per retry.
+    const uuid = randomUUID();
+    const result = await this.retryTransient(() => this.api.im.v1.message.create({
+      params: { receive_id_type: recipientType(chatId) },
+      data: { receive_id: chatId, msg_type: type, content, uuid },
+    }), operation, options);
+    if (!result.data?.message_id) throw new Error('Feishu send response is missing message_id');
+    return { message_id: result.data.message_id, chat_id: result.data.chat_id };
+  }
+
+  private async retryTransient<T extends { code?: number; msg?: string } | undefined>(request: () => Promise<T>, operation: string, options?: FeishuSendOptions): Promise<T> {
+    const signal = options?.signal ? AbortSignal.any([options.signal, this.retryStop.signal]) : this.retryStop.signal;
+    const publication = options ? { ...options, signal } : undefined;
+    for (let attempt = 0; ; attempt++) {
+      assertMaySend(publication);
+      try {
+        const result = await (publication ? outboundContext.run(publication, request) : request());
+        this.checkResult(result, operation);
+        return result;
+      }
+      catch (error) {
+        // Each HTTP attempt already has a 20-second timeout. Shutdown cancels
+        // backoff and prevents new attempts, including reaction cleanup retries.
+        if (attempt >= 2 || this.closed || signal.aborted || options?.canSend?.() === false || !isTransientFailure(error)) throw error;
+        try { await this.retryDelay(attempt === 0 ? 300 : 900, signal); }
+        catch { throw error; }
+        if (this.closed || signal.aborted) throw error;
+      }
+    }
+  }
 }
 
 function recipientType(id: string): 'chat_id' | 'open_id' | 'user_id' {
   return id.startsWith('oc_') ? 'chat_id' : id.startsWith('ou_') ? 'open_id' : 'user_id';
+}
+
+function isTransientFailure(error: unknown): boolean {
+  const details = record(error);
+  if (!details) return false;
+  // Feishu also reports application rate limits as HTTP 400 / code 99991400.
+  if (details.code === 99991400 || record(record(details.response)?.data)?.code === 99991400) return true;
+  const status = record(details.response)?.status ?? details.status;
+  if (typeof status === 'number') return status === 429 || (status >= 500 && status <= 599);
+  return typeof details.code === 'string' && [
+    'ECONNRESET', 'ECONNABORTED', 'ETIMEDOUT', 'EPIPE', 'EAI_AGAIN',
+    'ECONNREFUSED', 'ENETUNREACH', 'EHOSTUNREACH',
+  ].includes(details.code);
 }

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { TaskProgress } from '../src/task-progress.js';
-import type { FeishuTransport, MessageCard } from '../src/types.js';
+import type { FeishuSendOptions, FeishuTransport, MessageCard } from '../src/types.js';
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -16,8 +16,8 @@ async function flush(): Promise<void> {
 
 function fixture(t: test.TestContext, options: { throttleMs?: number } = {}) {
   t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 1_800_000_000_000 });
-  const sent: { id: string; chatId: string; card: MessageCard; at: number }[] = [];
-  const updated: { id: string; card: MessageCard; at: number }[] = [];
+  const sent: { id: string; chatId: string; card: MessageCard; at: number; options?: FeishuSendOptions }[] = [];
+  const updated: { id: string; card: MessageCard; at: number; options?: FeishuSendOptions }[] = [];
   const recalled: string[] = [];
   const logs: string[] = [];
   const hooks: {
@@ -31,13 +31,13 @@ function fixture(t: test.TestContext, options: { throttleMs?: number } = {}) {
     async sendText() { throw new Error('No text messages should be sent by progress handling'); },
     async sendImage() { throw new Error('No image messages should be sent by progress handling'); },
     async sendFile() { throw new Error('No file messages should be sent by progress handling'); },
-    async sendCard(chatId, card) {
+    async sendCard(chatId, card, options) {
       const id = `message-${sent.length + 1}`;
-      sent.push({ id, chatId, card: structuredClone(card), at: Date.now() });
+      sent.push({ id, chatId, card: structuredClone(card), at: Date.now(), ...(options ? { options } : {}) });
       return hooks.send ? hooks.send() : id;
     },
-    async updateCard(id, card) {
-      updated.push({ id, card: structuredClone(card), at: Date.now() });
+    async updateCard(id, card, options) {
+      updated.push({ id, card: structuredClone(card), at: Date.now(), ...(options ? { options } : {}) });
       await hooks.update?.();
     },
     async recallCard(id) { recalled.push(id); throw new Error('Task cards must never be recalled'); },
@@ -378,4 +378,63 @@ test('uncertain final cleanup failure logs the problem without discarding the an
   assert.ok(fx.updated[1]!.card.text.length <= fx.final.text.length + 202);
   assert.equal(fx.updated[1]!.card.buttons, undefined);
   assert.equal(fx.logs.length, 1);
+});
+
+for (const waitingFor of ['creation', 'update'] as const) {
+  for (const stop of ['cancel', 'revoke'] as const) {
+    test(`guarded delivery checks ${stop} after waiting for progress ${waitingFor} and cleanup cannot bypass it`, async t => {
+      const fx = fixture(t);
+      const creating = deferred<string>();
+      const updating = deferred<void>();
+      if (waitingFor === 'creation') fx.hooks.send = () => creating.promise;
+      await fx.explain();
+      if (waitingFor === 'update') {
+        fx.hooks.update = () => updating.promise;
+        fx.progress.update('待完成的进度');
+        await fx.advance(4_000);
+      }
+      const controller = new AbortController();
+      let allowed = true;
+      const question: MessageCard = { title: '产品', text: '请分析登录校验要求。', mention: { openId: 'ou_developer' } };
+      const delivery = fx.progress.deliver(question, { signal: controller.signal, canSend: () => allowed });
+      const rejected = assert.rejects(delivery, /stopped|授权已变化/);
+      await flush();
+      if (stop === 'cancel') controller.abort(new Error('consultation stopped'));
+      else allowed = false;
+      creating.resolve('progress-id');
+      updating.resolve();
+      await rejected;
+      await fx.progress.finish(false, fx.fallback);
+      assert.equal(fx.sent.length, 1);
+      assert.equal(fx.updated.length, waitingFor === 'creation' ? 0 : 1);
+      assert.ok([...fx.sent, ...fx.updated].every(entry => entry.card.mention === undefined));
+    });
+  }
+}
+
+for (const hasProgress of [false, true]) {
+  test(`guarded ${hasProgress ? 'update' : 'send'} preserves mention metadata and the first delivery options`, async t => {
+    const fx = fixture(t);
+    if (hasProgress) await fx.explain();
+    const controller = new AbortController();
+    const options: FeishuSendOptions = { signal: controller.signal, canSend: () => true };
+    const question: MessageCard = { title: '产品', text: '请分析登录校验要求。', mention: { openId: 'ou_developer' }, buttons: fx.card.buttons };
+    const delivery = fx.progress.deliver(question, options);
+    assert.equal(delivery, fx.progress.deliver(fx.final, { canSend: () => false }));
+    assert.equal(await delivery, 'message-1');
+    const publication = hasProgress ? fx.updated[0]! : fx.sent[0]!;
+    assert.equal(publication.options, options);
+    assert.deepEqual(publication.card.mention, { openId: 'ou_developer' });
+    assert.equal(publication.card.text, question.text);
+    assert.equal(publication.card.buttons, undefined);
+    assert.equal(question.buttons?.length, 1);
+  });
+}
+
+test('a guarded final send that is already unauthorized never reaches transport', async t => {
+  const fx = fixture(t);
+  await assert.rejects(fx.progress.deliver(fx.final, { canSend: () => false }), /授权已变化/);
+  await fx.progress.finish(false, fx.fallback);
+  assert.deepEqual(fx.sent, []);
+  assert.deepEqual(fx.updated, []);
 });

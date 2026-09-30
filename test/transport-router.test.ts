@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { TransportRouter } from '../src/transport-router.js';
-import { messageKey } from '../src/routing.js';
-import type { FeishuTransport } from '../src/types.js';
+import { conversationKey, messageKey } from '../src/routing.js';
+import type { FeishuSendOptions, FeishuTransport } from '../src/types.js';
 
 function client(recallCard?: (messageId: string) => Promise<void>, markCompleted?: (messageId: string) => Promise<void>): FeishuTransport {
   return {
@@ -81,4 +81,21 @@ test('completion errors propagate from the original bot without retrying another
   router.set('dev', client(undefined, async id => { calls.push(`dev:${id}`); throw error; }));
   await assert.rejects(router.markCompleted(messageKey('dev', 'om_original')), actual => actual === error);
   assert.deepEqual(calls, ['dev:om_original']);
+});
+
+test('consultation publication options stay on the target bot for both sends and updates', async () => {
+  const router = new TransportRouter();
+  const options: FeishuSendOptions = { signal: new AbortController().signal, canSend: () => true };
+  const calls: Array<[string, string, FeishuSendOptions | undefined]> = [];
+  router.set('default', { ...client(), async sendCard() { throw new Error('wrong bot'); }, async updateCard() { throw new Error('wrong bot'); } });
+  router.set('reviewer', { ...client(),
+    async sendCard(id, _card, actual) { calls.push(['send', id, actual]); return 'om_consult'; },
+    async updateCard(id, _card, actual) { calls.push(['update', id, actual]); },
+  });
+  const card = { title: '咨询答复', text: '分析' };
+  const id = await router.sendCard(conversationKey('reviewer', 'oc_group'), card, options);
+  assert.equal(id, messageKey('reviewer', 'om_consult'));
+  await router.updateCard(id, card, options);
+  assert.deepEqual(calls.map(([kind, id]) => [kind, id]), [['send', 'oc_group'], ['update', 'om_consult']]);
+  assert.ok(calls.every(([, , actual]) => actual === options));
 });

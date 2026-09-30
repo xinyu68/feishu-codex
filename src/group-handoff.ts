@@ -1,3 +1,5 @@
+import { validateGroupHandoffRequest } from './group-handoff-request.js';
+
 export const MAX_GROUP_HANDOFFS = 6;
 
 export interface GroupHandoffCandidate {
@@ -6,7 +8,7 @@ export interface GroupHandoffCandidate {
   aliases?: readonly string[];
 }
 
-export type GroupHandoffInvalidReason = 'unknown_target' | 'ambiguous_target' | 'multiple_targets' | 'self_target' | 'empty_instruction';
+export type GroupHandoffInvalidReason = 'unknown_target' | 'ambiguous_target' | 'multiple_targets' | 'self_target' | 'empty_instruction' | 'invalid_request';
 
 export type GroupHandoffResult =
   | { kind: 'none' }
@@ -19,6 +21,7 @@ const errorMessages: Record<GroupHandoffInvalidReason, string> = {
   multiple_targets: '一次只能交接给一个机器人，请明确一个接收者。',
   self_target: '不能把任务交接给自己，请选择另一个机器人。',
   empty_instruction: '交接需要说明具体任务。',
+  invalid_request: '交接申请未通过校验，请确认接收者和任务后重新安排。',
 };
 
 function candidateNames(candidate: GroupHandoffCandidate): string[] {
@@ -125,5 +128,20 @@ export function canContinueGroupHandoff(completedHandoffs: number): boolean {
 export function buildGroupHandoffGuidance(candidates: readonly GroupHandoffCandidate[], selfBotId: string): string {
   const names = [...new Set(candidates.filter(candidate => candidate.id !== selfBotId).map(candidate => candidate.name.trim()).filter(Boolean))];
   if (!names.length) return '';
-  return `可交接角色：${JSON.stringify(names)}`;
+  const needsId = candidates.filter(candidate => candidate.id !== selfBotId && names.includes(candidate.name.trim())
+    && (candidates.some(other => other.id !== candidate.id && candidateNames(other).includes(candidate.name.trim()))
+      || /[：:\r\n]/u.test(candidate.name)));
+  return `可交接角色：${JSON.stringify(names)}${needsId.length ? `\n同名或特殊名称请用角色编号：${JSON.stringify(needsId.map(({ id, name }) => ({ id, name })))}` : ''}`;
+}
+
+/** Structured requests use exact recipient matching without interpreting task text as routing syntax. */
+export function resolveGroupHandoffRequest(value: unknown, candidates: readonly GroupHandoffCandidate[], selfBotId: string): GroupHandoffResult {
+  const request = validateGroupHandoffRequest(value);
+  const line = JSON.stringify(request);
+  const invalid = (reason: GroupHandoffInvalidReason): GroupHandoffResult => ({ kind: 'invalid', reason, message: errorMessages[reason], line, lineNumber: 1 });
+  const matches = [...new Set(candidates.filter(candidate => candidateNames(candidate).includes(request.target)).map(candidate => candidate.id))];
+  if (matches.length === 0) return invalid('unknown_target');
+  if (matches.length > 1) return invalid('ambiguous_target');
+  if (matches[0] === selfBotId) return invalid('self_target');
+  return { kind: 'handoff', targetBotId: matches[0]!, instruction: request.task, line, lineNumber: 1 };
 }

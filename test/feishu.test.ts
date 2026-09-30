@@ -14,7 +14,7 @@ const privateEvent = (content = JSON.stringify({ text: '有没有需要我待处
 });
 const tick = () => new Promise<void>(resolve => setImmediate(resolve));
 
-function harness(overrides: Partial<FeishuOptions> = {}, methods: Record<string, unknown> = {}) {
+function harness(overrides: Partial<FeishuOptions> = {}, methods: Record<string, unknown> = {}, retryDelay: (milliseconds: number, signal: AbortSignal) => Promise<void> = async () => {}) {
   let dispatcher: Lark.EventDispatcher;
   let wsClosed = false;
   const messages: InboundMessage[] = [];
@@ -54,7 +54,7 @@ function harness(overrides: Partial<FeishuOptions> = {}, methods: Record<string,
     onStatus: status => { statuses.push(status); },
     log: (_level, text) => { logs.push(text); },
     ...overrides,
-  }, { api, ws: {
+  }, { api, retryDelay, ws: {
     start: async options => { dispatcher = options.eventDispatcher; },
     close: () => { wsClosed = true; },
   } });
@@ -75,6 +75,30 @@ test('plain follow-ups remain untouched and only human private messages enter Co
   assert.equal(parseMessageEvent({ message: {} }), undefined);
   assert.equal(parseMessageEvent(privateEvent('{')), undefined);
   assert.equal(parseMessageEvent(privateEvent('null')), undefined);
+});
+
+test('supported group commands addressed to two bots reach each bot without changing ordinary mentions', () => {
+  const event = {
+    sender: { sender_type: 'user', sender_id: { open_id: 'ou_actor' } },
+    message: {
+      message_id: 'om_multi_new', chat_id: 'oc_group', chat_type: 'group', message_type: 'text',
+      content: JSON.stringify({ text: '@_user_1 @_user_2 /new' }),
+      mentions: [
+        { key: '@_user_1', id: { open_id: 'ou_bot_a' }, name: '机器人 A' },
+        { key: '@_user_2', id: { open_id: 'ou_bot_b' }, name: '机器人 B' },
+      ],
+    },
+  };
+  for (const command of ['/new', '/status', '/stop', '/session']) {
+    event.message.content = JSON.stringify({ text: `@_user_1 @_user_2 ${command}` });
+    assert.equal(parseMessageEvent(event, { botOpenId: 'ou_bot_a' })?.message.text, command);
+    assert.equal(parseMessageEvent(event, { botOpenId: 'ou_bot_b' })?.message.text, command);
+    assert.equal(parseMessageEvent(event, { botOpenId: 'ou_other' }), undefined);
+  }
+  event.message.content = JSON.stringify({ text: '@_user_1 @_user_2 /session S1' });
+  assert.equal(parseMessageEvent(event, { botOpenId: 'ou_bot_a' })?.message.text, '@机器人 B /session S1');
+  event.message.content = JSON.stringify({ text: '@_user_1 @_user_2 请讨论 /new 的用法' });
+  assert.equal(parseMessageEvent(event, { botOpenId: 'ou_bot_a' })?.message.text, '@机器人 B 请讨论 /new 的用法');
 });
 
 test('attachment names cannot escape the directory or create Windows device files', () => {
@@ -472,4 +496,319 @@ test('SDK completion uses the reaction POST endpoint with DONE and a bounded tim
     assert.equal(reactions[0]!.timeout, 20_000);
     assert.deepEqual(JSON.parse(String(reactions[0]!.data)), { reaction_type: { emoji_type: 'DONE' } });
   } finally { Lark.defaultHttpInstance.defaults.adapter = originalAdapter; await client.close(); }
+});
+
+test('card retries reuse a UUID after an uncertain network result; distinct sends use distinct UUIDs', async () => {
+  const requests: any[] = [];
+  const waits: number[] = [];
+  const h = harness({}, { message: { create: async (request: any) => {
+    requests.push(request);
+    if (requests.length === 1) throw Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' });
+    return { code: 0, data: { message_id: 'om_recovered' } };
+  } } }, async milliseconds => { waits.push(milliseconds); });
+  const card = { title: '结果', text: '完成' };
+  assert.equal(await h.client.sendCard('oc_chat', card), 'om_recovered');
+  assert.deepEqual(requests[0], requests[1]);
+  assert.match(requests[0].data.uuid, /^[a-f0-9-]{36}$/);
+  assert.deepEqual(waits, [300]);
+  await h.client.sendCard('oc_chat', card);
+  assert.notEqual(requests[1].data.uuid, requests[2].data.uuid);
+});
+
+test('text chunks each keep their own UUID across retries', async () => {
+  const requests: any[] = [];
+  const attempts = new Map<string, number>();
+  const h = harness({}, { message: { create: async (request: any) => {
+    requests.push(request);
+    const uuid = request.data.uuid as string;
+    const attempt = (attempts.get(uuid) ?? 0) + 1;
+    attempts.set(uuid, attempt);
+    if (attempt === 1) throw { response: { status: 503 } };
+    return { code: 0, data: { message_id: `om_${attempts.size}` } };
+  } } });
+  const text = 'a'.repeat(12_001);
+  assert.equal(await h.client.sendText('oc_chat', text), 'om_2');
+  assert.deepEqual([...attempts.values()], [2, 2]);
+  assert.deepEqual(requests[0], requests[1]);
+  assert.deepEqual(requests[2], requests[3]);
+  assert.equal(JSON.parse(requests[0].data.content).text + JSON.parse(requests[2].data.content).text, text);
+});
+
+test('only known transient network, HTTP and Feishu rate-limit errors receive bounded retries', async () => {
+  const cases: Array<{ response?: any; error?: unknown; attempts: number }> = [
+    ...['ECONNRESET', 'ETIMEDOUT', 'ECONNABORTED', 'EAI_AGAIN'].map(code => ({ error: { code }, attempts: 3 })),
+    { error: { response: { status: 429 } }, attempts: 3 },
+    { error: { response: { status: 502 } }, attempts: 3 },
+    { error: { response: { status: 400, data: { code: 99991400 } } }, attempts: 3 },
+    { response: { code: 99991400, msg: 'rate limited' }, attempts: 3 },
+    { error: { response: { status: 403 }, code: 'ECONNRESET' }, attempts: 1 },
+    { response: { code: 99991672, msg: 'missing permission' }, attempts: 1 },
+    { response: { code: 230001, msg: 'invalid content' }, attempts: 1 },
+    { error: new Error('unknown ECONNRESET-looking text'), attempts: 1 },
+    { error: { code: 'ERR_CANCELED' }, attempts: 1 },
+    { response: { code: 0, data: {} }, attempts: 1 },
+  ];
+  for (const item of cases) {
+    let calls = 0;
+    const waits: number[] = [];
+    const uuids = new Set<string>();
+    const h = harness({}, { message: { create: async (request: any) => {
+      calls++; uuids.add(request.data.uuid);
+      if (item.error) throw item.error;
+      return item.response;
+    } } }, async milliseconds => { waits.push(milliseconds); });
+    await assert.rejects(h.client.sendText('oc_chat', 'hello'));
+    assert.equal(calls, item.attempts);
+    assert.equal(uuids.size, 1);
+    assert.deepEqual(waits, item.attempts === 3 ? [300, 900] : []);
+  }
+});
+
+test('card patch retries the same message and body without creating another card', async () => {
+  const requests: any[] = [];
+  const h = harness({}, { message: { patch: async (request: any) => {
+    requests.push(request);
+    if (requests.length === 1) throw { response: { status: 500 } };
+    return { code: 0 };
+  } } });
+  await h.client.updateCard('om_existing', { title: '完成', text: '结果' });
+  assert.equal(requests.length, 2);
+  assert.deepEqual(requests[0], requests[1]);
+  assert.equal(requests[0].path.message_id, 'om_existing');
+});
+
+test('image and file message retries reuse uploaded content without repeating uploads', async t => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'feishu-retry-upload-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const file = path.join(directory, 'content.png');
+  await writeFile(file, Buffer.from('content'));
+  for (const kind of ['image', 'file'] as const) {
+    const requests: any[] = [];
+    const h = harness({}, { message: { create: async (request: any) => {
+      requests.push(request);
+      if (requests.length === 1) throw { code: 'ECONNRESET' };
+      return { code: 0, data: { message_id: 'om_uploaded' } };
+    } } });
+    await (kind === 'image' ? h.client.sendImage('oc_chat', file) : h.client.sendFile('oc_chat', file));
+    assert.equal(kind === 'image' ? h.imageUploads.length : h.fileUploads.length, 1);
+    assert.deepEqual(requests[0], requests[1]);
+    let uploads = 0;
+    const failed = harness({}, { [kind]: { create: async () => { uploads++; throw { code: 'ECONNRESET' }; } } });
+    await assert.rejects(kind === 'image' ? failed.client.sendImage('oc_chat', file) : failed.client.sendFile('oc_chat', file));
+    assert.equal(uploads, 1);
+    assert.equal(failed.created.length, 0);
+  }
+});
+
+test('typing cleanup shares retries, clears only after success and does not remove DONE', async () => {
+  const requests: any[] = [];
+  const h = harness({}, { messageReaction: {
+    create: async () => ({ code: 0, data: { reaction_id: 'typing-id' } }),
+    delete: async (request: any) => {
+      requests.push(request);
+      if (requests.length < 3) throw { code: 'ECONNRESET' };
+      return { code: 0 };
+    },
+  } });
+  const cleanup = await h.client.startTyping('om_user');
+  await Promise.all([cleanup(), cleanup(), cleanup()]);
+  await cleanup(); await h.client.close();
+  assert.equal(requests.length, 3);
+  assert.ok(requests.every(request => request.path.message_id === 'om_user' && request.path.reaction_id === 'typing-id'));
+  assert.equal(h.logs.length, 0);
+});
+
+test('exhausted typing cleanup stays registered and shutdown makes only one final attempt', async () => {
+  let calls = 0;
+  const h = harness({}, { messageReaction: {
+    create: async () => ({ code: 0, data: { reaction_id: 'typing-id' } }),
+    delete: async () => { calls++; throw { code: 'ECONNRESET' }; },
+  } });
+  const cleanup = await h.client.startTyping('om_user');
+  await cleanup();
+  assert.equal(calls, 3);
+  assert.ok(h.logs.some(text => text.includes('表情可能仍保留')));
+  await h.client.close();
+  assert.equal(calls, 4);
+});
+
+test('shutdown cancels a pending typing backoff and shares cleanup instead of retrying', async () => {
+  let calls = 0;
+  let waiting!: () => void;
+  const backoff = new Promise<void>(resolve => { waiting = resolve; });
+  const h = harness({}, { messageReaction: {
+    create: async () => ({ code: 0, data: { reaction_id: 'typing-id' } }),
+    delete: async () => { calls++; throw { code: 'ECONNRESET' }; },
+  } }, async (_milliseconds, signal) => {
+    waiting();
+    await new Promise<void>((_resolve, reject) => signal.addEventListener('abort', () => reject(new Error('cancelled')), { once: true }));
+  });
+  const cleanup = await h.client.startTyping('om_user');
+  const clearing = cleanup();
+  await backoff;
+  await h.client.close();
+  await clearing;
+  assert.equal(calls, 1);
+  assert.ok(h.wsClosed);
+  assert.ok(h.logs.some(text => text.includes('表情可能仍保留')));
+});
+
+test('shutdown cancels message retries without starting another UUID or attempt', async () => {
+  let calls = 0;
+  let waiting!: () => void;
+  const backoff = new Promise<void>(resolve => { waiting = resolve; });
+  const failure = Object.assign(new Error('reset'), { code: 'ECONNRESET' });
+  const h = harness({}, { message: { create: async () => { calls++; throw failure; } } }, async (_milliseconds, signal) => {
+    waiting();
+    await new Promise<void>((_resolve, reject) => signal.addEventListener('abort', () => reject(new Error('cancelled')), { once: true }));
+  });
+  const sent = assert.rejects(h.client.sendCard('oc_chat', { title: '结果', text: '已完成' }), error => error === failure);
+  await backoff;
+  await h.client.close();
+  await sent;
+  assert.equal(calls, 1);
+});
+
+test('SDK retry preserves message UUID and timeout in the actual HTTP payload', async () => {
+  const originalAdapter = Lark.defaultHttpInstance.defaults.adapter;
+  const sent: Array<{ uuid: string; content: string }> = [];
+  Lark.defaultHttpInstance.defaults.adapter = async config => {
+    const authentication = config.url?.includes('/auth/');
+    if (!authentication) {
+      sent.push(JSON.parse(String(config.data)));
+      assert.equal(config.timeout, 20_000);
+      if (sent.length === 1) throw Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' });
+    }
+    return {
+      config, status: 200, statusText: 'OK', headers: {},
+      data: authentication
+        ? { code: 0, tenant_access_token: 'mock-retry-token', app_access_token: 'mock-retry-token', expire: 7200 }
+        : { code: 0, data: { message_id: 'om_retry', chat_id: 'oc_chat' } },
+    };
+  };
+  const client = new FeishuClient({
+    appId: 'cli_abcdef0123456782', appSecret: 'mock-retry-secret', attachmentDir: os.tmpdir(),
+    onMessage: async () => {}, onStatus: () => {}, log: () => {},
+  }, { ws: { start: async () => {}, close: () => {} }, retryDelay: async () => {} });
+  try {
+    assert.equal(await client.sendCard('oc_chat', { title: '完成', text: '结果' }), 'om_retry');
+    assert.equal(sent.length, 2);
+    assert.match(sent[0]!.uuid, /^[a-f0-9-]{36}$/);
+    assert.deepEqual(sent[0], sent[1]);
+  } finally { Lark.defaultHttpInstance.defaults.adapter = originalAdapter; await client.close(); }
+});
+
+test('guarded card creation and updates stop retries when publication is revoked', async () => {
+  for (const update of [false, true]) {
+    let allowed = true;
+    let calls = 0;
+    const failure = Object.assign(new Error('connection reset'), { code: 'ECONNRESET' });
+    const request = async () => { calls++; throw failure; };
+    const h = harness({}, { message: { create: request, patch: request } }, async () => { allowed = false; });
+    const options = { canSend: () => allowed };
+    const card = { title: '咨询答复', text: '分析' };
+    try {
+      await assert.rejects(update ? h.client.updateCard('om_card', card, options) : h.client.sendCard('oc_chat', card, options), /发送已取消|授权已变化/);
+      assert.equal(calls, 1);
+      await assert.rejects(h.client.sendCard('oc_chat', card, options), /发送已取消|授权已变化/);
+      assert.equal(calls, 1);
+    } finally { await h.client.close(); }
+  }
+});
+
+test('consultation abort cancels publication backoff without another request', async () => {
+  const controller = new AbortController();
+  let calls = 0;
+  let waiting!: () => void;
+  const backoff = new Promise<void>(resolve => { waiting = resolve; });
+  const failure = Object.assign(new Error('connection reset'), { code: 'ECONNRESET' });
+  const h = harness({}, { message: { create: async () => { calls++; throw failure; } } }, async (_milliseconds, signal) => {
+    waiting();
+    await new Promise<void>((_resolve, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }));
+  });
+  try {
+    const rejected = assert.rejects(h.client.sendCard('oc_chat', { title: '咨询答复', text: '分析' }, { signal: controller.signal }), error => error === failure);
+    await backoff;
+    controller.abort();
+    await rejected;
+    assert.equal(calls, 1);
+  } finally { await h.client.close(); }
+});
+
+test('guarded SDK card calls pass cancellation to the actual HTTP request', async () => {
+  const originalAdapter = Lark.defaultHttpInstance.defaults.adapter;
+  let calls = 0;
+  let started!: () => void;
+  let observedSignal: AbortSignal | undefined;
+  Lark.defaultHttpInstance.defaults.adapter = async config => {
+    if (!config.url?.includes('/auth/')) {
+      calls++;
+      observedSignal = config.signal as AbortSignal;
+      started();
+      await new Promise<void>((_resolve, reject) => observedSignal!.addEventListener('abort', () => reject(observedSignal!.reason), { once: true }));
+    }
+    return { config, status: 200, statusText: 'OK', headers: {},
+      data: { code: 0, tenant_access_token: 'mock-cancel-token', app_access_token: 'mock-cancel-token', expire: 7200 } };
+  };
+  const client = new FeishuClient({
+    appId: 'cli_abcdef0123456783', appSecret: 'mock-cancel-secret', attachmentDir: os.tmpdir(),
+    onMessage: async () => {}, onStatus: () => {}, log: () => {},
+  }, { ws: { start: async () => {}, close: () => {} }, retryDelay: async () => {} });
+  try {
+    for (const update of [false, true]) {
+      const controller = new AbortController();
+      const sent = new Promise<void>(resolve => { started = resolve; });
+      const card = { title: '咨询答复', text: '分析' };
+      const rejected = assert.rejects(update ? client.updateCard('om_card', card, { signal: controller.signal })
+        : client.sendCard('oc_chat', card, { signal: controller.signal }), /cancel|stop/i);
+      await sent;
+      assert.ok(observedSignal);
+      controller.abort(new Error('consultation stopped'));
+      await rejected;
+      assert.equal(observedSignal.aborted, true);
+    }
+    assert.equal(calls, 2);
+  } finally { Lark.defaultHttpInstance.defaults.adapter = originalAdapter; await client.close(); }
+});
+
+test('publication authorization is rechecked after asynchronous SDK token lookup', async () => {
+  const originalAdapter = Lark.defaultHttpInstance.defaults.adapter;
+  let allowed = true;
+  let messageRequests = 0;
+  Lark.defaultHttpInstance.defaults.adapter = async config => {
+    if (config.url?.includes('/auth/')) allowed = false;
+    else messageRequests++;
+    return { config, status: 200, statusText: 'OK', headers: {},
+      data: { code: 0, tenant_access_token: 'mock-revoked-token', app_access_token: 'mock-revoked-token', expire: 7200 } };
+  };
+  const client = new FeishuClient({
+    appId: 'cli_abcdef0123456784', appSecret: 'mock-revoked-secret', attachmentDir: os.tmpdir(),
+    onMessage: async () => {}, onStatus: () => {}, log: () => {},
+  }, { ws: { start: async () => {}, close: () => {} }, retryDelay: async () => {} });
+  try {
+    await assert.rejects(client.sendCard('oc_chat', { title: '咨询答复', text: '分析' }, { canSend: () => allowed }), /授权已变化/);
+    assert.equal(messageRequests, 0);
+  } finally { Lark.defaultHttpInstance.defaults.adapter = originalAdapter; await client.close(); }
+});
+
+test('trusted card mentions render a separate native mention before the question', () => {
+  const card = renderCard({ title: '产品', text: '请分析登录校验要求。', mention: { openId: 'ou_developer-1_2' } }, 'oc_chat', 'secret') as any;
+  assert.deepEqual(card.elements, [
+    { tag: 'markdown', content: '<at id=ou_developer-1_2></at>' },
+    { tag: 'markdown', content: '请分析登录校验要求。' },
+  ]);
+});
+
+test('card mentions reject invalid identifiers instead of emitting markup or mentioning everyone', () => {
+  for (const openId of ['all', 'cli_developer', 'ou_', 'ou_developer"', 'ou_developer></at><at id=all', 'ou_developer\n', `ou_${'x'.repeat(181)}`]) {
+    assert.throws(() => renderCard({ title: '产品', text: '问题', mention: { openId } }, 'oc_chat', 'secret'), /open_id 无效/);
+  }
+});
+
+test('ordinary cards preserve their elements and do not infer mentions from plain text', () => {
+  assert.deepEqual(renderCard({ title: '产品', text: '@开发 请分析登录校验要求。', tone: 'green' }, 'oc_chat', 'secret'), {
+    config: { wide_screen_mode: true, update_multi: true },
+    header: { template: 'green', title: { tag: 'plain_text', content: '产品' } },
+    elements: [{ tag: 'markdown', content: '@开发 请分析登录校验要求。' }],
+  });
 });

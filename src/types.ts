@@ -1,6 +1,7 @@
 export type ConnectionStatus = 'stopped' | 'connecting' | 'connected' | 'error';
 export type BotProfile = {
   id: string; name: string; appId: string; appSecret: string; enabled: boolean;
+  engine?: 'codex' | 'hermes';
   allowedActors: string[]; allowedGroups: string[]; roleInstructions: string; privateRoleInstructions?: string; model: string; effort: string;
   /** Automatically supplement recent group discussion; omitted legacy values default to true. */
   includeGroupContext?: boolean;
@@ -12,6 +13,9 @@ export type BridgeConfig = {
   botName?: string; roleInstructions?: string; privateRoleInstructions?: string; allowedGroups?: string[]; bots?: BotProfile[];
   includeGroupContext?: boolean;
   desktopNotificationTarget?: DesktopNotificationTarget | null;
+  engine?: 'codex' | 'hermes';
+  /** The legacy first bot was explicitly removed; do not recreate its empty placeholder. */
+  defaultBotRemoved?: boolean;
 };
 export type DesktopNotificationTarget = { chatId: string; actorId: string; botAppId: string };
 export type DesktopNotificationTargetOption = DesktopNotificationTarget & { botId: string; botName: string };
@@ -19,11 +23,16 @@ export type Project = { path: string; name: string; threadCount: number; lastAct
 export type ThreadSummary = { id: string; title: string; cwd: string; updatedAt: string; preview: string };
 export type ModelInfo = { id: string; name: string; efforts: string[]; defaultEffort: string };
 export type HistoryMessage = { role: 'user' | 'assistant'; text: string; at?: string; id?: string; turnId?: string; phase?: string };
+export type GroupContextBoundary = { afterSequence: number; startedAt: string };
 export type Conversation = {
   chatId: string; actorId: string; title: string; cwd: string; threadId?: string;
   botId?: string; rawChatId?: string; chatType?: 'p2p' | 'group'; botName?: string;
   revision?: number;
+  /** Stable across a native session ID change caused by compaction; reset on an explicit switch. */
+  consultationIdentity?: string;
   model?: string; effort?: string; updatedAt: string; preview: string;
+  /** Automatic group background starts here; explicit quotations remain available. */
+  groupContextBoundary?: GroupContextBoundary;
 };
 export type LogEntry = { id: string; at: string; level: 'info' | 'warn' | 'error'; text: string };
 export type ChatMessage = { id: string; role: 'user' | 'assistant' | 'system'; text: string; at: string; streaming?: boolean; phase?: string; turnId?: string };
@@ -45,7 +54,11 @@ export type InboundMessage = {
   expectedThreadId?: string;
 };
 export type CardButton = { label: string; command: string; primary?: boolean };
-export type MessageCard = { title: string; text: string; tone?: 'blue' | 'green' | 'orange' | 'red'; buttons?: CardButton[] };
+export type MessageCard = {
+  title: string; text: string; tone?: 'blue' | 'green' | 'orange' | 'red'; buttons?: CardButton[];
+  /** Bridge-resolved recipient identity; never inferred from display names or model text. */
+  mention?: { openId: string };
+};
 export type CodexQuestion = { id: string; question: string; options?: { label: string; description?: string }[] };
 export type RuntimeRequest = {
   id: string; kind: 'approval' | 'question'; title: string; text: string;
@@ -98,6 +111,8 @@ export type TurnTiming = { startedAtMs?: number; completedAtMs?: number; duratio
 export interface CodexRuntime {
   readonly supportsSteering?: boolean;
   run(input: CodexRunInput): Promise<{ threadId: string; text: string; turnId?: string; images?: string[] }>;
+  /** A separate analysis session; never resumes or publishes into an ordinary chat. */
+  consult?(input: RuntimeConsultInput): Promise<{ threadId: string; text: string }>;
   subscribe?(listener: (event: RuntimeEvent) => void): () => void;
   watch?(threadId: string): Promise<void>;
   watchLoaded?(): Promise<void>;
@@ -114,15 +129,17 @@ export interface CodexRuntime {
   close(): Promise<void>;
   usage?(): Promise<CodexUsage>;
 }
+export type FeishuSendOptions = { signal?: AbortSignal; canSend?: () => boolean };
+
 export interface FeishuTransport {
   isAvailable?(chatId: string): boolean;
   start(): Promise<void>;
   close(): Promise<void>;
   sendText(chatId: string, text: string): Promise<string>;
-  sendCard(chatId: string, card: MessageCard): Promise<string>;
+  sendCard(chatId: string, card: MessageCard, options?: FeishuSendOptions): Promise<string>;
   sendImage(chatId: string, imagePath: string): Promise<string>;
   sendFile(chatId: string, filePath: string): Promise<string>;
-  updateCard(messageId: string, card: MessageCard): Promise<void>;
+  updateCard(messageId: string, card: MessageCard, options?: FeishuSendOptions): Promise<void>;
   recallCard?(messageId: string): Promise<void>;
   markCompleted?(messageId: string): Promise<void>;
   startTyping(messageId: string): Promise<() => Promise<void>>;
@@ -143,6 +160,8 @@ export type GroupMessage = {
   text: string; at: string; cwd: string; replyTo?: string;
   /** Native source thread; only this thread already knows its own result. */
   threadId?: string;
+  /** Bridge-assigned observation order, independent of event timestamps. */
+  sequence?: number;
 };
 
 export type UsageWindow = {
@@ -165,4 +184,15 @@ export type CodexUsage = {
   resetCredits: number | null;
   ordinaryUsageAllowed: boolean | null;
   fetchedAt: string;
+};
+
+export type RuntimeConsultInput = {
+  cwd: string; threadId?: string; prompt: string; roleInstructions?: string; model?: string; effort?: string;
+  /** Keep a dedicated consultation thread resumable across calls. */
+  persistent?: boolean;
+  engine?: 'codex' | 'hermes';
+  signal: AbortSignal;
+  onProgress?: (text: string) => void;
+  /** Recheck the source authorization immediately before submitting the consultation. */
+  onBeforeSubmit?: () => void | Promise<void>;
 };

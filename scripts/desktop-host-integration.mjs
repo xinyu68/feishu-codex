@@ -83,6 +83,7 @@ async function verifyNotificationMcp() {
       } while (cursor);
       assert.ok(notification?.tools.request_feishu_completion_notification, 'completion MCP must be callable in the actual runtime');
       assert.ok(notification?.tools.send_artifact_to_feishu, 'artifact MCP must be callable in the actual runtime');
+      assert.ok(notification?.tools.request_feishu_group_handoff, 'group handoff MCP must be callable in the actual runtime');
       const skills = await rpc('skills/list', { cwds: [dataDir], forceReload: true });
       const skill = skills.data.flatMap(entry => entry.skills).find(entry => entry.name === 'feishu-codex');
       assert.ok(skill, 'bundled skill must be discovered by the actual runtime');
@@ -149,7 +150,7 @@ try {
   report.createdPids.push(healthy.runtime.pid, healthy.bridge.pid, healthy.relay.pid);
   report.checks.push('all three isolated components ready; bot disabled');
   await verifyNotificationMcp();
-  report.checks.push('actual runtime preserves all CLI overrides, advertises both MCP tools, and discovers the bundled skill in its isolated Codex home');
+  report.checks.push('actual runtime preserves all CLI overrides, advertises all three MCP tools, and discovers the bundled skill in its isolated Codex home');
   const stateFile = path.join(directory, 'host-state.json');
   const lockScript = path.join(dataDir, 'hold-state.ps1');
   await fs.writeFile(lockScript, `\uFEFFparam([string]$Path)

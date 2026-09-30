@@ -26,6 +26,9 @@ async function fixture(page: Page, status: DesktopStatus = ready, native = true,
       switchToShared: async () => { calls.push('switch'); if (cancelNextSwitch) { cancelNextSwitch = false; return { ok: false, cancelled: true }; } update({ ...status, launch: { state: 'switching', message: '正在重启 Codex 并连接飞书…' } }); return { ok: true }; },
       openCodex: async () => { calls.push('open'); return { ok: true }; },
       retry: async () => { calls.push('retry'); return { ok: true }; },
+      checkForUpdates: async () => { calls.push('checkForUpdates'); update({ ...status, update: { phase: 'available', version: '0.3.3' } }); return { ok: true }; },
+      downloadUpdate: async () => { calls.push('downloadUpdate'); update({ ...status, update: { phase: 'ready', version: '0.3.3', percent: 100 } }); return { ok: true }; },
+      installUpdate: async () => { calls.push('installUpdate'); return { ok: true }; },
       quit: async () => { calls.push('quit'); return { ok: true }; },
       openLogs: async () => ({ ok: true }),
       restoreExisting: async () => { calls.push('restore'); update({ state: 'starting', canWrite: false, reason: '正在连接本机服务…' }); return { ok: true }; },
@@ -69,6 +72,21 @@ test('native startup preference defaults on, persists on change, and fits the se
   expect(await page.evaluate(() => (window as unknown as { nativeCalls: string[] }).nativeCalls)).toEqual(['preferences:false:false:tray']);
   expect(await page.evaluate(() => ({ outer: document.documentElement.scrollHeight > innerHeight, settings: document.querySelector('.application-settings')!.scrollHeight > document.querySelector('.application-settings')!.clientHeight }))).toEqual({ outer: false, settings: false });
   await page.screenshot({ path: 'artifacts/launch-preference-1024.png' });
+});
+
+test('desktop update is checked, downloaded and installed only after a user action', async ({ page }) => {
+  await page.setViewportSize({ width: 1024, height: 680 });
+  await fixture(page, { ...ready, shellVersion: '0.3.2', update: { phase: 'idle' } });
+  await page.getByRole('button', { name: '设置', exact: true }).click();
+  await page.getByRole('button', { name: '应用与运行', exact: true }).click();
+  await page.getByRole('button', { name: '检查更新' }).click();
+  await expect(page.getByText('发现新版本 0.3.3')).toBeVisible();
+  await page.getByRole('button', { name: '下载更新' }).click();
+  await expect(page.getByText('新版本 0.3.3 已下载，等待安装')).toBeVisible();
+  expect(await page.evaluate(() => (window as unknown as { nativeCalls: string[] }).nativeCalls)).toEqual(['checkForUpdates', 'downloadUpdate']);
+  await page.getByRole('button', { name: '安装并重启' }).click();
+  expect(await page.evaluate(() => (window as unknown as { nativeCalls: string[] }).nativeCalls)).toEqual(['checkForUpdates', 'downloadUpdate', 'installUpdate']);
+  expect(await page.evaluate(() => document.querySelector('.application-settings')!.scrollHeight > document.querySelector('.application-settings')!.clientHeight)).toBe(false);
 });
 
 test('retained data offers recovery and never hides all actions behind an old migration result', async ({ page }) => {

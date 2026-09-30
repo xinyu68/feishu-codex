@@ -3,6 +3,10 @@ productName: Feishu Codex
 copyright: Copyright © 2026 xinyu68
 directories:
   output: release
+publish:
+  provider: github
+  owner: xinyu68
+  repo: feishu-codex
 files:
   - desktop/**
   - package.json

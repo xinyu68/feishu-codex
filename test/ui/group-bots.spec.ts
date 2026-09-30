@@ -47,7 +47,7 @@ async function setup(page: Page, state = fixture(), url = '/') {
       body = { source: 'codex', threadId: conversation?.threadId, messages: conversation ? [{ id: `message-${conversation.threadId}`, role: 'assistant', text: `${conversation.botName}的独立历史` }] : [] };
     }
     if (url.pathname === '/api/bots' && method === 'POST') {
-      const bot: BotProfile = { id: 'tester', name: String(input.name), appId: String(input.appId), hasSecret: true, enabled: true, allowedActors: [], allowedGroups: [], roleInstructions: String(input.roleInstructions || ''), model: '', effort: '', connection: { status: 'connected' } };
+      const bot: BotProfile = { id: 'tester', name: String(input.name), engine: input.engine === 'hermes' ? 'hermes' : 'codex', appId: String(input.appId), hasSecret: true, enabled: true, allowedActors: [], allowedGroups: [], roleInstructions: String(input.roleInstructions || ''), model: '', effort: '', connection: { status: 'connected' } };
       state.bots!.push(bot); body = { bot };
     }
     if (url.pathname.startsWith('/api/bots/')) {
@@ -55,8 +55,24 @@ async function setup(page: Page, state = fixture(), url = '/') {
       const bot = state.bots!.find(item => item.id === id)!;
       if (operation === 'credentials') { bot.appId = String(input.appId); bot.hasSecret = true; bot.enabled = true; bot.connection.status = 'connected'; }
       if (operation === 'connection') { bot.enabled = Boolean(input.enabled); bot.connection.status = bot.enabled ? 'connected' : 'stopped'; }
-      if (method === 'PATCH') Object.assign(bot, input);
-      if (method === 'DELETE') state.bots = state.bots!.filter(item => item.id !== id);
+      if (method === 'PATCH') {
+        if (input.engine && input.engine !== (bot.engine || 'codex')) {
+          for (const conversation of state.conversations.filter(item => item.botId === id)) {
+            conversation.threadId = undefined; conversation.title = '新会话'; conversation.preview = '';
+          }
+          bot.model = ''; bot.effort = '';
+          if (input.engine === 'hermes' && state.config.desktopNotificationTarget?.botAppId === bot.appId) state.config.desktopNotificationTarget = null;
+        }
+        Object.assign(bot, input);
+      }
+      if (method === 'DELETE') {
+        state.bots = state.bots!.filter(item => item.id !== id);
+        state.conversations = state.conversations.filter(item => item.chatId === 'local-preview' || (item.botId || 'default') !== id);
+        state.pendingActors = state.pendingActors.filter(item => (item.botId || 'default') !== id);
+        state.pendingGroups = state.pendingGroups!.filter(item => item.botId !== id);
+        state.notificationTargets = state.notificationTargets?.filter(item => item.botId !== id);
+        if (state.config.desktopNotificationTarget?.botAppId === bot.appId) state.config.desktopNotificationTarget = null;
+      }
       body = { bot };
     }
     if (url.pathname === '/api/actors') {
@@ -97,7 +113,7 @@ test('adding a bot only submits after explicit confirmation and starts with acce
   await page.getByRole('button', { name: '修改凭据', exact: true }).click();
   await expect(page.getByRole('textbox', { name: 'App ID', exact: true })).toHaveValue('cli_tester');
   await expect(page.locator('input[type=password]:visible')).toHaveValue('');
-  expect(writes).toEqual([{ path: '/api/bots', method: 'POST', body: { name: '测试', appId: 'cli_tester', appSecret: 'fixture-secret' } }]);
+  expect(writes).toEqual([{ path: '/api/bots', method: 'POST', body: { name: '测试', engine: 'codex', appId: 'cli_tester', appSecret: 'fixture-secret' } }]);
 });
 
 test('group and actor authorization are separate and scoped to the selected bot', async ({ page }) => {
@@ -165,18 +181,78 @@ test('an additional bot requires a matching secret when changing its app and onl
   ]);
 });
 
-test('removing an extra bot requires confirmation and the default bot has no remove action', async ({ page }) => {
+test('deletion is available on the conversation tab and cancel or escape never delete a bot', async ({ page }) => {
   const { writes } = await setup(page);
   await page.getByRole('button', { name: '机器人', exact: true }).click();
-  await page.getByRole('tab', { name: '连接设置', exact: true }).click();
-  await expect(page.getByRole('button', { name: '移除这个机器人' })).not.toBeVisible();
+  await expect(page.getByRole('button', { name: '删除机器人', exact: true })).toBeVisible();
   await page.getByRole('button', { name: '管理产品经理', exact: true }).click();
-  await page.getByRole('tab', { name: '连接设置', exact: true }).click();
-  await page.getByRole('button', { name: '移除这个机器人' }).click();
+  const remove = page.getByRole('button', { name: '删除机器人', exact: true });
+  const dialog = page.getByRole('alertdialog', { name: '删除「产品经理」？' });
+  await remove.click();
+  await expect(dialog.getByRole('button', { name: '取消', exact: true })).toBeFocused();
+  await expect(dialog).toContainText('会话历史保留');
+  await page.screenshot({ path: test.info().outputPath('delete-confirmation.png') });
+  await dialog.getByRole('button', { name: '取消', exact: true }).click();
+  await expect(dialog).not.toBeVisible();
+  await expect(remove).toBeFocused();
+  await remove.click();
+  await page.keyboard.press('Escape');
+  await expect(dialog).not.toBeVisible();
   expect(writes).toEqual([]);
-  await page.getByRole('button', { name: '确认移除', exact: true }).click();
+  await remove.click();
+  await dialog.getByRole('button', { name: '确认删除', exact: true }).click();
   await expect(page.getByRole('button', { name: '管理产品经理', exact: true })).toHaveCount(0);
   await expect(page.getByRole('button', { name: '管理开发', exact: true })).toBeVisible();
+  expect(writes).toEqual([{ path: '/api/bots/product', method: 'DELETE', body: {} }]);
+});
+
+test('deleting the first and last bots clears the default target and shows an addable empty state', async ({ page }) => {
+  const state = fixture();
+  state.config.desktopNotificationTarget = { botAppId: 'cli_default', chatId: 'oc_private', actorId: 'ou_default' };
+  await setup(page, state);
+  await page.getByRole('button', { name: '机器人', exact: true }).click();
+  await page.getByRole('button', { name: '删除机器人', exact: true }).click();
+  let dialog = page.getByRole('alertdialog', { name: '删除「开发」？' });
+  await expect(dialog).toContainText('删除后需重新设置通知接收位置');
+  await dialog.getByRole('button', { name: '确认删除', exact: true }).click();
+  await expect(page.getByRole('button', { name: '管理开发', exact: true })).toHaveCount(0);
+  await expect(page.getByRole('heading', { name: '产品经理', exact: true })).toBeVisible();
+  expect(state.config.desktopNotificationTarget).toBeNull();
+  await page.getByRole('button', { name: '删除机器人', exact: true }).click();
+  dialog = page.getByRole('alertdialog', { name: '删除「产品经理」？' });
+  await dialog.getByRole('button', { name: '确认删除', exact: true }).click();
+  await expect(page.getByRole('heading', { name: '还没有机器人', exact: true })).toBeVisible();
+  await page.reload();
+  await page.getByRole('button', { name: '机器人', exact: true }).click();
+  await expect(page.getByRole('heading', { name: '还没有机器人', exact: true })).toBeVisible();
+  await page.getByRole('button', { name: '添加机器人', exact: true }).click();
+  const adding = page.getByRole('dialog', { name: '添加机器人' });
+  await adding.getByRole('textbox', { name: '机器人名称' }).fill('新机器人');
+  await adding.getByRole('textbox', { name: 'App ID', exact: true }).fill('cli_new');
+  await adding.locator('input[type=password]').fill('fixture-secret');
+  await adding.getByRole('button', { name: '验证并添加' }).click();
+  await expect(page.getByRole('button', { name: '管理新机器人', exact: true })).toBeVisible();
+  await expect(page.getByRole('heading', { name: '还没有机器人', exact: true })).not.toBeVisible();
+});
+
+test('busy deletion errors remain reviewable and a subsequent retry can remove the bot', async ({ page }) => {
+  const { writes } = await setup(page);
+  let reject = true;
+  await page.route('**/api/bots/product', async route => {
+    if (route.request().method() === 'DELETE' && reject) {
+      reject = false;
+      await route.fulfill({ status: 409, json: { error: '这个机器人还有任务正在运行，请结束后再删除。' } });
+    } else await route.fallback();
+  });
+  await page.getByRole('button', { name: '机器人', exact: true }).click();
+  await page.getByRole('button', { name: '管理产品经理', exact: true }).click();
+  await page.getByRole('button', { name: '删除机器人', exact: true }).click();
+  const dialog = page.getByRole('alertdialog', { name: '删除「产品经理」？' });
+  await dialog.getByRole('button', { name: '确认删除', exact: true }).click();
+  await expect(dialog.getByRole('alert')).toContainText('还有任务正在运行');
+  await expect(page.getByRole('button', { name: '管理产品经理', exact: true })).toBeVisible();
+  await dialog.getByRole('button', { name: '确认删除', exact: true }).click();
+  await expect(page.getByRole('button', { name: '管理产品经理', exact: true })).toHaveCount(0);
   expect(writes).toEqual([{ path: '/api/bots/product', method: 'DELETE', body: {} }]);
 });
 
@@ -560,4 +636,117 @@ test('explicit verification reconnects saved credentials while untouched blur st
   expect(writes).toEqual([{ path: '/api/bots/product/credentials', method: 'POST', body: { appId: 'cli_product' } }]);
   expect(state.bots![1].enabled).toBe(true);
   expect(state.bots![0].appId).toBe('cli_default');
+});
+test('adding a Hermes bot sends the selected AI and shows Hermes conversation controls', async ({ page }) => {
+  const { state, writes } = await setup(page);
+  await page.getByRole('button', { name: '机器人', exact: true }).click();
+  await page.getByRole('button', { name: '添加机器人', exact: true }).click();
+  const dialog = page.getByRole('dialog', { name: '添加机器人' });
+  const selector = dialog.getByRole('combobox', { name: '处理对话的 AI' });
+  await expect(selector).toHaveValue('codex');
+  await selector.selectOption('hermes');
+  await expect(dialog).toContainText('请先打开本机 Hermes');
+  await dialog.getByRole('textbox', { name: '机器人名称' }).fill('Hermes 产品');
+  await dialog.getByRole('textbox', { name: 'App ID', exact: true }).fill('cli_hermes');
+  await dialog.locator('input[type=password]').fill('fixture-secret');
+  expect(writes).toEqual([]);
+  await page.screenshot({ path: test.info().outputPath('add-hermes.png') });
+  await dialog.getByRole('button', { name: '验证并添加', exact: true }).click();
+  await expect(page.getByRole('button', { name: '管理Hermes 产品', exact: true })).toBeVisible();
+  await page.getByRole('tab', { name: '对话设置', exact: true }).click();
+  await expect(page.getByRole('combobox', { name: '处理对话的 AI' })).toHaveValue('hermes');
+  await expect(page.getByRole('combobox', { name: '机器人模型' })).toHaveCount(0);
+  await expect(page.getByRole('textbox', { name: '群聊角色说明' })).toBeVisible();
+  await expect(page.getByRole('region', { name: '默认通知机器人' })).toHaveCount(0);
+  expect(writes).toEqual([{ path: '/api/bots', method: 'POST', body: { name: 'Hermes 产品', engine: 'hermes', appId: 'cli_hermes', appSecret: 'fixture-secret' } }]);
+  expect(state.bots!.find(bot => bot.id === 'default')!.engine).toBeUndefined();
+});
+
+test('switching AI is explicit, cancel restores focus, and switching both ways keeps other bots unchanged', async ({ page }) => {
+  const state = fixture();
+  state.config.desktopNotificationTarget = { botAppId: 'cli_product', chatId: 'oc_product', actorId: 'ou_product' };
+  const { writes } = await setup(page, state);
+  await page.getByRole('button', { name: '机器人', exact: true }).click();
+  await page.getByRole('button', { name: '管理产品经理', exact: true }).click();
+  const selector = page.getByRole('combobox', { name: '处理对话的 AI' });
+  await selector.selectOption('hermes');
+  let dialog = page.getByRole('alertdialog', { name: '切换到 Hermes？' });
+  await expect(dialog.getByRole('button', { name: '取消', exact: true })).toBeFocused();
+  await expect(dialog).toContainText('私聊和群聊将从新的 Hermes 会话开始');
+  await expect(dialog).toContainText('需重新选择 Codex 桌面通知');
+  await expect(page.getByRole('textbox', { name: '群聊角色说明' })).toBeDisabled();
+  await page.keyboard.press('Escape');
+  await expect(dialog).not.toBeVisible();
+  await expect(selector).toBeFocused();
+  await expect(selector).toHaveValue('codex');
+  expect(writes).toEqual([]);
+  await selector.selectOption('hermes');
+  await dialog.getByRole('button', { name: '确认切换', exact: true }).click();
+  await expect(dialog).not.toBeVisible();
+  await expect(selector).toHaveValue('hermes');
+  await expect(page.getByRole('combobox', { name: '机器人模型' })).toHaveCount(0);
+  expect(state.config.desktopNotificationTarget).toBeNull();
+  expect(state.conversations.find(item => item.botId === 'product')!.threadId).toBeUndefined();
+  expect(state.conversations.find(item => item.botId === 'default')!.threadId).toBe('thread-development');
+  await page.screenshot({ path: test.info().outputPath('hermes-settings.png') });
+  await selector.selectOption('codex');
+  dialog = page.getByRole('alertdialog', { name: '切换到 Codex？' });
+  await dialog.getByRole('button', { name: '确认切换', exact: true }).click();
+  await expect(dialog).not.toBeVisible();
+  await expect(selector).toHaveValue('codex');
+  await expect(page.getByRole('combobox', { name: '机器人模型' })).toBeVisible();
+  expect(writes).toEqual([
+    { path: '/api/bots/product', method: 'PATCH', body: { engine: 'hermes' } },
+    { path: '/api/bots/product', method: 'PATCH', body: { engine: 'codex' } },
+  ]);
+});
+
+test('unavailable Hermes leaves the old selection and binding and allows retry after startup', async ({ page }) => {
+  const { state } = await setup(page);
+  let unavailable = true;
+  await page.route('**/api/bots/product', async route => {
+    if (route.request().method() === 'PATCH' && unavailable) {
+      unavailable = false;
+      await route.fulfill({ status: 503, json: { error: 'Hermes 尚未启动，请先打开 Hermes。' } });
+    } else await route.fallback();
+  });
+  await page.getByRole('button', { name: '机器人', exact: true }).click();
+  await page.getByRole('button', { name: '管理产品经理', exact: true }).click();
+  const selector = page.getByRole('combobox', { name: '处理对话的 AI' });
+  await selector.selectOption('hermes');
+  const dialog = page.getByRole('alertdialog', { name: '切换到 Hermes？' });
+  await dialog.getByRole('button', { name: '确认切换', exact: true }).click();
+  await expect(dialog.getByRole('alert')).toContainText('Hermes 尚未启动');
+  await expect(selector).toHaveValue('codex');
+  expect(state.conversations.find(item => item.botId === 'product')!.threadId).toBe('thread-product');
+  await dialog.getByRole('button', { name: '确认切换', exact: true }).click();
+  await expect(dialog).not.toBeVisible();
+  await expect(selector).toHaveValue('hermes');
+});
+
+test('a rejected Hermes creation keeps its credentials and selected AI for retry', async ({ page }) => {
+  const { state, writes } = await setup(page);
+  let unavailable = true;
+  await page.route('**/api/bots', async route => {
+    if (route.request().method() === 'POST' && unavailable) {
+      unavailable = false;
+      await route.fulfill({ status: 503, json: { error: '请先打开本机 Hermes，再重试。' } });
+    } else await route.fallback();
+  });
+  await page.getByRole('button', { name: '机器人', exact: true }).click();
+  await page.getByRole('button', { name: '添加机器人', exact: true }).click();
+  const dialog = page.getByRole('dialog', { name: '添加机器人' });
+  await dialog.getByRole('combobox', { name: '处理对话的 AI' }).selectOption('hermes');
+  await dialog.getByRole('textbox', { name: '机器人名称' }).fill('Hermes 测试');
+  await dialog.getByRole('textbox', { name: 'App ID', exact: true }).fill('cli_hermes');
+  await dialog.locator('input[type=password]').fill('fixture-secret');
+  await dialog.getByRole('button', { name: '验证并添加', exact: true }).click();
+  await expect(dialog.getByRole('alert')).toContainText('打开本机 Hermes');
+  await expect(dialog.getByRole('combobox', { name: '处理对话的 AI' })).toHaveValue('hermes');
+  await expect(dialog.locator('input[type=password]')).toHaveValue('fixture-secret');
+  expect(state.bots!.length).toBe(2);
+  await dialog.getByRole('button', { name: '验证并添加', exact: true }).click();
+  await expect(dialog).not.toBeVisible();
+  expect(writes.length).toBe(1);
+  expect(state.bots!.at(-1)!.engine).toBe('hermes');
 });

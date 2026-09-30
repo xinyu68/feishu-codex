@@ -35,13 +35,13 @@ npm run dev:ui
 npm run package:win
 ```
 
-产物：`release/Feishu-Codex-<版本>-Setup.exe`。
+产物：`release/Feishu-Codex-<版本>-Setup.exe`、对应 `.blockmap` 和 `latest.yml`。应用通过 GitHub Release 检查、下载更新；三者必须来自同一次构建。
 
 构建先生成 `build/server` 和 `build/ui`，随后在 `.desktop-package` 准备生产依赖与 Node.js 运行时，再用 electron-builder / NSIS 打包。`afterPack` 会检查依赖文件完整性，并用随包 Node 加载服务入口。
 
 Node.js 运行时来自当前构建机的 `node.exe`；安装包必须在 Windows x64 下构建。依赖和 Node.js 许可证下载需要联网。当前安装包未配置代码签名证书。
 
-GitHub Actions 中的 **Build Windows installer** 支持手动构建，成功后生成带 SHA-256 校验文件的下载产物；它不会自动创建 Release 或发布版本。
+GitHub Actions 中的 **Build Windows installer** 支持手动构建并保留构建产物；发布与 `package.json` 版本一致的 GitHub Release 时，会构建并将安装包、`.blockmap`、`latest.yml` 和 SHA-256 校验文件附加到该 Release。不要只上传安装包，否则已安装应用无法发现更新。发布后用上一版安装包验证“检查 → 下载 → 安全退出 → 安装 → 保留配置”的完整路径。当前安装包未配置代码签名证书，公开分发前应补上签名。
 
 ## 自动检查
 

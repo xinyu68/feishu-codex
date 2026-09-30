@@ -1,12 +1,25 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { buildGroupHandoffGuidance, canContinueGroupHandoff, MAX_GROUP_HANDOFFS, parseGroupHandoff } from '../src/group-handoff.js';
+import { buildGroupHandoffGuidance, canContinueGroupHandoff, MAX_GROUP_HANDOFFS, parseGroupHandoff, resolveGroupHandoffRequest } from '../src/group-handoff.js';
+import { validateGroupHandoffRequest } from '../src/group-handoff-request.js';
 
 const candidates = [
   { id: 'product', name: '产品经理', aliases: ['Codex-产品'] },
   { id: 'developer', name: '开发人员', aliases: ['Codex-开发', '开发'] },
   { id: 'qa', name: '测试人员', aliases: ['测试'] },
 ];
+
+test('guidance exposes stable role IDs only when names need disambiguation', () => {
+  assert.doesNotMatch(buildGroupHandoffGuidance(candidates, 'product'), /角色编号/);
+  const ambiguous = [candidates[0]!, { id: 'dev-a', name: '开发' }, { id: 'dev-b', name: '开发' }];
+  const guidance = buildGroupHandoffGuidance(ambiguous, 'product');
+  assert.match(guidance, /角色编号/);
+  assert.ok(guidance.includes('"id":"dev-a"'));
+  assert.ok(guidance.includes('"id":"dev-b"'));
+  assert.ok(!guidance.includes('"id":"product"'));
+  assert.match(buildGroupHandoffGuidance([candidates[0]!, { id: 'qa', name: '测试：验收' }], 'product'), /角色编号/);
+  assert.match(buildGroupHandoffGuidance([candidates[0]!, { id: 'dev', name: '产品经理' }], 'product'), /角色编号/);
+});
 
 test('final standalone handoff resolves an exact role, alias or id and preserves task and line', () => {
   for (const name of ['开发人员', 'Codex-开发', 'developer']) {
@@ -168,4 +181,56 @@ test('repeated recipients still require the last non-empty line to be an actiona
     const result = parseGroupHandoff(`交接给 @开发：按方案开发。\n${ending}`, candidates, 'product');
     assert.deepEqual(result, { kind: 'none' });
   }
+});
+
+test('structured handoff validation rejects routing fields and invalid or oversized payloads', () => {
+  assert.deepEqual(validateGroupHandoffRequest({ target: ' 开发人员 ', task: ' 第一行\n第二行？ ' }), {
+    target: '开发人员', task: '第一行\n第二行？',
+  });
+  assert.deepEqual(validateGroupHandoffRequest({ target: '甲'.repeat(100), task: '😀'.repeat(6000) }), {
+    target: '甲'.repeat(100), task: '😀'.repeat(6000),
+  });
+  for (const value of [null, undefined, [], 'developer', 1, {}, { target: 'developer' }, { task: '检查' },
+    { target: 1, task: '检查' }, { target: 'developer', task: false },
+    { target: ' \t\n', task: '检查' }, { target: 'developer', task: '\n \t' },
+    { target: '甲'.repeat(101), task: '检查' }, { target: 'developer', task: '文'.repeat(6001) },
+    Object.create({ target: 'developer', task: '检查' }),
+  ]) assert.throws(() => validateGroupHandoffRequest(value));
+  for (const field of ['chatId', 'threadId', 'turnId', 'actorId', 'botId', 'groupId', 'chainId', 'localOnly', '__proto__']) {
+    const value = JSON.parse(`{"target":"developer","task":"检查","${field}":"untrusted"}`);
+    assert.throws(() => validateGroupHandoffRequest(value), /only contain target and task/, field);
+  }
+});
+
+test('structured requests resolve exact names ids and aliases while preserving questions and multiline tasks', () => {
+  const task = '请核查下面的问题：\n为什么 user@example.com 校验失败？\n参考 @测试 的公开结论，不要修改代码。';
+  for (const target of [' 开发人员 ', 'developer', 'Codex-开发', '开发']) {
+    const result = resolveGroupHandoffRequest({ target, task: ` ${task}\n` }, candidates, 'product');
+    assert.equal(result.kind, 'handoff', target);
+    if (result.kind === 'handoff') {
+      assert.equal(result.targetBotId, 'developer');
+      assert.equal(result.instruction, task);
+    }
+  }
+  assert.equal(resolveGroupHandoffRequest({ target: 'developer', task: '不要执行代码，只回答问题？' }, candidates, 'product').kind, 'handoff');
+});
+
+test('structured recipient lookup fails closed for unknown ambiguous and self targets', () => {
+  for (const [target, reason] of [
+    ['陌生人', 'unknown_target'], ['Codex', 'unknown_target'], ['developer,qa', 'unknown_target'],
+    ['开发 @测试', 'unknown_target'], ['产品经理', 'self_target'], ['product', 'self_target'],
+  ] as const) {
+    const result = resolveGroupHandoffRequest({ target, task: '检查' }, candidates, 'product');
+    assert.equal(result.kind, 'invalid', target);
+    if (result.kind === 'invalid') assert.equal(result.reason, reason, target);
+  }
+  for (const extra of [{ id: 'other', name: '开发' }, { id: 'other', name: 'developer' }, { id: 'other', name: '另一个角色', aliases: ['开发人员'] }]) {
+    const target = extra.aliases?.[0] ?? extra.name;
+    const result = resolveGroupHandoffRequest({ target, task: '检查' }, [...candidates, extra], 'product');
+    assert.equal(result.kind, 'invalid');
+    if (result.kind === 'invalid') assert.equal(result.reason, 'ambiguous_target');
+  }
+  const duplicateAlias = resolveGroupHandoffRequest({ target: '开发', task: '检查' }, [...candidates, { id: 'developer', name: '开发' }], 'product');
+  assert.equal(duplicateAlias.kind, 'handoff');
+  assert.throws(() => resolveGroupHandoffRequest({ target: 'developer', task: '检查', chatId: 'oc_other' }, candidates, 'product'), /only contain target and task/);
 });

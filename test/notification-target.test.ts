@@ -22,7 +22,7 @@ async function settle() {
 
 function fixture(t: test.TestContext) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'notification-target-'));
-  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  t.after(() => { assert.equal(path.dirname(dir), os.tmpdir()); assert.ok(path.basename(dir).startsWith('notification-target-')); fs.rmSync(dir, { recursive: true, force: true }); });
   const store = new Store(dir);
   store.saveConfig({ appId: appA, appSecret: 'fixture-a', allowedActors: ['ou_a'], defaultWorkspace: dir,
     autoNotifyDesktop: true, desktopNotificationMode: 'long', desktopNotificationMinMinutes: 1, desktopNotificationTarget: null });
@@ -127,7 +127,7 @@ test('revoked and App-ID-stale explicit defaults never fall back to the remainin
   }
 });
 
-test('changing the default only affects subsequent turns and clearing restores the unique-private-chat policy', async t => {
+test('changing the default only affects subsequent turns and explicit clearing does not select the remaining bot', async t => {
   const fx = fixture(t); fx.store.saveConfig({ desktopNotificationTarget: targetB });
   fx.emit('turn/started', 'pinned'); await settle();
   assert.equal(Object.values(fx.store.state.notifications)[0]!.chatId, chatB);
@@ -137,8 +137,35 @@ test('changing the default only affects subsequent turns and clearing restores t
   fx.store.authorize('ou_a', false);
   fx.store.saveConfig({ desktopNotificationTarget: null });
   fx.complete('cleared'); await settle();
-  assert.equal(fx.cards[2]!.botId, 'reviewer');
+  assert.equal(fx.cards.length, 2);
+  assert.equal(Object.values(fx.store.state.notifications).some(item => item.turnId === 'cleared'), false);
   assert.equal(new Store(fx.dir).config.desktopNotificationTarget, null);
+});
+
+test('deleting the default notification robot cancels pending notices and never retargets unbound desktop completions', async t => {
+  const fx = fixture(t); fx.store.saveConfig({ desktopNotificationTarget: targetB });
+  fx.emit('turn/started', 'before-delete'); await settle();
+  assert.equal(Object.values(fx.store.state.notifications).length, 1);
+  // The task itself is an unbound desktop task; removing its idle notification bot must not stop Codex.
+  await fx.bridge.removeBot('reviewer', async () => { fx.transport.delete('reviewer'); });
+  assert.equal(fx.store.config.desktopNotificationTarget, null);
+  assert.equal(fx.store.notificationTargets().length, 1);
+  fx.complete('before-delete'); fx.complete('after-delete'); await settle();
+  assert.deepEqual(fx.cards, []);
+  assert.equal(Object.values(fx.store.state.notifications)[0]!.status, 'cancelled');
+  assert.equal(Object.values(fx.store.state.notifications).length, 1);
+});
+
+test('deleting a notification recipient during task metadata lookup cannot recreate a pending notice', async t => {
+  const fx = fixture(t); fx.store.saveConfig({ desktopNotificationTarget: targetB });
+  let release!: () => void; const held = new Promise<void>(resolve => { release = resolve; });
+  let entered!: () => void; const started = new Promise<void>(resolve => { entered = resolve; });
+  fx.runtime.threadInfo = async threadId => { entered(); await held; return { threadId, cwd: fx.dir, title: 'Slow metadata', isUserThread: true }; };
+  fx.emit('turn/started', 'slow'); await started;
+  try { await fx.bridge.removeBot('reviewer', async () => { fx.transport.delete('reviewer'); }); }
+  finally { release(); }
+  await settle(); fx.complete('slow'); await settle();
+  assert.deepEqual(fx.cards, []); assert.deepEqual(fx.store.state.notifications, {});
 });
 
 test('revoking access, replacing the selected app or changing chat type after registration never redirects a notice', async t => {

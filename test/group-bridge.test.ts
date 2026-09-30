@@ -8,6 +8,7 @@ import { Bridge } from '../src/bridge.js';
 import { Store } from '../src/store.js';
 import { conversationKey, namespaceMessage, parseRoute } from '../src/routing.js';
 import { cleanBridgeText } from '../src/discovery.js';
+import { parseMessageEvent } from '../src/feishu.js';
 import type { CodexRunInput, CodexRuntime, InboundMessage, MessageCard, RuntimeEvent } from '../src/types.js';
 
 const tick = () => new Promise<void>(resolve => setImmediate(resolve));
@@ -116,6 +117,75 @@ test('each role has an independent /new and may not bind another role current or
   assert.equal(h.store.conversation('oc_team').threadId, undefined);
   assert.equal(h.store.conversation(devKey).threadId, devThread);
   await assert.rejects(h.bridge.bind(devKey, h.dir, pmThread), /独立会话/);
+});
+
+test('one multi-mention /new resets both bot conversations without starting a model turn', async t => {
+  const h = setup(t);
+  h.store.authorize('pm-user', true, 'dev');
+  await h.send('default', 'product work');
+  await h.send('dev', 'development work', { actorId: 'pm-user' });
+  assert.ok(h.store.conversation('oc_team').threadId);
+  const devKey = conversationKey('dev', 'oc_team');
+  assert.ok(h.store.conversation(devKey).threadId);
+  const runsBefore = h.runs.length;
+  const event = {
+    sender: { sender_type: 'user', sender_id: { open_id: 'pm-user' } },
+    message: {
+      message_id: 'om_reset_both', chat_id: 'oc_team', chat_type: 'group', message_type: 'text',
+      content: JSON.stringify({ text: '@_user_1 @_user_2 /new' }),
+      mentions: [
+        { key: '@_user_1', id: { open_id: 'ou_pm_bot' }, name: '产品经理' },
+        { key: '@_user_2', id: { open_id: 'ou_dev_bot' }, name: '开发人员' },
+      ],
+    },
+  };
+  const product = parseMessageEvent(event, { botOpenId: 'ou_pm_bot' });
+  const development = parseMessageEvent(event, { botOpenId: 'ou_dev_bot' });
+  assert.ok(product && development);
+  await Promise.all([
+    h.bridge.receive(namespaceMessage('default', product.message)),
+    h.bridge.receive(namespaceMessage('dev', development.message)),
+  ]);
+  assert.equal(h.store.conversation('oc_team').threadId, undefined);
+  assert.equal(h.store.conversation(devKey).threadId, undefined);
+  assert.equal(h.runs.length, runsBefore);
+});
+
+test('multi-mention status, session and stop act on both bots independently', async t => {
+  const h = setup(t);
+  h.store.authorize('pm-user', true, 'dev');
+  await h.send('default', 'product work');
+  await h.send('dev', 'development work', { actorId: 'pm-user' });
+  const productThread = h.store.conversation('oc_team').threadId!;
+  const devKey = conversationKey('dev', 'oc_team');
+  const developerThread = h.store.conversation(devKey).threadId!;
+  const runsBefore = h.runs.length;
+  for (const command of ['status', 'session', 'stop']) {
+    const event = {
+      sender: { sender_type: 'user', sender_id: { open_id: 'pm-user' } },
+      message: {
+        message_id: `om_multi_${command}`, chat_id: 'oc_team', chat_type: 'group', message_type: 'text',
+        content: JSON.stringify({ text: `@_user_1 @_user_2 /${command}` }),
+        mentions: [
+          { key: '@_user_1', id: { open_id: 'ou_pm_bot' }, name: '产品经理' },
+          { key: '@_user_2', id: { open_id: 'ou_dev_bot' }, name: '开发人员' },
+        ],
+      },
+    };
+    const product = parseMessageEvent(event, { botOpenId: 'ou_pm_bot' });
+    const development = parseMessageEvent(event, { botOpenId: 'ou_dev_bot' });
+    assert.ok(product && development);
+    const repliesBefore = h.sent.length;
+    await Promise.all([
+      h.bridge.receive(namespaceMessage('default', product.message)),
+      h.bridge.receive(namespaceMessage('dev', development.message)),
+    ]);
+    assert.deepEqual(h.sent.slice(repliesBefore).map(item => item.chatId).sort(), ['oc_team', devKey].sort());
+  }
+  assert.equal(h.runs.length, runsBefore);
+  assert.deepEqual(h.stopped.sort(), [productThread, developerThread].sort());
+  assert.equal(h.store.conversation('oc_team').threadId, productThread);
+  assert.equal(h.store.conversation(devKey).threadId, developerThread);
 });
 
 test('changing group project synchronizes all roles and excludes old-project context', async t => {
@@ -434,4 +504,216 @@ test('private entry cannot rebind or replace a group thread role', async t => {
   await assert.rejects(h.bridge.bind('oc_private', h.dir, threadId), /独立会话/);
   await h.send('default', 'Continue group request');
   assert.equal(h.runs[1]!.roleInstructions, role);
+});
+
+test('/new excludes old group background while another bot keeps its independent context', async t => {
+  const h = setup(t);
+  h.store.observeGroup(h.message('default', 'OLD-PUBLIC-BACKGROUND'));
+  await h.send('default', 'OLD-PRODUCT-TASK');
+  const oldThread = h.store.conversation('oc_team').threadId;
+  await h.send('default', '/new');
+  const boundary = h.store.conversation('oc_team').groupContextBoundary!;
+  assert.ok(boundary);
+  assert.ok(h.sent.at(-1)!.card.text.includes('此前的群聊背景不再自动带入'));
+  h.store.observeGroup(h.message('default', 'FRESH-PUBLIC-BACKGROUND'));
+  await h.send('default', 'Start fresh');
+  assert.doesNotMatch(h.runs.at(-1)!.prompt, /OLD-PUBLIC|OLD-PRODUCT|验证码五分钟/);
+  assert.match(h.runs.at(-1)!.prompt, /FRESH-PUBLIC-BACKGROUND/);
+  assert.match(h.runs.at(-1)!.roleInstructions!, /澄清需求/);
+  assert.notEqual(h.store.conversation('oc_team').threadId, oldThread);
+  assert.deepEqual(h.store.state.threadBindings[h.store.conversation('oc_team').threadId!]!.groupContextBoundary, boundary);
+  await h.send('dev', 'Continue developer');
+  assert.match(h.runs.at(-1)!.prompt, /OLD-PUBLIC-BACKGROUND/);
+  assert.equal(h.store.conversation(conversationKey('dev', 'oc_team')).groupContextBoundary, undefined);
+  assert.ok(h.store.state.groupMessages.oc_team!.some(item => item.text === 'OLD-PUBLIC-BACKGROUND'));
+  await h.send('dev', '/new');
+  await h.send('dev', 'Start fresh developer');
+  assert.doesNotMatch(h.runs.at(-1)!.prompt, /OLD-PUBLIC|OLD-PRODUCT|FRESH-PUBLIC|Start fresh\n/);
+});
+
+test('management switching resumes native threads with new background boundaries that survive restart', async t => {
+  const h = setup(t);
+  await h.send('default', 'Original conversation');
+  const original = h.store.conversation('oc_team').threadId!;
+  const originalRole = h.store.state.threadBindings[original]!.roleInstructions;
+  h.store.observeGroup(h.message('default', 'PENDING-BEFORE-RESET'));
+  await h.bridge.newConversation('oc_team');
+  const boundary = h.store.conversation('oc_team').groupContextBoundary!;
+  await h.send('default', 'Reset conversation');
+  const fresh = h.store.conversation('oc_team').threadId!;
+  assert.doesNotMatch(h.runs.at(-1)!.prompt, /PENDING-BEFORE-RESET/);
+  const restored = new Store(h.dir);
+  assert.deepEqual(restored.conversation('oc_team').groupContextBoundary, boundary);
+  assert.deepEqual(restored.state.threadBindings[fresh]!.groupContextBoundary, boundary);
+  await h.bridge.bind('oc_team', h.dir, original);
+  const originalBoundary = h.store.conversation('oc_team').groupContextBoundary!;
+  assert.ok(originalBoundary.afterSequence > boundary.afterSequence);
+  assert.deepEqual(h.store.state.threadBindings[original]!.groupContextBoundary, originalBoundary);
+  h.store.observeGroup(h.message('default', 'PUBLIC-AFTER-RETURN'));
+  await h.send('default', 'Continue original conversation');
+  assert.equal(h.runs.at(-1)!.threadId, original);
+  assert.equal(h.runs.at(-1)!.roleInstructions, originalRole);
+  assert.doesNotMatch(h.runs.at(-1)!.prompt, /PENDING-BEFORE-RESET|Reset conversation/);
+  assert.match(h.runs.at(-1)!.prompt, /PUBLIC-AFTER-RETURN/);
+  await h.bridge.bind('oc_team', h.dir, fresh);
+  const freshBoundary = h.store.conversation('oc_team').groupContextBoundary!;
+  assert.ok(freshBoundary.afterSequence > originalBoundary.afterSequence);
+  const restarted = new Store(h.dir);
+  assert.deepEqual(restarted.conversation('oc_team').groupContextBoundary, freshBoundary);
+  assert.deepEqual(restarted.state.threadBindings[fresh]!.groupContextBoundary, freshBoundary);
+  await h.send('default', 'Continue reset conversation');
+  assert.equal(h.runs.at(-1)!.threadId, fresh);
+  assert.doesNotMatch(h.runs.at(-1)!.prompt, /PENDING-BEFORE-RESET|PUBLIC-AFTER-RETURN|Continue original conversation/);
+});
+
+test('new-session retains an explicit quote without automatically restoring other old discussion', async t => {
+  const h = setup(t);
+  await h.send('default', 'Discuss old requirements');
+  const oldReply = h.sent.find(item => item.card.text.includes('五分钟'))!;
+  h.store.observeGroup(h.message('default', 'UNRELATED-OLD-BACKGROUND'));
+  await h.send('default', '/new');
+  await h.send('default', 'Use this particular specification', { replyTo: oldReply.id });
+  assert.match(h.runs.at(-1)!.prompt, /明确引用[\s\S]*验证码五分钟有效/);
+  assert.doesNotMatch(h.runs.at(-1)!.prompt, /UNRELATED-OLD-BACKGROUND|Discuss old requirements/);
+  await h.send('default', 'Continue');
+  assert.doesNotMatch(h.runs.at(-1)!.prompt, /UNRELATED-OLD-BACKGROUND|验证码五分钟有效/);
+});
+
+test('a delayed onThread from before /new cannot replace the new pending background boundary', async t => {
+  const h = setup(t);
+  const entered = deferred(), finish = deferred();
+  t.after(() => finish.resolve());
+  h.store.observeGroup(h.message('default', 'OLD-WHILE-CREATING'));
+  let index = 0;
+  h.runWith(async input => {
+    const current = ++index;
+    if (current === 1) { entered.resolve(); await finish.promise; }
+    const threadId = `delayed-${current}`;
+    input.onThread?.(threadId);
+    input.prompt = await input.preparePrompt?.(threadId) ?? input.prompt;
+    input.onSubmitted?.({ threadId, turnId: `turn-${current}`, mode: 'start', status: 'submitted' });
+    return { threadId, turnId: `turn-${current}`, text: 'Done' };
+  });
+  const previous = h.send('default', 'Start previous task');
+  await entered.promise;
+  await h.send('default', '/new');
+  const boundary = h.store.conversation('oc_team').groupContextBoundary!;
+  finish.resolve();
+  await previous;
+  assert.equal(h.store.conversation('oc_team').threadId, undefined);
+  assert.deepEqual(h.store.conversation('oc_team').groupContextBoundary, boundary);
+  assert.equal(h.store.state.threadBindings['delayed-1']!.groupContextBoundary, undefined);
+  await h.send('default', 'Start another task');
+  assert.match(h.runs[0]!.prompt, /OLD-WHILE-CREATING/);
+  assert.doesNotMatch(h.runs[1]!.prompt, /OLD-WHILE-CREATING|Start previous task/);
+  assert.deepEqual(h.store.state.threadBindings['delayed-2']!.groupContextBoundary, boundary);
+});
+
+test('/session selection skips discussion from the other session while retaining explicit quotes', async t => {
+  const h = setup(t);
+  await h.send('default', 'ORIGINAL-TASK');
+  const original = h.store.conversation('oc_team').threadId!;
+  await h.send('default', '/new');
+  await h.send('default', 'OTHER-SESSION-TASK');
+  const other = h.store.conversation('oc_team').threadId!;
+  const quote = h.message('default', 'SPECIFIC-OLD-SPECIFICATION');
+  h.store.observeGroup(quote);
+  h.store.observeGroup(h.message('default', 'UNRELATED-WHILE-AWAY'));
+  await h.send('default', `/session id ${original}`);
+  h.store.observeGroup(h.message('default', 'DISCUSSION-AFTER-SWITCH'));
+  await h.send('default', 'Continue with quoted requirements', { replyTo: quote.id });
+  assert.equal(h.runs.at(-1)!.threadId, original);
+  assert.match(h.runs.at(-1)!.prompt, /明确引用[\s\S]*SPECIFIC-OLD-SPECIFICATION/);
+  assert.match(h.runs.at(-1)!.prompt, /DISCUSSION-AFTER-SWITCH/);
+  assert.doesNotMatch(h.runs.at(-1)!.prompt, /OTHER-SESSION-TASK|UNRELATED-WHILE-AWAY/);
+  await h.send('default', 'Continue again');
+  assert.doesNotMatch(h.runs.at(-1)!.prompt, /SPECIFIC-OLD-SPECIFICATION|DISCUSSION-AFTER-SWITCH|UNRELATED-WHILE-AWAY/);
+  await h.send('default', `/session id ${other}`);
+  await h.send('default', 'Continue second session');
+  assert.equal(h.runs.at(-1)!.threadId, other);
+  assert.doesNotMatch(h.runs.at(-1)!.prompt, /Continue with quoted requirements|Continue again|UNRELATED-WHILE-AWAY/);
+});
+
+test('listing, reselecting and failed switches leave pending group background intact', async t => {
+  const h = setup(t);
+  await h.send('default', '/new');
+  await h.send('default', 'Current task');
+  const current = h.store.conversation('oc_team');
+  const threadId = current.threadId!;
+  const boundary = structuredClone(current.groupContextBoundary!);
+  h.store.observeGroup(h.message('default', 'PENDING-WITHOUT-A-SWITCH'));
+  await h.send('default', '/session');
+  await h.send('default', `/session id ${threadId}`);
+  await h.bridge.bind('oc_team', h.dir, threadId);
+  await h.send('default', '/session id missing-thread');
+  await assert.rejects(h.bridge.bind('oc_team', h.dir, 'missing-thread'), /群聊角色需要专属会话/);
+  await assert.rejects(h.bridge.bind('oc_team', h.dir, threadId, current.revision! - 1), /其他入口切换/);
+  assert.deepEqual(current.groupContextBoundary, boundary);
+  assert.deepEqual(h.store.state.threadBindings[threadId]!.groupContextBoundary, boundary);
+  await h.send('default', 'Continue current task');
+  assert.match(h.runs.at(-1)!.prompt, /PENDING-WITHOUT-A-SWITCH/);
+});
+
+test('reselecting an existing legacy group session does not start a new background boundary', async t => {
+  const h = setup(t);
+  await h.send('default', 'Legacy task');
+  const threadId = h.store.conversation('oc_team').threadId!;
+  h.store.observeGroup(h.message('default', 'PENDING-LEGACY-BACKGROUND'));
+  await h.send('default', `/session id ${threadId}`);
+  assert.equal(h.store.conversation('oc_team').groupContextBoundary, undefined);
+  await h.send('default', 'Continue legacy task');
+  assert.match(h.runs.at(-1)!.prompt, /PENDING-LEGACY-BACKGROUND/);
+});
+
+test('late callbacks retain their captured background but cannot roll back a newer switch boundary', async t => {
+  const h = setup(t);
+  await h.send('default', 'Session A');
+  const first = h.store.conversation('oc_team').threadId!;
+  await h.send('default', '/new');
+  await h.send('default', 'Session B');
+  const second = h.store.conversation('oc_team').threadId!;
+  await h.bridge.bind('oc_team', h.dir, first);
+  const oldBoundary = h.store.conversation('oc_team').groupContextBoundary!;
+  h.store.observeGroup(h.message('default', 'CAPTURED-BEFORE-SWITCH'));
+  const entered = deferred(), finish = deferred();
+  t.after(() => finish.resolve());
+  h.runWith(async input => {
+    entered.resolve();
+    await finish.promise;
+    input.onThread?.(first);
+    input.prompt = await input.preparePrompt?.(first) ?? input.prompt;
+    input.onSubmitted?.({ threadId: first, turnId: 'late-turn', mode: 'start', status: 'submitted' });
+    return { threadId: first, turnId: 'late-turn', text: 'Late result' };
+  });
+  const pending = h.send('default', 'Already accepted task');
+  await entered.promise;
+  await h.bridge.bind('oc_team', h.dir, second);
+  h.store.observeGroup(h.message('default', 'DISCUSSION-WHILE-AWAY'));
+  await h.bridge.bind('oc_team', h.dir, first);
+  const newBoundary = structuredClone(h.store.conversation('oc_team').groupContextBoundary!);
+  assert.ok(newBoundary.afterSequence > oldBoundary.afterSequence);
+  finish.resolve();
+  await pending;
+  assert.match(h.runs.at(-1)!.prompt, /CAPTURED-BEFORE-SWITCH/);
+  assert.deepEqual(h.store.conversation('oc_team').groupContextBoundary, newBoundary);
+  assert.deepEqual(h.store.state.threadBindings[first]!.groupContextBoundary, newBoundary);
+  const restarted = new Store(h.dir);
+  assert.deepEqual(restarted.state.threadBindings[first]!.groupContextBoundary, newBoundary);
+  const probe = h.message('default', 'Next task');
+  assert.doesNotMatch(restarted.planGroupContext(probe, h.dir, first, newBoundary).text, /CAPTURED-BEFORE-SWITCH|DISCUSSION-WHILE-AWAY/);
+});
+
+test('private session switches preserve native bindings without adding group boundaries', async t => {
+  const h = setup(t);
+  const privateChat = { chatId: 'oc_private', chatType: 'p2p' as const };
+  await h.send('default', 'Private A', privateChat);
+  const first = h.store.conversation('oc_private').threadId!;
+  await h.send('default', '/new', privateChat);
+  await h.send('default', 'Private B', privateChat);
+  await h.bridge.bind('oc_private', h.dir, first);
+  assert.equal(h.store.conversation('oc_private').groupContextBoundary, undefined);
+  assert.equal(h.store.state.threadBindings[first]!.groupContextBoundary, undefined);
+  await h.send('default', 'Continue private A', privateChat);
+  assert.equal(h.runs.at(-1)!.threadId, first);
+  assert.doesNotMatch(h.runs.at(-1)!.prompt, /feishu_group_context/);
 });

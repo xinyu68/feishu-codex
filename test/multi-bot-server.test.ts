@@ -181,7 +181,8 @@ test('deleting a bot disconnects only its own listener and stale callbacks canno
   assert.equal((await h.request(`/api/bots/${bot.id}`, {}, 'DELETE')).status, 200);
   assert.deepEqual(h.closes, [developerApp]);
   assert.equal((await h.state()).connection.status, 'connected');
-  assert.equal((await h.request('/api/bots/default', {}, 'DELETE')).status, 400);
+  assert.equal((await h.request('/api/bots/default', {}, 'DELETE')).status, 200);
+  assert.deepEqual((await h.state()).bots, []);
   await removedClient.onMessage({ id: 'om_stale', chatId: 'oc_group', actorId: 'ou_user', text: '不能执行' });
   assert.equal(h.runs.length, 0);
   assert.equal(h.sends.length, 0);
@@ -414,4 +415,153 @@ test('invalid or revoked notification selections reject the whole patch without 
   assert.equal(revoked.status, 400);
   assert.deepEqual((await h.state()).config.desktopNotificationTarget, target, 'retain stale selection so the UI can explain why it is invalid');
   assert.equal((await h.request('/api/config', { desktopNotificationTarget: null }, 'PUT')).status, 200);
+});
+
+test('deleting first bot clears its routes and pending deliveries while preserving other bot, native history and local preview', async t => {
+  const h = await fixture(t);
+  const other = await h.create();
+  const store = h.app.store;
+  store.saveConfig({ allowedActors: ['ou_owner'], allowedGroups: ['oc_group'], botName: 'Developer', roleInstructions: 'group role', privateRoleInstructions: 'private role', progress: false });
+  store.saveBot(other.id, { allowedActors: ['ou_other'], allowedGroups: ['oc_group'] });
+  const own = store.conversation('oc_own', 'ou_owner'); own.threadId = 'native-codex'; store.rememberThread(own);
+  const otherChat = conversationKey(other.id, 'oc_other');
+  const retained = store.conversation(otherChat, 'ou_other'); retained.threadId = 'hermes:native-history'; store.rememberThread(retained);
+  store.message(otherChat, 'assistant', 'retained history');
+  const preview = store.conversation('local-preview', 'local'); preview.threadId = 'native-preview'; store.rememberThread(preview);
+  const nativeFile = path.join(store.dir, 'native-session.jsonl'); fs.writeFileSync(nativeFile, 'native history must remain');
+  store.state.groupMessages.oc_group = [
+    { id: 'm1', chatId: 'oc_group', botId: 'default', sender: 'Developer', role: 'assistant', text: 'public result', at: '', cwd: store.dir },
+    { id: 'm2', chatId: 'oc_group', botId: other.id, sender: 'Product', role: 'assistant', text: 'other public result', at: '', cwd: store.dir },
+  ];
+  store.pendingActor('ou_pending', 'oc_pending'); store.pendingGroup('default', 'oc_pending', 'ou_pending');
+  store.state.groupContextReceipts[store.groupContextKey('oc_group', store.dir, 'native-codex')] = { seen: { m1: 13 }, updatedAt: '' };
+  store.notification('pending', { threadId: 'native-codex', turnId: 'turn', chatId: 'oc_own', actorId: 'ou_owner', cwd: store.dir, title: 'pending', requestedAt: '', status: 'registered' });
+  store.artifact('pending-artifact', { threadId: 'native-codex', turnId: 'turn', itemId: 'call', chatId: 'oc_own', actorId: 'ou_owner', requestedAt: '', paths: [], status: 'registered' });
+  assert.equal(store.config.desktopNotificationTarget?.chatId, 'oc_own');
+  const starts = [...h.starts];
+  assert.equal((await h.request('/api/bots/default', {}, 'DELETE')).status, 200);
+  const saved = new Store(store.dir);
+  assert.deepEqual(saved.bots().map(bot => bot.id), [other.id]);
+  assert.equal(saved.config.defaultBotRemoved, true);
+  assert.equal(saved.config.appId, ''); assert.equal(saved.config.appSecret, ''); assert.equal(saved.config.enabled, false);
+  assert.deepEqual(saved.config.allowedActors, []); assert.deepEqual(saved.config.allowedGroups, []);
+  assert.equal(saved.config.roleInstructions, ''); assert.equal(saved.config.privateRoleInstructions, '');
+  assert.equal(saved.config.desktopNotificationTarget, null); assert.equal(saved.config.defaultWorkspace, store.dir); assert.equal(saved.config.progress, false);
+  assert.equal(store.notificationTargets().length, 1);
+  assert.equal((h.app.bridge as any).notificationRecipient('unbound-desktop-task', undefined, true), undefined, 'explicitly cleared default must not route new desktop notifications to the remaining bot');
+  assert.equal(saved.state.conversations.oc_own, undefined); assert.equal(saved.state.threadBindings['native-codex'], undefined);
+  assert.equal(saved.state.conversations[otherChat]?.threadId, 'hermes:native-history');
+  assert.equal(saved.state.history[otherChat]?.[0]?.text, 'retained history');
+  assert.equal(saved.state.conversations['local-preview']?.threadId, 'native-preview');
+  assert.equal(saved.state.threadBindings['native-preview']?.chatId, 'local-preview');
+  assert.equal(saved.state.pendingActors.length, 0); assert.equal(saved.state.pendingGroups.length, 0);
+  assert.equal(Object.keys(saved.state.groupContextReceipts).length, 0);
+  assert.equal(saved.state.groupMessages.oc_group?.length, 2);
+  assert.equal(saved.state.notifications.pending?.status, 'cancelled'); assert.equal(saved.state.artifacts['pending-artifact']?.status, 'failed');
+  assert.equal(fs.readFileSync(nativeFile, 'utf8'), 'native history must remain');
+  assert.deepEqual(h.starts, starts); assert.deepEqual(h.closes, [], 'a disconnected first bot needs no service shutdown');
+  assert.equal((await h.state()).bots[0].connection.status, 'connected');
+});
+
+test('removed bots cannot be recreated by stale save, authorization or conversation actions; last deletion allows local Codex', async t => {
+  const h = await fixture(t); const bot = await h.create();
+  for (const id of ['default', bot.id]) {
+    assert.equal((await h.request(`/api/bots/${id}`, {}, 'DELETE')).status, 200);
+    for (const [endpoint, payload, method] of [
+      [`/api/bots/${id}`, { name: 'stale' }, 'PATCH'], [`/api/bots/${id}/credentials`, { appId: defaultApp, appSecret: 'stale' }, 'POST'],
+      [`/api/bots/${id}/connection`, { enabled: true }, 'POST'], ['/api/actors', { botId: id, actorId: 'ou_stale', allow: true }, 'POST'],
+      ['/api/groups', { botId: id, chatId: 'oc_stale', allow: true }, 'POST'], ['/api/new', { chatId: conversationKey(id, 'oc_stale') }, 'POST'],
+      ['/api/stop', { chatId: conversationKey(id, 'oc_stale') }, 'POST'],
+    ] as const) assert.equal((await h.request(endpoint, payload, method)).status, 404, endpoint);
+    await h.app.bridge.receive({ id: `stale-${id}`, chatId: conversationKey(id, 'oc_stale'), actorId: 'ou_stale', text: 'hello', chatType: 'group' });
+  }
+  assert.equal((await h.request('/api/credentials', { appId: defaultApp, appSecret: 'stale' })).status, 404);
+  assert.equal((await h.request('/api/config', { appId: defaultApp, appSecret: 'stale' }, 'PUT')).status, 404);
+  assert.equal((await h.request('/api/config', { progress: false }, 'PUT')).status, 200);
+  assert.deepEqual(new Store(h.app.store.dir).bots(), []);
+  assert.deepEqual(h.app.store.state.pendingActors, []); assert.deepEqual(h.app.store.state.pendingGroups, []);
+  assert.deepEqual(Object.keys(h.app.store.state.conversations), []);
+  await h.app.bridge.receive({ id: 'local-after-delete', chatId: 'local-preview', actorId: 'local', text: 'hello', localOnly: true });
+  assert.equal(h.runs.length, 1); assert.equal(h.runs[0]?.channel, 'local-preview');
+  assert.equal(h.app.store.state.conversations['local-preview']?.threadId, 'thread-1');
+  const fresh = await h.create('New bot', otherApp);
+  assert.deepEqual((await h.state()).bots.map((item: any) => item.id), [fresh.id]);
+});
+
+test('deletion rejects work on its own bot but succeeds for another idle bot without stopping the task', async t => {
+  const h = await fixture(t); const idle = await h.create();
+  await h.request('/api/connection', { enabled: true }); await h.request('/api/actors', { actorId: 'ou_owner', allow: true });
+  let finish!: () => void; const blocked = new Promise<void>(resolve => { finish = resolve; });
+  let signalStarted!: () => void; const started = new Promise<void>(resolve => { signalStarted = resolve; });
+  const stopped: string[] = [];
+  Object.assign(h.app.bridge.codex, {
+    async run(input: CodexRunInput) { input.onThread?.('running-native'); signalStarted(); await blocked; return { threadId: 'running-native', text: 'done' }; },
+    async stop(id: string) { stopped.push(id); },
+  });
+  const work = h.clients.get(defaultApp)!.onMessage({ id: 'om_busy', chatId: 'oc_busy', actorId: 'ou_owner', text: 'work' });
+  await started;
+  try {
+    assert.equal((await h.request('/api/bots/default', {}, 'DELETE')).status, 409);
+    assert.equal((await h.request(`/api/bots/${idle.id}`, {}, 'DELETE')).status, 200);
+    assert.deepEqual(h.closes, [developerApp]); assert.deepEqual(stopped, []);
+    assert.equal(h.app.store.bot('default')?.enabled, true);
+  } finally { finish(); await work; }
+  assert.equal((await h.request('/api/bots/default', {}, 'DELETE')).status, 200);
+});
+
+test('deletion is guarded while an accepted message is still checking desktop availability', async t => {
+  const h = await fixture(t); await h.request('/api/connection', { enabled: true });
+  await h.request('/api/actors', { actorId: 'ou_owner', allow: true });
+  let finish!: () => void; const wait = new Promise<void>(resolve => { finish = resolve; });
+  let entered!: () => void; const entry = new Promise<void>(resolve => { entered = resolve; });
+  (h.app.bridge as any).discovery.assertCanWrite = async () => { entered(); await wait; };
+  const work = h.clients.get(defaultApp)!.onMessage({ id: 'om_wait', chatId: 'oc_wait', actorId: 'ou_owner', text: 'work' });
+  await entry;
+  try { assert.equal((await h.request('/api/bots/default', {}, 'DELETE')).status, 409); }
+  finally { finish(); await work; }
+  assert.equal(h.runs.length, 1);
+  assert.equal((await h.request('/api/bots/default', {}, 'DELETE')).status, 200);
+});
+
+test('engine changes and transport shutdown serialize against deletion and stale saves', async t => {
+  const h = await fixture(t); const bot = await h.create();
+  let release!: () => void; let entered!: () => void;
+  const wait = new Promise<void>(resolve => { release = resolve; }); const entry = new Promise<void>(resolve => { entered = resolve; });
+  h.app.bridge.setBotEngine = async (id, engine) => { entered(); await wait; h.app.store.saveBot(id, { engine }); };
+  const patch = h.request(`/api/bots/${bot.id}`, { engine: 'hermes' }, 'PATCH');
+  await entry;
+  try { assert.equal((await h.request(`/api/bots/${bot.id}`, {}, 'DELETE')).status, 409); }
+  finally { release(); await patch; }
+  const transport = (h.app.bridge.transport as TransportRouter).get(bot.id)!;
+  let releaseClose!: () => void; let enterClose!: () => void;
+  const closeWait = new Promise<void>(resolve => { releaseClose = resolve; }); const closeEntry = new Promise<void>(resolve => { enterClose = resolve; });
+  transport.close = async () => { enterClose(); await closeWait; };
+  const deletion = h.request(`/api/bots/${bot.id}`, {}, 'DELETE');
+  await closeEntry;
+  try {
+    assert.equal((await h.request(`/api/bots/${bot.id}`, { name: 'late-save' }, 'PATCH')).status, 409);
+    await h.clients.get(developerApp)!.onMessage({ id: 'after-disconnect', chatId: 'oc_late', actorId: 'ou_owner', text: 'no dispatch' });
+    assert.equal(h.runs.length, 0);
+  } finally { releaseClose(); assert.equal((await deletion).status, 200); }
+  assert.equal((await h.request(`/api/bots/${bot.id}`, { name: 'later-save' }, 'PATCH')).status, 404);
+  assert.equal(h.app.store.bot(bot.id), undefined);
+});
+
+test('bot deletion waits for an in-flight artifact summary as well as the upload', async t => {
+  const h = await fixture(t); const bot = await h.create();
+  await h.request('/api/actors', { botId: bot.id, actorId: 'ou_owner', allow: true });
+  const chatId = conversationKey(bot.id, 'oc_files');
+  const conversation = h.app.store.conversation(chatId, 'ou_owner'); conversation.threadId = 'thread-files'; h.app.store.rememberThread(conversation);
+  const file = path.join(h.app.store.dir, 'test.txt'); fs.writeFileSync(file, 'fixture file');
+  let release!: () => void; let entered!: () => void;
+  const wait = new Promise<void>(resolve => { release = resolve; }); const entry = new Promise<void>(resolve => { entered = resolve; });
+  const transport = (h.app.bridge.transport as TransportRouter).get(bot.id)!;
+  transport.sendCard = async () => { entered(); await wait; return 'om_summary'; };
+  const delivery = (h.app.bridge as any).deliverArtifactCall('thread-files', 'turn', { id: 'call', arguments: { paths: [file] } });
+  await entry;
+  try {
+    assert.equal(h.app.store.state.artifacts['thread-files:turn:call']?.status, 'sent');
+    assert.equal((await h.request(`/api/bots/${bot.id}`, {}, 'DELETE')).status, 409);
+  } finally { release(); await delivery; }
+  assert.equal((await h.request(`/api/bots/${bot.id}`, {}, 'DELETE')).status, 200);
 });

@@ -87,6 +87,7 @@ async function fixture(codexHome?: string, options: Partial<CodexClientOptions> 
           reply(socket, message, { thread: { id: threadId, status: { type: status.get(threadId) ?? 'idle' } } }); return;
         case 'thread/start':
           reply(socket, message, { thread: { id: threadId, status: { type: status.get(threadId) ?? 'idle' } } }); return;
+        case 'thread/unsubscribe': reply(socket, message, { status: 'unsubscribed' }); return;
         case 'thread/read':
           if (await fx.onRead?.(socket, message)) return;
           reply(socket, message, { thread: { id: threadId, status: { type: status.get(threadId) ?? 'idle' }, historyMode: 'paginated' } }); return;
@@ -122,6 +123,93 @@ test('notification timing reads the requested turn and normalizes seconds withou
   assert.deepEqual(await fx.client.turnTiming('thread', 'missing'), {});
   assert.equal(fx.received.some(row => ['turn/start', 'turn/steer', 'turn/interrupt', 'thread/resume'].includes(row.message.method || '')), false);
  } finally { await fx.cleanup(); }
+});
+
+test('shared consultation runs beside its source and never publishes temporary thread events', async () => {
+  const fx = await fixture();
+  try {
+    const sourceReady = deferred();
+    let sourceTurn!: Turn;
+    fx.onStart = (socket, message) => {
+      const id = String(message.params!.threadId);
+      const turn = fx.begin(id, String(message.params!.clientUserMessageId));
+      fx.reply(socket, message, { turn });
+      if (id === 'source') { sourceTurn = turn; sourceReady.resolve(); }
+      else fx.complete(id, turn, 'consultation answer');
+    };
+    const events: Array<{ threadId?: string }> = [];
+    fx.client.subscribe(event => events.push(event));
+    const source = fx.client.run({ cwd: process.cwd(), threadId: 'source', prompt: 'source work' });
+    await sourceReady.promise;
+    const result = await fx.client.consult({ cwd: process.cwd(), prompt: 'analysis only', signal: new AbortController().signal,
+      onBeforeSubmit: async () => {
+        fx.onLoaded = (socket, message) => fx.reply(socket, message, { data: ['new-thread'], nextCursor: null });
+        await fx.client.watchLoaded();
+      },
+    });
+    assert.equal(result.text, 'consultation answer');
+    assert.equal(fx.status.get('source'), 'active');
+    assert.equal(events.some(event => event.threadId === 'new-thread'), false);
+    assert.equal(fx.received.some(row => row.message.method === 'thread/resume' && row.message.params?.threadId === 'new-thread'), false);
+    assert.equal(fx.received.find(row => row.message.method === 'thread/start')!.message.params!.ephemeral, true);
+    assert.equal(fx.received.find(row => row.message.method === 'thread/unsubscribe')!.message.params!.threadId, 'new-thread');
+    fx.complete('source', sourceTurn, 'source answer');
+    assert.equal((await source).text, 'source answer');
+  } finally { await fx.cleanup(); }
+});
+
+test('shared consultation abort and late events leave the source turn running', async () => {
+  const fx = await fixture();
+  try {
+    const started = deferred();
+    const sourceTurn = fx.begin('source', 'source-user');
+    fx.onStart = (socket, message) => {
+      const turn = fx.begin(String(message.params!.threadId), 'consultation');
+      fx.reply(socket, message, { turn });
+      started.resolve();
+    };
+    const controller = new AbortController();
+    const events: Array<{ threadId?: string }> = [];
+    fx.client.subscribe(event => events.push(event));
+    const result = fx.client.consult({ cwd: process.cwd(), prompt: 'analyze', signal: controller.signal });
+    const rejected = assert.rejects(result, /咨询已取消或超时/);
+    await started.promise;
+    controller.abort();
+    await rejected;
+    assert.deepEqual(fx.received.filter(row => row.message.method === 'turn/interrupt').map(row => row.message.params?.threadId), ['new-thread']);
+    assert.equal(sourceTurn.status, 'inProgress');
+    assert.equal(events.some(event => event.threadId === 'new-thread'), false);
+    const before = fx.received.length;
+    await assert.rejects(fx.client.consult({ cwd: process.cwd(), prompt: 'late', signal: controller.signal }), /咨询已取消或超时/);
+    assert.equal(fx.received.length, before);
+  } finally { await fx.cleanup(); }
+});
+
+test('dedicated consultation resumes its own persisted Codex thread without desktop watching', async () => {
+  const fx = await fixture();
+  try {
+    const input = { cwd: process.cwd(), prompt: 'first question', persistent: true, signal: new AbortController().signal };
+    const first = await fx.client.consult(input);
+    const second = await fx.client.consult({ ...input, threadId: first.threadId, prompt: 'follow-up question' });
+    assert.equal(second.threadId, first.threadId);
+    assert.equal(fx.received.filter(row => row.message.method === 'thread/start').length, 1);
+    assert.equal(fx.received.find(row => row.message.method === 'thread/start')!.message.params!.ephemeral, false);
+    assert.deepEqual(fx.received.filter(row => row.message.method === 'thread/resume').map(row => row.message.params!.threadId), [first.threadId]);
+    fx.onLoaded = (socket, message) => fx.reply(socket, message, { data: [first.threadId], nextCursor: null });
+    await fx.client.watchLoaded();
+    assert.equal(fx.received.filter(row => row.message.method === 'thread/resume').length, 1);
+  } finally { await fx.cleanup(); }
+});
+
+test('consultation revalidates authorization before submitting and cleans up a rejected session', async () => {
+  const fx = await fixture();
+  try {
+    await assert.rejects(fx.client.consult({ cwd: process.cwd(), prompt: 'analyze', signal: new AbortController().signal,
+      onBeforeSubmit: () => { throw new Error('source turn ended'); },
+    }), /source turn ended/);
+    assert.equal(fx.received.some(row => row.message.method === 'turn/start'), false);
+    assert.ok(fx.received.some(row => row.message.method === 'thread/unsubscribe'));
+  } finally { await fx.cleanup(); }
 });
 
 test('shared resume preserves native settings and early output', async () => {

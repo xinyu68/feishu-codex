@@ -163,7 +163,7 @@ test('status shows the current session preview and Beijing update time instead o
   conversation.threadId = 'thread-human';
   await bridge.receive({ id: randomUUID(), actorId: 'ou_alice', chatId: 'oc_chat', text: '/status' });
   assert.match(cards.at(-1)!.card.text, /会话：修复启动闪窗/);
-  assert.match(cards.at(-1)!.card.text, /最近内容：确认 PowerShell 窗口已经不再出现/);
+  assert.match(cards.at(-1)!.card.text, /会话摘要：确认 PowerShell 窗口已经不再出现/);
   assert.match(cards.at(-1)!.card.text, /最近更新：09-25 23:30/);
   assert.doesNotMatch(cards.at(-1)!.card.text, /thread-human/);
 });
@@ -351,4 +351,117 @@ test('local preview refuses unknown or unauthorized chats before state mutation'
   assert.deepEqual(cards, []);
   assert.equal(store.state.pendingActors.length, 0);
   await bridge.close();
+});
+
+test('status exposes a completed but unconfirmed reply and preserves the saved answer after restart', async t => {
+  const fx = fixture(t);
+  const sendCard = fx.transport.sendCard.bind(fx.transport);
+  fx.transport.sendCard = async (chatId, card) => {
+    if (card.title === 'Codex') throw Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' });
+    return sendCard(chatId, card);
+  };
+  await fx.send('Check lost reply', { id: 'lost-reply' });
+  assert.equal(fx.store.state.operations['lost-reply']!.status, 'completed');
+  assert.ok(fx.store.state.history.oc_chat!.some(item => item.role === 'assistant' && item.text === '完成'));
+  await fx.send('/status');
+  assert.match(fx.cards.at(-1)!.card.text, /状态：空闲[\s\S]*最近回复：送达未确认/);
+  assert.match(fx.cards.at(-1)!.card.text, /本机工作台查看本轮结果/);
+  assert.match(fx.cards.at(-1)!.card.text, /最近提问：Check lost reply/);
+  const restarted = new Store(fx.dir);
+  const bridge = new Bridge(restarted, fx.runtime, { projects: async () => [], threads: async () => [] });
+  bridge.transport = fx.transport;
+  t.after(() => bridge.close());
+  await bridge.receive({ id: randomUUID(), chatId: 'oc_chat', actorId: 'ou_alice', text: '/status' });
+  assert.match(fx.cards.at(-1)!.card.text, /最近回复：送达未确认/);
+  await bridge.newConversation('oc_chat');
+  await bridge.receive({ id: randomUUID(), chatId: 'oc_chat', actorId: 'ou_alice', text: '/status' });
+  assert.doesNotMatch(fx.cards.at(-1)!.card.text, /最近回复|Check lost reply/);
+});
+
+test('status distinguishes an in-flight reply from a confirmed reply without running the task twice', async t => {
+  const fx = fixture(t);
+  let release!: () => void;
+  const acknowledged = new Promise<void>(resolve => { release = resolve; });
+  t.after(release);
+  const sendCard = fx.transport.sendCard.bind(fx.transport);
+  let sending = false;
+  fx.transport.sendCard = async (chatId, card) => {
+    if (card.title === 'Codex') { sending = true; await acknowledged; }
+    return sendCard(chatId, card);
+  };
+  const pending = fx.send('Generate a reply');
+  for (let i = 0; i < 50 && !sending; i++) await tick();
+  assert.equal(sending, true);
+  await fx.send('/status');
+  assert.match(fx.cards.at(-1)!.card.text, /最近回复：发送中/);
+  release(); await pending;
+  await fx.send('/status');
+  assert.match(fx.cards.at(-1)!.card.text, /状态：空闲[\s\S]*最近回复：已送达/);
+  assert.equal(fx.runs.length, 1);
+});
+
+test('status scopes delivery to the current bot, chat, project and thread and orders by accepted task', async t => {
+  const fx = fixture(t);
+  Object.assign(fx.store.conversation('oc_chat', 'ou_alice'), { threadId: 'thread-1' });
+  const base = { chatId: 'oc_chat', actorId: 'ou_alice', cwd: fx.dir, threadId: 'thread-1', revision: 0,
+    source: 'feishu' as const, status: 'completed' as const };
+  for (const [id, at, status] of [['old', '2026-09-29T11:00:00.000Z', 'uncertain'], ['new', '2026-09-29T11:01:00.000Z', 'sent']] as const) {
+    fx.store.operation(id, { ...base, turnId: id, at });
+    fx.store.finishDelivery(`oc_chat:thread-1:${id}`, status);
+  }
+  fx.store.operation('old', { error: 'Late old callback', updatedAt: '2026-09-29T23:00:00.000Z' });
+  for (const [id, patch] of Object.entries({ bot: { chatId: 'bot:product:oc_chat' }, chat: { chatId: 'oc_other' },
+    thread: { threadId: 'other-thread' }, project: { cwd: path.join(fx.dir, 'other') }, preview: { source: 'management' as const } })) {
+    fx.store.operation(id, { ...base, ...patch, turnId: id, at: '2026-09-29T12:00:00.000Z' });
+    const operation = fx.store.state.operations[id]!;
+    fx.store.finishDelivery(`${operation.chatId}:${operation.threadId}:${id}`, 'uncertain');
+  }
+  fx.store.finishDelivery('desktop-notification:thread-1:desktop', 'uncertain');
+  await fx.send('/status');
+  assert.match(fx.cards.at(-1)!.card.text, /最近回复：已送达/);
+  assert.doesNotMatch(fx.cards.at(-1)!.card.text, /送达未确认/);
+});
+
+test('error-notice delivery does not claim a successful answer and cannot mask an unconfirmed answer', async t => {
+  const fx = fixture(t);
+  Object.assign(fx.store.conversation('oc_chat', 'ou_alice'), { threadId: 'thread-1' });
+  fx.store.operation('failed-task', { chatId: 'oc_chat', actorId: 'ou_alice', cwd: fx.dir, threadId: 'thread-1',
+    turnId: 'failed-turn', revision: 0, source: 'feishu', status: 'failed' });
+  fx.store.finishDelivery('error:oc_chat:thread-1:failed-turn', 'sent');
+  await fx.send('/status');
+  assert.match(fx.cards.at(-1)!.card.text, /最近异常提示：已送达/);
+  assert.doesNotMatch(fx.cards.at(-1)!.card.text, /最近回复：已送达/);
+  fx.store.finishDelivery('oc_chat:thread-1:failed-turn', 'uncertain');
+  await fx.send('/status');
+  assert.match(fx.cards.at(-1)!.card.text, /最近回复：送达未确认/);
+  assert.doesNotMatch(fx.cards.at(-1)!.card.text, /最近异常提示/);
+});
+
+test('steered listeners share reply status and missing delivery never implies successful delivery', async t => {
+  const fx = fixture(t);
+  Object.assign(fx.store.conversation('oc_chat', 'ou_alice'), { threadId: 'thread-1' });
+  const base = { chatId: 'oc_chat', actorId: 'ou_alice', cwd: fx.dir, threadId: 'thread-1', turnId: 'shared-turn',
+    revision: 0, source: 'feishu' as const };
+  fx.store.operation('first', { ...base, status: 'completed', at: '2026-09-29T11:00:00.000Z' });
+  fx.store.operation('second', { ...base, status: 'uncertain', mode: 'steer', at: '2026-09-29T11:00:01.000Z' });
+  await fx.send('/status');
+  assert.doesNotMatch(fx.cards.at(-1)!.card.text, /最近回复：已送达/);
+  fx.store.finishDelivery('oc_chat:thread-1:shared-turn', 'sent');
+  fx.store.finishDelivery('error:oc_chat:thread-1:shared-turn', 'uncertain');
+  await fx.send('/status');
+  assert.match(fx.cards.at(-1)!.card.text, /最近回复：已送达/);
+  assert.equal(fx.store.state.operations.second!.status, 'uncertain');
+});
+
+test('status retains the actual latest question instead of overwriting it with a native opening summary', async t => {
+  const fx = fixture(t);
+  await fx.send('The current question');
+  const bridge = new Bridge(fx.store, fx.runtime, { projects: async () => [], threads: async () => [{ id: 'thread-1',
+    cwd: fx.dir, title: 'Native title', preview: 'The very first question', updatedAt: '2026-01-01T00:00:00.000Z' }] });
+  bridge.transport = fx.transport;
+  t.after(() => bridge.close());
+  await bridge.receive({ id: randomUUID(), actorId: 'ou_alice', chatId: 'oc_chat', text: '/status' });
+  assert.match(fx.cards.at(-1)!.card.text, /会话：Native title[\s\S]*最近提问：The current question/);
+  assert.doesNotMatch(fx.cards.at(-1)!.card.text, /The very first question/);
+  assert.equal(fx.store.conversation('oc_chat').preview, 'The current question');
 });
