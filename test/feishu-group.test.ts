@@ -74,6 +74,47 @@ test('group @ routing matches the bot open_id rather than display text or names'
   assert.equal(parseMessageEvent(groupEvent()), undefined);
 });
 
+test('bare group mentions survive parsing for acknowledgement and authorization', () => {
+  const options = { botOpenId: 'ou_bot' };
+  for (const text of ['@_user_1', ' @_user_1 \n', '@_user_1 @_user_10']) {
+    const event = groupEvent(text, [mention(), mention('ou_other', '@_user_10', '另一个机器人')]);
+    const parsed = parseMessageEvent(event, options);
+    assert.equal(parsed?.message.mentionOnly, true);
+    assert.equal(parsed?.message.text, '');
+    assert.equal(parsed?.observation, undefined);
+  }
+  assert.equal(parseMessageEvent(groupEvent('@产品经理', []), options), undefined);
+  assert.equal(parseMessageEvent(groupEvent('@_user_1', [mention('ou_other')]), options), undefined);
+  assert.equal(parseMessageEvent(groupEvent('@_user_1 你好'), options)?.message.mentionOnly, undefined);
+  const bot = groupEvent('@_user_1'); bot.sender.sender_type = 'app';
+  assert.equal(parseMessageEvent(bot, options), undefined);
+});
+
+test('bare rich-text mentions are pings but attachments and text still reach the agent', () => {
+  const event = groupEvent('', [mention(), mention('ou_other', '@_user_2', '另一个机器人')]);
+  event.message.message_type = 'post';
+  const content = [[{ tag: 'at', user_id: 'ou_bot' }, { tag: 'at', user_id: 'ou_other' }]] as Record<string, string>[][];
+  event.message.content = JSON.stringify({ zh_cn: { title: '', content } });
+  assert.equal(parseMessageEvent(event, { botOpenId: 'ou_bot' })?.message.mentionOnly, true);
+  content[0]!.push({ tag: 'img', image_key: 'img_test' });
+  event.message.content = JSON.stringify({ zh_cn: { title: '', content } });
+  const image = parseMessageEvent(event, { botOpenId: 'ou_bot' });
+  assert.equal(image?.message.mentionOnly, undefined);
+  assert.equal(image?.attachments?.length, 1);
+  content[0]!.pop(); content[0]!.push({ tag: 'text', text: '你好' });
+  event.message.content = JSON.stringify({ zh_cn: { title: '', content } });
+  assert.equal(parseMessageEvent(event, { botOpenId: 'ou_bot' })?.message.mentionOnly, undefined);
+});
+
+test('bare mentions in an unknown group reach the authorization handler', async t => {
+  const h = harness({ allowGroup: () => false }); t.after(() => h.client.close());
+  await h.client.start();
+  await h.event(groupEvent('@_user_1'));
+  assert.equal(h.messages.length, 1);
+  assert.equal(h.messages[0]?.mentionOnly, true);
+  assert.equal(h.observed.length, 0);
+});
+
 test('mention replacement keeps other recipients and avoids overlapping mention keys', () => {
   const event = groupEvent('@_user_1 请参考 @_user_10 的意见', [mention(), mention('ou_other', '@_user_10', '开发')]);
   assert.equal(parseMessageEvent(event, { botOpenId: 'ou_bot' })?.message.text, '请参考 @开发 的意见');

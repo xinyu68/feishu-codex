@@ -206,7 +206,6 @@ function BotDetail({ state, bot, hidden, section, changeSection, pending, models
 }) {
   const tabsRef = useRef<HTMLDivElement>(null);
   const [removing, setRemoving] = useState(false);
-  const [switchingEngine, setSwitchingEngine] = useState(false);
   const tabId = (id: Section) => `bot-${bot.id}-tab-${id}`;
   const panelId = (id: Section) => `bot-${bot.id}-panel-${id}`;
   return <section className="bot-detail" hidden={hidden} aria-label={`${bot.name}设置`}>
@@ -217,9 +216,9 @@ function BotDetail({ state, bot, hidden, section, changeSection, pending, models
       const next = event.key === 'Home' ? 0 : event.key === 'End' ? sections.length - 1 : (index + (event.key === 'ArrowRight' ? 1 : -1) + sections.length) % sections.length;
       changeSection(sections[next].id); tabsRef.current?.querySelectorAll<HTMLButtonElement>('[role="tab"]')[next]?.focus();
     }}>{sections.map(item => <button key={item.id} type="button" role="tab" id={tabId(item.id)} aria-controls={panelId(item.id)} aria-selected={section === item.id} tabIndex={section === item.id ? 0 : -1} onClick={() => changeSection(item.id)}>{item.label}{item.id === 'access' && pending > 0 && <span className="count-badge">{pending}</span>}</button>)}</div>
-    <div className="bot-panel-scroll"><fieldset className="bot-settings-fields" disabled={removing || switchingEngine}>
+    <div className="bot-panel-scroll"><fieldset className="bot-settings-fields" disabled={removing}>
       {bot.engine !== 'hermes' && <DefaultNotificationBot state={state} bot={bot} configSave={configSave} startAccess={() => changeSection('access')} />}
-      <div className="bot-tab-panel" role="tabpanel" id={panelId('conversation')} aria-labelledby={tabId('conversation')} hidden={section !== 'conversation'}><BotEngine bot={bot} busy={busy || configSave.feedback.phase === 'saving'} perform={perform} onOpenChange={setSwitchingEngine} isNotificationTarget={state.config.desktopNotificationTarget?.botAppId === bot.appId} /><ConversationSettings bot={bot} models={models} modelError={modelError} retryModels={retryModels} refresh={refresh} /></div>
+      <div className="bot-tab-panel" role="tabpanel" id={panelId('conversation')} aria-labelledby={tabId('conversation')} hidden={section !== 'conversation'}><BotEngine bot={bot} /><ConversationSettings bot={bot} models={models} modelError={modelError} retryModels={retryModels} refresh={refresh} /></div>
       <div className="bot-tab-panel" role="tabpanel" id={panelId('access')} aria-labelledby={tabId('access')} hidden={section !== 'access'}><BotAccess state={state} bot={bot} busy={busy} perform={perform} onboarding={onboarding} /></div>
       <div className="bot-tab-panel" role="tabpanel" id={panelId('connection')} aria-labelledby={tabId('connection')} hidden={section !== 'connection'}><BotCredentials bot={bot} refresh={refresh} startAccess={startAccess} /></div>
     </fieldset></div>
@@ -399,7 +398,7 @@ function AddBotDialog({ close, created, perform }: { close: () => void; created:
     const first = items[0]; const last = items.at(-1);
     if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
     else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
-  }}><div className="drawer-title"><div><span className="eyebrow">FEISHU BOT</span><h2 id="add-bot-title">添加机器人</h2></div><button className="icon-button" aria-label="关闭添加机器人" disabled={saving} onClick={close}><X size={19} /></button></div><p className="section-description">每个机器人使用独立的飞书应用。连接成功后，给它发消息并授权自己的账号，即可开始使用。</p><form onSubmit={event => { event.preventDefault(); void create(); }}><div className="bot-dialog-fields"><div className="form-grid"><label className="field-label">机器人名称<input ref={nameInput} aria-label="机器人名称" disabled={saving} value={name} maxLength={60} placeholder="例如：开发人员" onChange={event => setName(event.target.value)} /></label><label className="field-label">处理对话的 AI<Select aria-label="处理对话的 AI" disabled={saving} value={engine} onChange={event => { setEngine(event.target.value as BotEngineName); setError(''); }}><option value="codex">Codex</option><option value="hermes">Hermes</option></Select></label></div><p className="bot-engine-add-hint">{engine === 'hermes' ? '需已安装 Hermes 并配置模型；连接时自动启动服务。' : '可在 Codex 桌面和飞书接着同一会话继续。'}</p><div className="form-grid"><label className="field-label">App ID<input aria-label="App ID" disabled={saving} value={appId} autoComplete="off" spellCheck={false} placeholder="cli_…" onChange={event => setAppId(event.target.value)} /></label><label className="field-label">App Secret<input aria-label="App Secret" disabled={saving} type="password" value={secret} autoComplete="new-password" placeholder="填写应用密钥" onChange={event => setSecret(event.target.value)} /></label></div></div><a className="settings-external-link" href="https://open.feishu.cn/app" target="_blank" rel="noopener noreferrer">飞书开发者后台<ExternalLink size={12} /></a>{error && <p className="field-error" role="alert">{error}</p>}<div className="bot-dialog-footer"><span>{saving ? '正在验证连接…' : '角色说明可稍后设置'}</span><button type="button" className="secondary-button" disabled={saving} onClick={close}>取消</button><button type="submit" className="primary-button" disabled={saving || !name.trim() || !appId.trim() || !secret.trim()}>{saving ? <LoaderCircle className="spin" size={14} /> : <Check size={14} />}{saving ? '正在连接…' : '验证并添加'}</button></div></form></div></div>;
+  }}><div className="drawer-title"><div><span className="eyebrow">FEISHU BOT</span><h2 id="add-bot-title">添加机器人</h2></div><button className="icon-button" aria-label="关闭添加机器人" disabled={saving} onClick={close}><X size={19} /></button></div><p className="section-description">每个机器人使用独立的飞书应用。连接成功后，给它发消息并授权自己的账号，即可开始使用。</p><form onSubmit={event => { event.preventDefault(); void create(); }}><div className="bot-dialog-fields"><div className="form-grid"><label className="field-label">机器人名称<input ref={nameInput} aria-label="机器人名称" disabled={saving} value={name} maxLength={60} placeholder="例如：开发人员" onChange={event => setName(event.target.value)} /></label><label className="field-label">处理对话的 AI<Select aria-label="处理对话的 AI" disabled={saving} value={engine} onChange={event => { setEngine(event.target.value as BotEngineName); setError(''); }}><option value="codex">Codex</option><option value="hermes">Hermes</option></Select></label></div><p className="bot-engine-add-hint">{engine === 'hermes' ? '需已安装 Hermes 并配置模型；连接时自动启动服务。' : '可在 Codex 桌面和飞书接着同一会话继续。'}</p><div className="form-grid"><label className="field-label">App ID<input aria-label="App ID" disabled={saving} value={appId} autoComplete="off" spellCheck={false} placeholder="cli_…" onChange={event => setAppId(event.target.value)} /></label><label className="field-label">App Secret<input aria-label="App Secret" disabled={saving} type="password" value={secret} autoComplete="new-password" placeholder="填写应用密钥" onChange={event => setSecret(event.target.value)} /></label></div></div><a className="settings-external-link" href="https://open.feishu.cn/app" target="_blank" rel="noopener noreferrer">飞书开发者后台<ExternalLink size={12} /></a>{error && <p className="field-error" role="alert">{error}</p>}<div className="bot-dialog-footer"><span>{saving ? '正在验证连接…' : '创建后 AI 不可更换'}</span><button type="button" className="secondary-button" disabled={saving} onClick={close}>取消</button><button type="submit" className="primary-button" disabled={saving || !name.trim() || !appId.trim() || !secret.trim()}>{saving ? <LoaderCircle className="spin" size={14} /> : <Check size={14} />}{saving ? '正在连接…' : '验证并添加'}</button></div></form></div></div>;
 }
 
 function DefaultNotificationBot({ state, bot, configSave, startAccess }: { state: AppState; bot: BotProfile; configSave: ConfigAutosave; startAccess: () => void }) {
@@ -434,48 +433,9 @@ function DefaultNotificationBot({ state, bot, configSave, startAccess }: { state
   </section>;
 }
 
-function BotEngine({ bot, busy, perform, onOpenChange, isNotificationTarget }: {
-  bot: BotProfile; busy: boolean; perform: Perform; onOpenChange: (open: boolean) => void; isNotificationTarget: boolean;
-}) {
-  const engine = bot.engine || 'codex';
-  const [pending, setPending] = useState<BotEngineName | null>(null);
-  const [saving, setSaving] = useState(false);
-  const [error, setError] = useState('');
-  const submitting = useRef(false);
-  const control = useRef<HTMLDivElement>(null);
-  const cancel = useRef<HTMLButtonElement>(null);
-  const dialog = useRef<HTMLDivElement>(null);
-  useEffect(() => { if (pending) cancel.current?.focus(); }, [pending]);
-  function close() {
-    if (submitting.current) return;
-    setPending(null); onOpenChange(false);
-    requestAnimationFrame(() => control.current?.querySelector('select')?.focus());
-  }
-  async function save() {
-    if (!pending || submitting.current || busy) return;
-    submitting.current = true; setSaving(true); setError('');
-    let saved = false;
-    try {
-      await perform('switch-bot-engine', async () => {
-        try { await request(botRoute(bot.id), { engine: pending }, 'PATCH'); saved = true; }
-        catch (caught) { setError(errorMessage(caught)); }
-      });
-    } finally { submitting.current = false; setSaving(false); }
-    if (saved) close();
-  }
-  const nextName = pending === 'hermes' ? 'Hermes' : 'Codex';
-  return <><div className="bot-engine-row" ref={control}><div><label className="field-label" htmlFor={`bot-engine-${bot.id}`}>处理对话的 AI</label><p>{engine === 'hermes' ? '使用本机 Hermes，模型在 Hermes 中设置。' : '在 Codex 桌面和飞书接续同一会话。'}</p></div><Select id={`bot-engine-${bot.id}`} aria-label="处理对话的 AI" disabled={busy || saving} value={engine} onChange={event => {
-    const next = event.target.value as BotEngineName;
-    if (next !== engine) { setError(''); setPending(next); onOpenChange(true); }
-  }}><option value="codex">Codex</option><option value="hermes">Hermes</option></Select></div>
-    {engine === 'hermes' && bot.engineStatus?.available === false && <p className="bot-engine-error" role="status">{bot.engineStatus.error || 'Hermes 服务尚未就绪，请检查本机安装和模型配置。'}</p>}
-    {pending && createPortal(<div className="overlay modal-overlay" onMouseDown={event => { if (event.target === event.currentTarget) close(); }}><div className="bot-dialog bot-engine-dialog" role="alertdialog" aria-modal="true" aria-labelledby={`switch-engine-${bot.id}`} aria-describedby={`switch-engine-description-${bot.id}`} ref={dialog} onKeyDown={event => {
-      if (event.key === 'Escape') { event.stopPropagation(); close(); }
-      if (event.key !== 'Tab') return;
-      const items = [...(dialog.current?.querySelectorAll<HTMLButtonElement>('button:not(:disabled)') || [])];
-      const first = items[0], last = items.at(-1);
-      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
-      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
-    }}><div className="drawer-title"><h2 id={`switch-engine-${bot.id}`}>切换到 {nextName}？</h2><button className="icon-button" type="button" aria-label="关闭切换确认" disabled={saving} onClick={close}><X size={18} /></button></div><p className="section-description" id={`switch-engine-description-${bot.id}`}>「{bot.name}」的私聊和群聊将从新的 {nextName} 会话开始，原有会话历史保留。</p>{pending === 'hermes' && <p className="bot-engine-dialog-hint">需已安装 Hermes 并配置模型，应用会自动启动并检测服务。</p>}{pending === 'hermes' && isNotificationTarget && <p className="bot-engine-warning">它是默认通知机器人；切换后需重新选择 Codex 桌面通知的接收机器人。</p>}{error && <p className="field-error" role="alert">{error}</p>}<div className="bot-dialog-footer"><button ref={cancel} type="button" className="secondary-button" disabled={saving} onClick={close}>取消</button><button type="button" className="primary-button" disabled={busy || saving} onClick={() => void save()}>{saving && <LoaderCircle size={14} className="spin" />}{saving ? '正在切换…' : '确认切换'}</button></div></div></div>, document.body)}
+function BotEngine({ bot }: { bot: BotProfile }) {
+  const engine = bot.engine === 'hermes' ? 'Hermes' : 'Codex';
+  return <><div className="bot-engine-row"><div><span className="field-label">处理对话的 AI</span><p>创建后不可更换；如需更换，请删除后重新添加。</p></div><span className="bot-engine-value" aria-label="处理对话的 AI">{engine}</span></div>
+    {bot.engine === 'hermes' && bot.engineStatus?.available === false && <p className="bot-engine-error" role="status">{bot.engineStatus.error || 'Hermes 服务尚未就绪，请检查本机安装和模型配置。'}</p>}
   </>;
 }

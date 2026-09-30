@@ -13,9 +13,8 @@ import type { CodexRunInput, CodexRuntime, InboundMessage, RuntimeConsultInput, 
 function setup(t: test.TestContext, sourceEngine: 'codex' | 'hermes' = 'codex', targetEngine: 'codex' | 'hermes' = 'hermes') {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'group-consult-bridge-'));
   const store = new Store(dir);
-  store.saveConfig({ enabled: true, appId: 'cli_source', allowedActors: ['source-user'], allowedGroups: ['oc_team'],
+  store.saveConfig({ engine: sourceEngine, enabled: true, appId: 'cli_source', allowedActors: ['source-user'], allowedGroups: ['oc_team'],
     defaultWorkspace: dir, botName: '开发人员', progress: false });
-  store.saveBot('default', { engine: sourceEngine });
   store.saveBot('pm', { enabled: true, appId: 'cli_target', name: '产品经理', engine: targetEngine,
     allowedActors: ['target-user'], allowedGroups: ['oc_team'], roleInstructions: '梳理验收要求', model: 'target-model', effort: 'high' });
   store.rememberBotIdentity('pm', { openId: 'ou_target', name: '产品经理' });

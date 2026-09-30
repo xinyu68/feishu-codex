@@ -74,7 +74,6 @@ export class Bridge {
   private sessionChoices = new Map<string, ThreadSummary[]>();
   private modelChoices = new Map<string, string[]>();
   private changingContext = new Set<string>();
-  private changingEngines = new Set<string>();
   private removingBots = new Set<string>();
   private receivingBots = new Map<string, number>();
   private artifactSummaries = new Set<string>();
@@ -519,7 +518,7 @@ export class Bridge {
   }
   async removeBot(botId: string, disconnect: () => Promise<void>): Promise<void> {
     if (!this.store.bot(botId)) throw new UserError('这个机器人不存在，请刷新页面。', 404);
-    if (this.removingBots.has(botId) || this.changingEngines.has(botId) || this.hasBotActiveWork(botId)) {
+    if (this.removingBots.has(botId) || this.hasBotActiveWork(botId)) {
       throw new UserError('这个机器人还有任务、交接或消息发送正在进行，请完成或停止后再删除。', 409);
     }
     this.removingBots.add(botId);
@@ -676,6 +675,11 @@ export class Bridge {
     const allowed = this.store.isAuthorized(message.chatId, message.actorId, message.chatType);
     if (allowed && message.chatType === 'group' && !message.handoff && !message.localOnly) {
       this.store.rememberActorIdentity(message);
+      if (message.mentionOnly) {
+        if (!this.store.claim(message.id)) return;
+        await this.transport?.sendText(message.chatId, '我在。请在 @我 后写上问题，或发送 /help 查看命令。');
+        return;
+      }
     }
     const receiptTarget = allowed ? { ...this.store.conversation(message.chatId, message.actorId, undefined, message.chatType) } : undefined;
     if (allowed && !/^\/[a-z]+(?:\s|$)/i.test(message.text.trim())) {
@@ -705,7 +709,6 @@ export class Bridge {
     // Group membership is not ownership. Each operation captures its own authorized sender.
     savedConversation.actorId = message.actorId;
     try {
-      if (this.changingEngines.has(route.botId)) throw new UserError('机器人执行端正在切换，请稍后重试。', 409);
       const command = message.handoff ? null : /^\/([a-z]+)(?:\s+([\s\S]*))?\s*$/i.exec(message.text.trim());
       if (command) {
         await this.command(message, command[1]!.toLowerCase(), command[2]?.trim() ?? '');
@@ -1107,7 +1110,6 @@ export class Bridge {
   }
   async bind(chatId: string, cwd: string, threadId?: string, expectedRevision?: number, resetGroupContext = false): Promise<void> {
     if (chatId !== 'local-preview' && (!this.store.botForChat(chatId) || this.removingBots.has(parseRoute(chatId).botId))) throw new UserError('这个机器人已移除，请刷新页面。', 404);
-    if (this.changingEngines.has(parseRoute(chatId).botId)) throw new UserError('机器人执行端正在切换，请稍后重试。', 409);
     if (threadId && isHermesThread(threadId) !== (this.engineForChat(chatId) === 'hermes')) throw new UserError('Hermes 和 Codex 使用独立会话，请选择当前执行端的会话或新建。', 409);
     this.checkRevision(this.store.conversation(chatId), expectedRevision);
     if (this.changingContext.has(chatId)) throw new UserError('正在切换上下文，请稍后重试。', 409);
@@ -1773,29 +1775,6 @@ export class Bridge {
         return { id, cwd: binding.cwd, title: summary.title || 'Hermes 会话', preview: summary.preview || '', updatedAt: summary.updatedAt || '' };
       }).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
   }
-  async setBotEngine(botId: string, engine: 'codex' | 'hermes'): Promise<void> {
-    const bot = this.store.bot(botId);
-    if (!bot) throw new UserError('机器人不存在', 404);
-    if ((bot.engine ?? 'codex') === engine) return;
-    const busy = () => this.hasBotActiveWork(botId);
-    if (this.removingBots.has(botId) || this.changingEngines.has(botId) || busy()) throw new UserError('这个机器人仍有任务或交接正在进行，请等任务结束后切换执行端。', 409);
-    this.changingEngines.add(botId);
-    try {
-      if (engine === 'hermes') {
-        const runtimes = this.codex;
-        if (!(runtimes instanceof RuntimeRouter)) throw new UserError('Hermes 本机接口尚未配置。', 503);
-        const status = await Promise.resolve().then(() => runtimes.forEngine(engine).status())
-          .catch(error => { throw new UserError(errorText(error), 503); });
-        if (!status.available || status.authenticated === false) throw new UserError(status.error || 'Hermes 本机接口尚未就绪，请先启动 Hermes。', 503);
-      }
-      if (busy()) throw new UserError('这个机器人开始了新任务，请完成后再切换执行端。', 409);
-      this.store.switchBotEngine(botId, engine);
-      for (const item of this.conversations()) if (parseRoute(item.chatId).botId === botId) {
-        this.historyCache.delete(item.chatId); this.sessionChoices.delete(item.chatId); this.modelChoices.delete(item.chatId);
-      }
-      this.store.log('info', `${bot.name} 执行端已切换到 ${engine === 'hermes' ? 'Hermes' : 'Codex'}，下一条消息将使用独立的新会话。`);
-    } finally { this.changingEngines.delete(botId); }
-  }
   async close(): Promise<void> {
     this.closing = true;
     const closingConsultations = this.consultations.close();
@@ -1855,7 +1834,7 @@ export class Bridge {
       const operation = this.store.state.operations[message.id];
       return Boolean(!this.closing && !queue.cancelled && this.isCurrentTarget(target)
         && this.store.state.conversations[message.chatId]?.threadId === target.threadId
-        && !this.removingBots.has(sourceRoute.botId) && !this.changingEngines.has(sourceRoute.botId)
+        && !this.removingBots.has(sourceRoute.botId)
         && bot?.enabled && bot.appId === sourceIdentity.appId && (bot.engine ?? 'codex') === sourceIdentity.engine
         && this.store.isAuthorized(message.chatId, message.actorId, 'group')
         && operation?.status === 'submitted' && operation.threadId === target.threadId && operation.turnId
@@ -1902,7 +1881,7 @@ export class Bridge {
           && (currentBot.engine ?? 'codex') === snapshot.engine && currentBot.roleInstructions === snapshot.role
           && currentBot.name === snapshot.name && currentBot.model === snapshot.model && currentBot.effort === snapshot.effort
           && this.store.botIdentity(bot.id)?.openId === botIdentity.openId
-          && !this.removingBots.has(bot.id) && !this.changingEngines.has(bot.id) && !this.changingContext.has(targetChatId)
+          && !this.removingBots.has(bot.id) && !this.changingContext.has(targetChatId)
           && this.store.resolveGroupActor(message.chatId, message.actorId, bot.id) === actorId
           && this.store.isAuthorized(targetChatId, actorId, 'group') && this.transport?.isAvailable?.(targetChatId) !== false
           && current?.revision === snapshot.revision && current?.threadId === snapshot.threadId

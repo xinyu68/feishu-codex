@@ -38,6 +38,8 @@ export type LogEntry = { id: string; at: string; level: 'info' | 'warn' | 'error
 export type ChatMessage = { id: string; role: 'user' | 'assistant' | 'system'; text: string; at: string; streaming?: boolean; phase?: string; turnId?: string };
 export type InboundMessage = {
   id: string; chatId: string; actorId: string; text: string; at?: string;
+  /** A real group mention without a question or attachment; acknowledge without running an agent. */
+  mentionOnly?: boolean;
   botId?: string; rawChatId?: string; chatType?: 'p2p' | 'group'; senderName?: string; replyTo?: string; quotedText?: string;
   /** Identity fields from the authenticated Feishu event, never parsed from message text. */
   actorUnionId?: string; actorUserId?: string; actorTenantKey?: string;

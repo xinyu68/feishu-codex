@@ -46,21 +46,31 @@ function fixture(t: test.TestContext) {
   return { dir, store, runtime, bridge, cards, transport, discovery, emit, completed };
 }
 
-test('automatic desktop notifications are off by default and old configurations stay off', async t => {
+test('desktop notifications default to tasks over one minute and preserve saved preferences', async t => {
   const fx = fixture(t);
-  assert.equal(fx.store.config.autoNotifyDesktop, false);
+  assert.equal(fx.store.config.autoNotifyDesktop, true);
+  assert.equal(fx.store.config.desktopNotificationMode, 'long');
+  assert.equal(fx.store.config.desktopNotificationMinMinutes, 1);
   fx.completed(); await settle(fx.bridge);
   assert.deepEqual(fx.cards, []);
+  for (const durationMs of [59_999, 60_000, 60_001]) {
+    fx.emit('turn/completed', 'completed', { durationMs }, `default-${durationMs}`);
+    await settle(fx.bridge);
+  }
+  assert.equal(fx.cards.length, 1);
   const saved = JSON.parse(fs.readFileSync(path.join(fx.dir, 'config.json'), 'utf8'));
   delete saved.autoNotifyDesktop;
   delete saved.desktopNotificationMode;
   delete saved.desktopNotificationMinMinutes;
   fs.writeFileSync(path.join(fx.dir, 'config.json'), JSON.stringify(saved));
-  assert.equal(new Store(fx.dir).config.autoNotifyDesktop, false);
-  assert.equal(new Store(fx.dir).config.desktopNotificationMode, 'all');
-  assert.equal(new Store(fx.dir).config.desktopNotificationMinMinutes, 1);
-  fx.store.saveConfig({ autoNotifyDesktop: true });
   assert.equal(new Store(fx.dir).config.autoNotifyDesktop, true);
+  assert.equal(new Store(fx.dir).config.desktopNotificationMode, 'long');
+  assert.equal(new Store(fx.dir).config.desktopNotificationMinMinutes, 1);
+  fx.store.saveConfig({ autoNotifyDesktop: false, desktopNotificationMode: 'all', desktopNotificationMinMinutes: 3 });
+  const restored = new Store(fx.dir);
+  assert.equal(restored.config.autoNotifyDesktop, false);
+  assert.equal(restored.config.desktopNotificationMode, 'all');
+  assert.equal(restored.config.desktopNotificationMinMinutes, 3);
 });
 
 test('long-only filters completed, failed and stopped tasks using the configurable strict boundary', async t => {
@@ -152,7 +162,7 @@ test('live timing fallback captures arrival time before queued async work', asyn
 });
 
 test('desktop turn completes without an MCP call and duplicate events send one card without changing binding', async t => {
-  const fx = fixture(t); fx.store.saveConfig({ autoNotifyDesktop: true });
+  const fx = fixture(t); fx.store.saveConfig({ autoNotifyDesktop: true, desktopNotificationMode: 'all' });
   fx.emit('turn/started', 'inProgress'); await settle(fx.bridge);
   Object.assign(fx.store.state.conversations.oc_owner!, { threadId: 'another-task' });
   fx.store.conversation('oc_newer', 'ou_owner').updatedAt = '2099-01-01';
@@ -167,7 +177,7 @@ test('desktop turn completes without an MCP call and duplicate events send one c
 });
 
 test('enabling notifications does not replay old snapshots, but captures a fresh short desktop turn', async t => {
-  const fx = fixture(t); fx.store.saveConfig({ autoNotifyDesktop: true });
+  const fx = fixture(t); fx.store.saveConfig({ autoNotifyDesktop: true, desktopNotificationMode: 'all' });
   fx.emit('turn/snapshot', 'completed', { completedAt: Math.floor(Date.now() / 1000) - 60 }, 'old');
   await settle(fx.bridge); assert.equal(fx.cards.length, 0);
   fx.emit('turn/snapshot', 'completed', { completedAt: Math.ceil(Date.now() / 1000) }, 'fresh');
@@ -175,7 +185,7 @@ test('enabling notifications does not replay old snapshots, but captures a fresh
 });
 
 test('Feishu and local preview turns are excluded even if the binding now points elsewhere', async t => {
-  const fx = fixture(t); fx.store.saveConfig({ autoNotifyDesktop: true });
+  const fx = fixture(t); fx.store.saveConfig({ autoNotifyDesktop: true, desktopNotificationMode: 'all' });
   for (const source of ['feishu', 'management'] as const) {
     fx.store.operation(source, { chatId: 'oc_owner', actorId: 'ou_owner', cwd: fx.dir, threadId: 'desktop', turnId: source, revision: 0, source, status: 'submitted' });
     fx.store.state.conversations.oc_owner!.threadId = 'other-task';
@@ -185,7 +195,7 @@ test('Feishu and local preview turns are excluded even if the binding now points
 });
 
 test('a bridge submission recorded during metadata lookup still suppresses the automatic notification', async t => {
-  const fx = fixture(t); fx.store.saveConfig({ autoNotifyDesktop: true });
+  const fx = fixture(t); fx.store.saveConfig({ autoNotifyDesktop: true, desktopNotificationMode: 'all' });
   let resume!: () => void;
   const blocked = new Promise<void>(resolve => { resume = resolve; });
   fx.runtime.threadInfo = async threadId => { await blocked; return { threadId, cwd: fx.dir, title: 'task', isUserThread: true }; };
@@ -196,7 +206,7 @@ test('a bridge submission recorded during metadata lookup still suppresses the a
 });
 
 test('explicit MCP and automatic notification share one record and explicit requests survive turning the switch off', async t => {
-  const fx = fixture(t); fx.store.saveConfig({ autoNotifyDesktop: true });
+  const fx = fixture(t); fx.store.saveConfig({ autoNotifyDesktop: true, desktopNotificationMode: 'all' });
   fx.emit('turn/started', 'inProgress'); await settle(fx.bridge);
   fx.emit('turn/snapshot', 'inProgress', { items: [{ type: 'mcpToolCall', server: 'feishu_completion', tool: 'request_feishu_completion_notification', arguments: { summary: '用户明确要求的通知' } }] });
   await settle(fx.bridge); fx.store.saveConfig({ autoNotifyDesktop: false });
@@ -207,7 +217,7 @@ test('explicit MCP and automatic notification share one record and explicit requ
 
 test('disabling before completion cancels automatic delivery and a later Feishu continuation suppresses it too', async t => {
   for (const reason of ['off', 'phone']) {
-    const fx = fixture(t); fx.store.saveConfig({ autoNotifyDesktop: true });
+    const fx = fixture(t); fx.store.saveConfig({ autoNotifyDesktop: true, desktopNotificationMode: 'all' });
     fx.emit('turn/started', 'inProgress'); await settle(fx.bridge);
     if (reason === 'off') fx.store.saveConfig({ autoNotifyDesktop: false });
     else fx.store.operation('phone', { chatId: 'oc_owner', actorId: 'ou_owner', cwd: fx.dir, threadId: 'desktop', turnId: 'turn', revision: 0, source: 'feishu', status: 'submitted', mode: 'steer' });
@@ -218,7 +228,7 @@ test('disabling before completion cancels automatic delivery and a later Feishu 
 });
 
 test('failed and interrupted tasks retain their actual outcome and only this turn contributes to the result', async t => {
-  const fx = fixture(t); fx.store.saveConfig({ autoNotifyDesktop: true });
+  const fx = fixture(t); fx.store.saveConfig({ autoNotifyDesktop: true, desktopNotificationMode: 'all' });
   fx.runtime.history = async () => [{ role: 'assistant', text: '无关任务的结果', turnId: 'unrelated', phase: 'final_answer' }, { role: 'assistant', text: '本轮已停止', turnId: 'interrupted', phase: 'final_answer' }];
   fx.emit('turn/completed', 'failed', {}, 'failed'); fx.emit('turn/completed', 'interrupted', {}, 'interrupted');
   await settle(fx.bridge);
@@ -227,7 +237,7 @@ test('failed and interrupted tasks retain their actual outcome and only this tur
 });
 
 test('ephemeral or subagent threads and standalone runtimes do not trigger automatic notifications', async t => {
-  const fx = fixture(t); fx.store.saveConfig({ autoNotifyDesktop: true });
+  const fx = fixture(t); fx.store.saveConfig({ autoNotifyDesktop: true, desktopNotificationMode: 'all' });
   fx.runtime.threadInfo = async threadId => ({ threadId, cwd: fx.dir, title: '内部任务', isUserThread: false });
   fx.completed(); await settle(fx.bridge); assert.equal(fx.cards.length, 0);
   Object.defineProperty(fx.runtime, 'supportsSteering', { value: false });
@@ -236,7 +246,7 @@ test('ephemeral or subagent threads and standalone runtimes do not trigger autom
 });
 
 test('registered automatic notifications recover after restart and stay deduplicated', async t => {
-  const fx = fixture(t); fx.store.saveConfig({ autoNotifyDesktop: true });
+  const fx = fixture(t); fx.store.saveConfig({ autoNotifyDesktop: true, desktopNotificationMode: 'all' });
   fx.emit('turn/started', 'inProgress'); await settle(fx.bridge);
   const restored = new Bridge(new Store(fx.dir), fx.runtime, fx.discovery); restored.transport = fx.transport;
   await restored.deliverPendingNotifications(); await restored.deliverPendingNotifications();

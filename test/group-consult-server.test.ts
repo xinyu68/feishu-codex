@@ -24,10 +24,9 @@ type ConsultRun = { input: RuntimeConsultInput; engine: Engine; cancelled: boole
 async function setup(t: test.TestContext, sourceEngine: Engine = 'codex') {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'group-consult-http-'));
   const seed = new Store(dir);
-  seed.saveConfig({ enabled: true, appId: 'cli_1234567890abcdef', appSecret: 'source-test-secret',
+  seed.saveConfig({ engine: sourceEngine, enabled: true, appId: 'cli_1234567890abcdef', appSecret: 'source-test-secret',
     allowedActors: ['pm-user'], allowedGroups: ['oc_team'], defaultWorkspace: dir, botName: '产品经理',
     roleInstructions: '整理需求', progress: false });
-  seed.saveBot('default', { engine: sourceEngine });
   seed.saveBot('qa', { enabled: true, appId: 'cli_abcdef1234567890', appSecret: 'target-test-secret',
     engine: sourceEngine === 'codex' ? 'hermes' : 'codex', name: '测试人员', roleInstructions: '分析测试问题',
     allowedActors: ['qa-user'], allowedGroups: ['oc_team'] });

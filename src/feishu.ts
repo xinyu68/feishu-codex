@@ -144,6 +144,11 @@ export function parseMessageEvent(input: unknown, options: MessageParsingOptions
   const timestamp = Number(message.create_time);
   if (Number.isFinite(timestamp) && timestamp > 0 && timestamp < 8.64e15) base.at = new Date(timestamp).toISOString();
   if (message.message_type === 'text' && typeof content.text === 'string') {
+    let body = content.text;
+    for (const mention of [...(message.mentions ?? [])].sort((a, b) => b.key.length - a.key.length)) {
+      if (mention.key) body = body.split(mention.key).join('');
+    }
+    if (isGroup && mentioned && !body.trim()) return { message: { ...base, mentionOnly: true } };
     base.text = (isGroup && mentioned ? groupCommandAfterMentions(content.text, message.mentions) : undefined)
       ?? replaceMentionKeys(content.text, message.mentions, observation ? undefined : options.botOpenId).trim();
     return base.text ? { message: base, ...(observation ? { observation: true } : {}) } : undefined;
@@ -152,12 +157,20 @@ export function parseMessageEvent(input: unknown, options: MessageParsingOptions
     const post = normalizePost(content);
     if (!post) return;
     const attachments: Attachment[] = [];
+    let hasContent = Boolean(stringField(post.title).trim());
     const rows = Array.isArray(post.content) ? post.content : [];
     const lines = rows.filter(Array.isArray).map(row => row.map((raw: unknown) => {
       const node = record(raw);
       if (!node) return '';
-      if (node.tag === 'text' || node.tag === 'md') return stringField(node.text);
-      if (node.tag === 'a') return `${stringField(node.text)}${typeof node.href === 'string' ? ` (${node.href})` : ''}`;
+      if (node.tag === 'text' || node.tag === 'md') {
+        const text = replaceMentionKeys(stringField(node.text), message.mentions, options.botOpenId);
+        if (text.trim()) hasContent = true;
+        return stringField(node.text);
+      }
+      if (node.tag === 'a') {
+        if (stringField(node.text).trim() || stringField(node.href).trim()) hasContent = true;
+        return `${stringField(node.text)}${typeof node.href === 'string' ? ` (${node.href})` : ''}`;
+      }
       if (node.tag === 'at') {
         const id = stringField(node.user_id);
         const mention = message.mentions?.find(item => item.key === id || item.id?.open_id === id);
@@ -174,6 +187,7 @@ export function parseMessageEvent(input: unknown, options: MessageParsingOptions
       }
       return '';
     }).join(''));
+    if (isGroup && mentioned && !hasContent && !attachments.length) return { message: { ...base, mentionOnly: true } };
     base.text = replaceMentionKeys([stringField(post.title), ...lines].filter(Boolean).join('\n'), message.mentions, observation ? undefined : options.botOpenId).trim();
     if (!base.text && attachments.length && !observation) base.text = '请查看附件';
     if (!base.text) return;

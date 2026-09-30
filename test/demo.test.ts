@@ -62,7 +62,7 @@ test('demo API preserves multi-bot settings, authorization isolation and public 
     await demoRequest('/api/config', { desktopNotificationTarget: null }, 'PUT');
     await demoRequest('/api/bots/product', { name: '产品助手（演示）' }, 'PATCH');
     assert.equal((await read()).config.desktopNotificationTarget, null);
-    assert.equal((await read()).config.autoNotifyDesktop, false);
+    assert.equal((await read()).config.autoNotifyDesktop, before.config.autoNotifyDesktop);
   });
 
   await t.test('permission decisions only affect the selected bot and pending requests', async () => {
@@ -170,86 +170,20 @@ test('demo API preserves multi-bot settings, authorization isolation and public 
     const activated = await demoRequest(`${route}/credentials`, { appId: 'cli_demohermes', appSecret: '' }) as { bot: BotProfile };
     assert.equal(activated.bot.engine, 'hermes');
     const beforeRejectedCredentials = await read();
-    await assert.rejects(demoRequest(route, { engine: 'codex', appId: 'cli_demohermesreplacement', appSecret: 'demo-secret' }, 'PATCH'), /单独切换/);
+    await assert.rejects(demoRequest(route, { engine: 'codex', appId: 'cli_demohermesreplacement', appSecret: 'demo-secret' }, 'PATCH'), /删除后重新添加/);
     assert.deepEqual(await read(), beforeRejectedCredentials);
     await demoRequest(route, {}, 'DELETE');
     assert.deepEqual((await read()).conversations, previous.conversations);
   });
 
-  await t.test('engine switches isolate conversations, preserve old history and clear notification targets', async () => {
+  await t.test('existing engines are immutable across settings and legacy routes', async () => {
     const initial = await read();
-    const original = initial.conversations.find(item => item.chatId === 'demo-feishu')!;
-    const originalHistory = await demoRequest('/api/history?chatId=demo-feishu');
-    const sessionRoute = `/api/sessions?cwd=${encodeURIComponent(original.cwd)}`;
-    const originalSessions = await demoRequest(sessionRoute);
-    const { chatId: targetChat, actorId, botAppId } = initial.notificationTargets!.find(item => item.botId === 'default')!;
-    const target = { chatId: targetChat, actorId, botAppId };
-    await demoRequest('/api/config', { desktopNotificationTarget: target }, 'PUT');
-    await demoRequest('/api/bind', { chatId: 'local-preview', threadId: 'launch-check', cwd: original.cwd });
-    const localPreview = (await read()).conversations.find(item => item.chatId === 'local-preview');
-
-    const switched = await demoRequest('/api/bots/default', { engine: 'hermes', model: 'must-not-carry', effort: 'high' }, 'PATCH') as { bot: BotProfile };
-    assert.equal(switched.bot.engine, 'hermes');
-    assert.equal(switched.bot.engineStatus?.available, true);
-    assert.equal(switched.bot.model, '');
-    assert.equal(switched.bot.effort, '');
-    assert.deepEqual(switched.bot.allowedActors, bot(initial, 'default').allowedActors);
-    assert.deepEqual(switched.bot.allowedGroups, bot(initial, 'default').allowedGroups);
-    assert.equal(switched.bot.appId, bot(initial, 'default').appId);
-    assert.equal(switched.bot.roleInstructions, bot(initial, 'default').roleInstructions);
-    let state = await read();
-    let conversation = state.conversations.find(item => item.chatId === original.chatId)!;
-    assert.equal(conversation.threadId, undefined);
-    assert.equal(conversation.revision, original.revision! + 1);
-    assert.equal(conversation.model, '');
-    assert.equal(conversation.effort, '');
-    assert.equal(state.config.model, '');
-    assert.equal(state.config.effort, '');
-    assert.deepEqual(bot(state, 'product'), bot(initial, 'product'));
-    assert.deepEqual(state.conversations.find(item => item.chatId === 'local-preview'), localPreview);
-    assert.equal(state.config.desktopNotificationTarget, null);
-    assert.ok(state.notificationTargets!.every(item => item.botId !== 'default'));
-    assert.deepEqual((await demoRequest('/api/history?chatId=demo-feishu') as { messages: unknown[] }).messages, []);
-    assert.deepEqual(await demoRequest(`${sessionRoute}&chatId=demo-feishu`), { sessions: [] });
-    assert.deepEqual(await demoRequest('/api/models?chatId=demo-feishu'), { models: [] });
-    await assert.rejects(demoRequest('/api/config', { desktopNotificationTarget: target }, 'PUT'), /通知接收位置已失效/);
-    await assert.rejects(demoRequest('/api/bind', { chatId: 'demo-feishu', threadId: original.threadId, cwd: original.cwd }), /独立会话/);
-    assert.deepEqual(await demoRequest(sessionRoute), originalSessions);
-
-    await demoRequest('/api/chat', { chatId: 'demo-feishu', text: 'Start a separate Hermes conversation' });
-    const busyState = await read();
-    await assert.rejects(demoRequest('/api/bots/default', { engine: 'codex', name: 'Must not save' }, 'PATCH'), /仍有任务/);
-    assert.deepEqual(await read(), busyState);
-    await demoRequest('/api/bots/product', { engine: 'hermes' }, 'PATCH');
-    assert.equal(bot(await read(), 'product').engine, 'hermes');
-    await demoRequest('/api/bots/product', { engine: 'codex' }, 'PATCH');
-    await demoRequest('/api/bots/product', { model: bot(initial, 'product').model, effort: bot(initial, 'product').effort }, 'PATCH');
-    await new Promise(resolve => setTimeout(resolve, 1400));
-    state = await read();
-    conversation = state.conversations.find(item => item.chatId === original.chatId)!;
-    const hermesThread = conversation.threadId!;
-    assert.match(hermesThread, /^hermes:/);
-    const hermesHistory = await demoRequest('/api/history?chatId=demo-feishu');
-    const hermesSessions = await demoRequest(`${sessionRoute}&chatId=demo-feishu`) as { sessions: { id: string }[] };
-    assert.deepEqual(hermesSessions.sessions.map(item => item.id), [hermesThread]);
-    assert.deepEqual(await demoRequest(sessionRoute), originalSessions);
-
-    await demoRequest('/api/bots/default', { engine: 'codex', model: 'must-not-carry-back', effort: 'high' }, 'PATCH');
-    state = await read();
-    assert.equal(bot(state, 'default').model, '');
-    assert.equal(bot(state, 'default').effort, '');
-    assert.equal(state.config.desktopNotificationTarget, null);
-    assert.ok(state.notificationTargets!.some(item => item.botId === 'default'));
-    assert.equal(state.conversations.find(item => item.chatId === original.chatId)!.threadId, undefined);
-    await assert.rejects(demoRequest('/api/bind', { chatId: 'demo-feishu', threadId: hermesThread, cwd: original.cwd }), /独立会话/);
-    await demoRequest('/api/bind', { chatId: 'demo-feishu', threadId: original.threadId, cwd: original.cwd });
-    assert.deepEqual(await demoRequest('/api/history?chatId=demo-feishu'), originalHistory);
-    await demoRequest('/api/bots/default', { engine: 'hermes' }, 'PATCH');
-    await demoRequest('/api/bind', { chatId: 'demo-feishu', threadId: hermesThread, cwd: original.cwd });
-    assert.deepEqual(await demoRequest('/api/history?chatId=demo-feishu'), hermesHistory);
-    await demoRequest('/api/bots/default', { engine: 'codex' }, 'PATCH');
-    await demoRequest('/api/bind', { chatId: 'demo-feishu', threadId: original.threadId, cwd: original.cwd });
-    await demoRequest('/api/new', { chatId: 'local-preview', cwd: original.cwd });
+    const history = await demoRequest('/api/history?chatId=demo-feishu');
+    for (const [url, method] of [['/api/bots/default', 'PATCH'], ['/api/bots/default/credentials', 'POST'], ['/api/config', 'PUT'], ['/api/credentials', 'POST']]) {
+      await assert.rejects(demoRequest(url!, { engine: 'hermes', name: 'Must not save', appId: 'cli_demoreplacement', appSecret: 'demo-secret' }, method!), /删除后重新添加/);
+      assert.deepEqual(await read(), initial);
+    }
+    assert.deepEqual(await demoRequest('/api/history?chatId=demo-feishu'), history);
   });
 
   await t.test('deleting the first and last bots preserves native history and allows fresh configuration', async () => {

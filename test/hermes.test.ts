@@ -5,7 +5,7 @@ import { once } from 'node:events';
 import { WebSocketServer, type WebSocket } from 'ws';
 import { HermesClient } from '../src/hermes.js';
 import type { CodexRunInput } from '../src/types.js';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -132,6 +132,31 @@ test('Hermes installs a Skill and pins compact independent role references acros
     assert.match(fx.trace.filter(row => row.method === 'prompt.submit')[2]?.params.text, /无自定义角色/);
     assert.equal((await resumed.status()).available, true);
     await assert.rejects(resumed.run({ cwd: 'C:/work', threadId: 'codex-thread', prompt: 'no' }), /不能把 Codex/);
+  } finally { await resumed?.close(); await fx.cleanup(); }
+});
+
+test('a reinstalled Hermes client repairs an edited managed Skill and submits the next message once', async () => {
+  const fx = await fixture();
+  let resumed: HermesClient | undefined;
+  try {
+    const first = await fx.client.run({ cwd: 'C:/work', prompt: 'first' });
+    const skillPath = path.join(fx.hermesHome, 'skills', 'feishu-codex', 'SKILL.md');
+    const bundled = await readFile(skillPath, 'utf8');
+    await fx.client.close();
+    await writeFile(skillPath, bundled + '\nOutdated local troubleshooting notes\n');
+    const start = fx.trace.length;
+    resumed = new HermesClient(fx.clientOptions);
+    const result = await resumed.run({ cwd: 'C:/work', threadId: first.threadId, prompt: 'hello after reinstall' });
+    assert.equal(result.text, 'answer');
+    assert.equal(result.threadId, first.threadId);
+    assert.equal(await readFile(skillPath, 'utf8'), bundled);
+    const next = fx.trace.slice(start);
+    assert.equal(next.filter(request => request.method === 'prompt.submit').length, 1);
+    assert.ok(next.findIndex(request => request.method === 'skills.reload') < next.findIndex(request => request.method === 'prompt.submit'));
+    const backups = path.join(fx.hermesHome, '.feishu-codex', 'skill-backups');
+    const snapshots = await readdir(backups);
+    assert.equal(snapshots.length, 1);
+    assert.equal(await readFile(path.join(backups, snapshots[0]!, 'SKILL.md'), 'utf8'), bundled + '\nOutdated local troubleshooting notes\n');
   } finally { await resumed?.close(); await fx.cleanup(); }
 });
 

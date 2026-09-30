@@ -15,7 +15,7 @@ function fixture(t: test.TestContext) {
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const store = new Store(dir);
   store.saveConfig({ enabled: true, allowedActors: ['ou_alice'], allowedGroups: ['oc_group'], defaultWorkspace: dir, roleInstructions: '开发代码' });
-  store.saveBot('product', { name: '产品经理', enabled: true, allowedActors: ['ou_alice'], allowedGroups: ['oc_group'], roleInstructions: '只做产品方案' });
+  store.saveBot('product', { engine: 'hermes', name: '产品经理', enabled: true, allowedActors: ['ou_alice'], allowedGroups: ['oc_group'], roleInstructions: '只做产品方案' });
   const calls: Array<{ engine: string; input: CodexRunInput }> = [];
   const stops: string[] = [];
   const historyReads: string[] = [];
@@ -59,7 +59,6 @@ function fixture(t: test.TestContext) {
 
 test('Hermes /new resets automatic group background without changing the Codex bot', async t => {
   const h = fixture(t);
-  await h.bridge.setBotEngine('product', 'hermes');
   await h.send(h.productChat, 'OLD-HERMES-REQUIREMENTS');
   const old = h.store.conversation(h.productChat).threadId!;
   await h.send(h.productChat, '/new');
@@ -74,7 +73,6 @@ test('Hermes /new resets automatic group background without changing the Codex b
 
 test('Hermes bot bypasses desktop write gate and retains its independent session and group role', async t => {
   const h = fixture(t);
-  await h.bridge.setBotEngine('product', 'hermes');
   h.setDenied(true);
   await h.send(h.productChat, '记住代号 H731');
   await h.send(h.productChat, '刚才是什么');
@@ -93,7 +91,6 @@ test('Hermes bot bypasses desktop write gate and retains its independent session
 
 test('Hermes cannot bind Codex desktop sessions and Codex cannot bind Hermes sessions', async t => {
   const h = fixture(t);
-  await h.bridge.setBotEngine('product', 'hermes');
   await h.send(h.productChat, '开始方案');
   const oldThread = h.store.conversation(h.productChat).threadId!;
   await assert.rejects(h.bridge.bind(h.productChat, h.dir, 'desktop-thread'), /独立会话/);
@@ -108,29 +105,20 @@ test('Hermes cannot bind Codex desktop sessions and Codex cannot bind Hermes ses
   assert.equal((await h.bridge.sessions('oc_group', h.dir)).some(session => session.id.startsWith('hermes:')), false);
 });
 
-test('engine migration preserves previous bindings and authorization, resets only selected bot', async t => {
+test('store rejects engine changes without changing bindings, history or authorization', async t => {
   const h = fixture(t);
   const product = h.store.conversation(h.productChat, 'ou_alice', h.dir, 'group');
-  Object.assign(product, { threadId: 'old-product', model: 'gpt-model', effort: 'high', title: '旧方案' });
-  const developer = h.store.conversation('oc_group', 'ou_alice', h.dir, 'group');
-  Object.assign(developer, { threadId: 'old-developer', title: '开发任务' });
+  Object.assign(product, { threadId: 'hermes:old-product', title: '旧方案' });
   h.store.message(h.productChat, 'assistant', '保留旧方案');
   h.store.save();
-  await h.bridge.setBotEngine('product', 'hermes');
-  assert.equal(product.threadId, undefined);
-  assert.equal(product.model, '');
-  assert.equal(developer.threadId, 'old-developer');
-  assert.equal(h.store.state.threadBindings['old-product']?.title, '旧方案');
-  assert.deepEqual(h.store.bot('product')!.allowedGroups, ['oc_group']);
-  const backups = fs.readdirSync(path.join(h.dir, 'engine-migrations'));
-  const backup = JSON.parse(fs.readFileSync(path.join(h.dir, 'engine-migrations', backups[0]!), 'utf8'));
-  assert.equal(backup.history[h.productChat][0].text, '保留旧方案');
-  assert.equal(h.store.bot('default')!.engine, 'codex');
+  const before = structuredClone({ config: h.store.config, state: h.store.state });
+  assert.throws(() => h.store.saveBot('product', { engine: 'codex', name: 'Must not save' }), /删除后重新添加/);
+  assert.deepEqual({ config: h.store.config, state: h.store.state }, before);
+  assert.equal(fs.existsSync(path.join(h.dir, 'engine-migrations')), false);
 });
 
 test('Hermes rejects Codex-specific commands with an actionable explanation', async t => {
   const h = fixture(t);
-  await h.bridge.setBotEngine('product', 'hermes');
   for (const command of ['/model', '/effort high', '/usage']) await h.send(h.productChat, command);
   assert.equal(h.calls.length, 0);
   assert.equal(h.cards.filter(card => /请在 Hermes/.test(card.text)).length, 3);
@@ -138,7 +126,6 @@ test('Hermes rejects Codex-specific commands with an actionable explanation', as
 
 test('active product task blocks its engine switch and stop reaches Hermes only', async t => {
   const h = fixture(t);
-  await h.bridge.setBotEngine('product', 'hermes');
   let complete!: () => void;
   h.hermes.run = async input => {
     input.onThread?.('hermes:running');
@@ -147,28 +134,14 @@ test('active product task blocks its engine switch and stop reaches Hermes only'
   };
   const turn = h.send(h.productChat, '长任务');
   while (!complete) await new Promise<void>(resolve => setImmediate(resolve));
-  await assert.rejects(h.bridge.setBotEngine('product', 'codex'), /仍有任务/);
+  assert.throws(() => h.store.saveBot('product', { engine: 'codex' }), /删除后重新添加/);
   await h.bridge.stop(h.productChat);
   assert.deepEqual(h.stops, ['hermes:running']);
   complete(); await turn;
-  await h.bridge.setBotEngine('product', 'codex');
-  assert.equal(h.store.bot('product')!.engine, 'codex');
+  assert.equal(h.store.bot('product')!.engine, 'hermes');
 });
 
-test('a different active Codex desktop turn does not block changing the idle product bot', async t => {
-  const h = fixture(t);
-  let complete!: () => void;
-  h.codex.run = async input => {
-    input.onThread?.('desktop-running');
-    await new Promise<void>(resolve => { complete = resolve; });
-    return { threadId: 'desktop-running', text: 'done' };
-  };
-  const turn = h.send('oc_group', '开发任务');
-  while (!complete) await new Promise<void>(resolve => setImmediate(resolve));
-  await h.bridge.setBotEngine('product', 'hermes');
-  assert.equal(h.store.bot('product')!.engine, 'hermes');
-  complete(); await turn;
-});
+
 
 test('Hermes product can hand off a public group result to the separate Codex developer session', async t => {
   const h = fixture(t);
@@ -176,7 +149,6 @@ test('Hermes product can hand off a public group result to the separate Codex de
   h.store.saveBot('product', { appId: 'cli_abcdef1234567890' });
   for (const chatId of ['oc_group', h.productChat]) h.store.observeGroup({ id: `om_${randomUUID()}`, chatId, actorId: 'ou_alice',
     chatType: 'group', actorTenantKey: 'tenant_test', actorUnionId: 'same_human', text: '授权群协作' });
-  await h.bridge.setBotEngine('product', 'hermes');
   const original = h.hermes.run.bind(h.hermes);
   h.hermes.run = async input => ({ ...await original(input), text: '产品方案：验证码有效期五分钟。\n交接给 @开发人员：按方案实现并测试验证码过期。' });
   await h.send(h.productChat, '设计登录方案后交给开发');
@@ -208,7 +180,6 @@ test('RuntimeRouter forwards live events from both runtimes and unsubscribes bot
 
 test('switching back to Hermes keeps native history and roles while restarting only its automatic group background', async t => {
   const h = fixture(t);
-  await h.bridge.setBotEngine('product', 'hermes');
   await h.send(h.productChat, 'HERMES-NATIVE-HISTORY');
   const oldThread = h.store.conversation(h.productChat).threadId!;
   const originalRole = h.store.state.threadBindings[oldThread]!.roleInstructions;
@@ -262,7 +233,6 @@ test('switching back to Hermes keeps native history and roles while restarting o
 
 test('listing Hermes sessions, choosing the current session and rejected switches keep pending group background', async t => {
   const h = fixture(t);
-  await h.bridge.setBotEngine('product', 'hermes');
   await h.send(h.productChat, 'First Hermes session');
   const originalThread = h.store.conversation(h.productChat).threadId!;
   await h.send(h.productChat, '/new');

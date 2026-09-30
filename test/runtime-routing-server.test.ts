@@ -38,22 +38,19 @@ async function setup(t: test.TestContext, available = true, options: { autoDisco
   }, body: JSON.stringify(value) });
   const patch = (value: unknown, botId = 'product') => request(`/api/bots/${botId}`, value, 'PATCH');
   const create = (value: unknown) => request('/api/bots', value, 'POST');
-  return { app, base, patch, create, runtime, hermes, starts, verifications, failApps };
+  return { app, base, patch, create, request, runtime, hermes, starts, verifications, failApps };
 }
 
-test('bot engine API validates and exposes Hermes health without changing developer', async t => {
+test('bot engine API rejects changes before saving any fields', async t => {
   const h = await setup(t);
   assert.equal((await h.patch({ engine: 'unsupported' })).status, 400);
-  const response = await h.patch({ engine: 'hermes', model: 'must-not-inherit', effort: 'high' });
-  assert.equal(response.status, 200);
-  const body = await response.json() as any;
-  assert.equal(body.bot.engine, 'hermes');
-  assert.equal(body.bot.engineStatus.available, true);
-  assert.equal(body.bot.model, '');
-  assert.equal(body.bot.effort, '');
-  assert.equal(h.app.store.bot('default')!.engine, 'codex');
-  const bots = await fetch(`${h.base}/api/bots`).then(response => response.json()) as any;
-  assert.equal(bots.bots.find((bot: any) => bot.id === 'product').engineStatus.available, true);
+  const before = structuredClone(h.app.store.config);
+  const response = await h.patch({ engine: 'hermes', name: 'Must not save', model: 'must-not-inherit', effort: 'high' });
+  assert.equal(response.status, 409);
+  assert.match(await response.text(), /删除后重新添加/);
+  assert.deepEqual(h.app.store.config, before);
+  assert.deepEqual(h.verifications, []);
+  assert.deepEqual(h.starts, []);
 });
 
 test('unavailable Hermes leaves the selected engine and old conversation binding unchanged', async t => {
@@ -62,7 +59,7 @@ test('unavailable Hermes leaves the selected engine and old conversation binding
   conversation.threadId = 'original-codex-thread';
   h.app.store.save();
   const response = await h.patch({ engine: 'hermes' });
-  assert.equal(response.status, 503);
+  assert.equal(response.status, 409);
   assert.equal(h.app.store.bot('product')!.engine, 'codex');
   assert.equal(conversation.threadId, 'original-codex-thread');
 });
@@ -108,22 +105,32 @@ test('a failed Hermes Feishu connection rolls back the new bot', async t => {
   assert.deepEqual(new Store(h.app.store.dir).bots(), before);
 });
 
-test('switching Hermes back to Codex preserves native bindings and restores Codex model settings', async t => {
+test('existing Hermes bots reject Codex through settings and credentials without losing history', async t => {
   const h = await setup(t);
-  assert.equal((await h.patch({ engine: 'hermes' })).status, 200);
-  const conversation = h.app.store.conversation('bot:product:oc_test', 'ou_alice');
+  const response = await h.create({ name: 'Hermes', engine: 'hermes', appId: 'cli_1122334455667788', appSecret: 'test-secret' });
+  assert.equal(response.status, 201);
+  const { bot } = await response.json() as any;
+  const conversation = h.app.store.conversation('bot:' + bot.id + ':oc_test', 'ou_alice');
   conversation.threadId = 'hermes:saved-session';
   h.app.store.message(conversation.chatId, 'assistant', 'Preserve this native history');
-  const response = await h.patch({ engine: 'codex', model: 'chosen-codex-model', effort: 'high' });
-  assert.equal(response.status, 200);
-  const { bot } = await response.json() as any;
-  assert.equal(bot.engine, 'codex');
-  assert.equal(bot.model, 'chosen-codex-model');
-  assert.equal(bot.effort, 'high');
-  assert.equal(conversation.threadId, undefined);
-  assert.equal(h.app.store.state.threadBindings['hermes:saved-session']?.chatId, conversation.chatId);
-  const snapshots = fs.readdirSync(path.join(h.app.store.dir, 'engine-migrations')).map(file => JSON.parse(fs.readFileSync(path.join(h.app.store.dir, 'engine-migrations', file), 'utf8')));
-  assert.ok(snapshots.some(snapshot => snapshot.from === 'hermes' && snapshot.history[conversation.chatId][0].text === 'Preserve this native history'));
+  h.app.store.save();
+  const before = structuredClone({ config: h.app.store.config, state: h.app.store.state });
+  for (const [suffix, method] of [['', 'PATCH'], ['/credentials', 'POST']]) {
+    const rejected = await h.request('/api/bots/' + bot.id + suffix, { engine: 'codex', appId: 'cli_9988776655443322', appSecret: 'new-secret', name: 'Must not save' }, method!);
+    assert.equal(rejected.status, 409);
+    assert.match(await rejected.text(), /删除后重新添加/);
+    assert.deepEqual({ config: h.app.store.config, state: h.app.store.state }, before);
+  }
+  assert.deepEqual(h.verifications, ['cli_1122334455667788']);
+  assert.deepEqual(h.starts, ['cli_1122334455667788']);
+  assert.equal(fs.existsSync(path.join(h.app.store.dir, 'engine-migrations')), false);
+  assert.equal((await h.patch({ engine: 'hermes', name: '可修改名称' }, bot.id)).status, 200);
+  assert.equal((await h.request('/api/bots/' + bot.id, {}, 'DELETE')).status, 200);
+  const recreated = await h.create({ name: 'Codex', engine: 'codex', appId: bot.appId, appSecret: 'test-secret' });
+  assert.equal(recreated.status, 201);
+  const replacement = (await recreated.json() as any).bot;
+  assert.notEqual(replacement.id, bot.id);
+  assert.equal(replacement.engine, 'codex');
 });
 
 test('Hermes status errors preserve bot details, bindings and the explicit notification recipient', async t => {
@@ -135,26 +142,27 @@ test('Hermes status errors preserve bot details, bindings and the explicit notif
   h.app.store.save();
   h.hermes.status = async () => { throw new Error('Hermes discovery failed'); };
   const response = await h.patch({ engine: 'hermes', name: 'should-not-save' });
-  assert.equal(response.status, 503);
+  assert.equal(response.status, 409);
   assert.equal(h.app.store.bot('product')!.engine, 'codex');
   assert.equal(h.app.store.bot('product')!.name, '产品经理');
   assert.equal(conversation.threadId, 'original-codex-thread');
   assert.deepEqual(h.app.store.config.desktopNotificationTarget, target);
 });
 
-test('successful switch clears only that bot explicit default notification target and persists null', async t => {
+test('legacy configuration and credential routes cannot change an existing engine', async t => {
   const h = await setup(t);
-  const target = { chatId: 'bot:product:oc_test', actorId: 'ou_alice', botAppId: h.app.store.bot('product')!.appId };
+  const target = { chatId: 'oc_test', actorId: 'ou_alice', botAppId: h.app.store.bot('default')!.appId };
   h.app.store.saveConfig({ desktopNotificationTarget: target });
-  assert.equal((await h.patch({ engine: 'hermes' })).status, 200);
-  assert.equal(h.app.store.config.desktopNotificationTarget, null);
-  assert.equal(new Store(h.app.store.dir).config.desktopNotificationTarget, null);
-  assert.equal((await h.patch({ engine: 'codex' })).status, 200);
-  assert.equal(h.app.store.config.desktopNotificationTarget, null, 'switching back does not select another recipient');
-  const otherTarget = { chatId: 'oc_developer', actorId: 'ou_developer', botAppId: h.app.store.bot('default')!.appId };
-  h.app.store.saveConfig({ desktopNotificationTarget: otherTarget });
-  assert.equal((await h.patch({ engine: 'hermes' })).status, 200);
-  assert.deepEqual(h.app.store.config.desktopNotificationTarget, otherTarget);
+  const before = structuredClone(h.app.store.config);
+  for (const [url, method] of [['/api/config', 'PUT'], ['/api/credentials', 'POST'], ['/api/bots/default/credentials', 'POST'], ['/api/bots/default', 'PATCH']]) {
+    const response = await h.request(url!, { engine: 'hermes', appId: 'cli_9988776655443322', appSecret: 'new-secret' }, method!);
+    assert.equal(response.status, 409, url);
+    assert.match(await response.text(), /删除后重新添加/);
+    assert.deepEqual(h.app.store.config, before);
+  }
+  assert.deepEqual(h.verifications, []);
+  assert.deepEqual(h.starts, []);
+  assert.deepEqual(new Store(h.app.store.dir).config.desktopNotificationTarget, target);
 });
 
 test('fresh installs lazily discover Hermes without requiring a runtime configuration file', async t => {
@@ -173,7 +181,7 @@ test('explicit invalid Hermes configuration fails closed for both creation and s
   let checks = 0;
   t.mock.method(HermesClient.prototype, 'status', async () => { checks++; return { available: true }; });
   const h = await setup(t, true, { autoDiscover: true, hermesConfig: '{"type":"desktop","baseUrl":"https://example.com"}' });
-  assert.equal((await h.patch({ engine: 'hermes' })).status, 503);
+  assert.equal((await h.patch({ engine: 'hermes' })).status, 409);
   const response = await h.create({ name: 'Hermes', engine: 'hermes', appId: 'cli_1122334455667788', appSecret: 'test-secret' });
   assert.equal(response.status, 503);
   assert.equal(h.app.store.bots().length, 2);
@@ -208,7 +216,7 @@ test('the engine PATCH refuses active work and leaves its live binding intact', 
 test('an unauthenticated Hermes runtime cannot create or replace a bot', async t => {
   const h = await setup(t);
   h.hermes.status = async () => ({ available: true, authenticated: false });
-  assert.equal((await h.patch({ engine: 'hermes' })).status, 503);
+  assert.equal((await h.patch({ engine: 'hermes' })).status, 409);
   assert.equal((await h.create({ name: 'Hermes', engine: 'hermes', appId: 'cli_1122334455667788', appSecret: 'test-secret' })).status, 503);
   assert.equal(h.app.store.bots().length, 2);
   assert.equal(h.app.store.bot('product')!.engine, 'codex');
@@ -226,7 +234,7 @@ test('default Hermes uses the managed runtime and server shutdown owns its lifet
   t.mock.method(ManagedHermesRuntime.prototype, 'close', async () => { stops++; });
   const h = await setup(t, true, { autoDiscover: true });
   assert.equal(starts, 0, 'Codex-only users do not start Hermes');
-  assert.equal((await h.patch({ engine: 'hermes' })).status, 200);
+  assert.equal((await h.create({ name: 'Hermes', engine: 'hermes', appId: 'cli_1122334455667788', appSecret: 'test-secret' })).status, 201);
   assert.ok(starts > 0, 'the Hermes status path uses the managed backend');
   await h.app.close();
   assert.equal(stops, 1);

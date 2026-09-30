@@ -44,8 +44,8 @@ export class Store {
     fs.mkdirSync(this.dir, { recursive: true });
     this.config = readJson(path.join(dir, 'config.json'), {
       appId: '', appSecret: '', enabled: false, allowedActors: [],
-      defaultWorkspace: process.cwd(), model: '', effort: '', progress: true, autoNotifyDesktop: false,
-      desktopNotificationMode: 'all', desktopNotificationMinMinutes: 1, includeGroupContext: true, privateRoleInstructions: ''
+      defaultWorkspace: process.cwd(), model: '', effort: '', progress: true, autoNotifyDesktop: true,
+      desktopNotificationMode: 'long', desktopNotificationMinMinutes: 1, includeGroupContext: true, privateRoleInstructions: ''
     } satisfies BridgeConfig);
     this.state = readJson(path.join(dir, 'state.json'), {
       version: 1, conversations: {}, history: {}, pendingActors: [], seen: {},
@@ -243,6 +243,9 @@ export class Store {
   saveBot(id: string, patch: Partial<BotProfile>): void {
     if (id === DEFAULT_BOT_ID && this.config.defaultBotRemoved) throw new Error('这个机器人已移除，请重新添加机器人');
     const previous = this.bot(id);
+    if (previous && patch.engine !== undefined && patch.engine !== (previous.engine ?? 'codex')) {
+      throw new Error('机器人创建后不能更换处理对话的 AI，请删除后重新添加。');
+    }
     const next: BotProfile = { name: 'Codex', appId: '', appSecret: '', enabled: false, allowedActors: [], allowedGroups: [],
       roleInstructions: '', privateRoleInstructions: '', model: '', effort: '', ...previous, ...patch, id };
     next.includeGroupContext ??= true;
@@ -310,31 +313,6 @@ export class Store {
       roleInstructions: previous ? previous.roleInstructions : roleInstructions,
       groupContextBoundary: previous ? previous.groupContextBoundary : conversation.groupContextBoundary,
       ...(previous?.groupHandoffPolicyVersion !== undefined ? { groupHandoffPolicyVersion: previous.groupHandoffPolicyVersion } : {}) };
-  }
-  switchBotEngine(botId: string, engine: 'codex' | 'hermes'): void {
-    const bot = this.bot(botId);
-    if (!bot) throw new Error('机器人不存在');
-    if ((bot.engine ?? 'codex') === engine) return;
-    const conversations = Object.values(this.state.conversations).filter(item => item.chatId !== 'local-preview' && parseRoute(item.chatId).botId === botId);
-    const snapshot = { botId, from: bot.engine ?? 'codex', to: engine, at: new Date().toISOString(),
-      conversations, history: Object.fromEntries(conversations.map(item => [item.chatId, this.state.history[item.chatId] ?? []])) };
-    const directory = path.join(this.dir, 'engine-migrations');
-    fs.mkdirSync(directory, { recursive: true });
-    this.atomicWrite(path.join('engine-migrations', `${Date.now()}-${botId}.json`), snapshot);
-    for (const conversation of conversations) {
-      this.rememberThread(conversation);
-      Object.assign(conversation, { threadId: undefined, consultationIdentity: undefined, groupContextBoundary: undefined, model: '', effort: '', title: '新会话', preview: '',
-        revision: (conversation.revision ?? 0) + 1, updatedAt: new Date().toISOString() });
-      this.state.history[conversation.chatId] = [];
-    }
-    for (const notification of Object.values(this.state.notifications)) if (parseRoute(notification.chatId).botId === botId && notification.status === 'registered') notification.status = 'cancelled';
-    for (const artifact of Object.values(this.state.artifacts)) if (parseRoute(artifact.chatId).botId === botId && artifact.status === 'registered') artifact.status = 'failed';
-    this.save();
-    this.saveBot(botId, { engine, model: '', effort: '' });
-    if (engine === 'hermes' && this.config.desktopNotificationTarget
-      && parseRoute(this.config.desktopNotificationTarget.chatId).botId === botId) {
-      this.saveConfig({ desktopNotificationTarget: null });
-    }
   }
   isGroup(chatId: string, config = this.config): boolean {
     const route = parseRoute(chatId);

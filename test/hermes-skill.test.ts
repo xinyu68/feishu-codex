@@ -63,17 +63,12 @@ test('keeps role versions immutable, supports concurrent roles, and never inheri
   assert.equal((await fs.stat(path.join(fx.directory, results[0]!.roleReference!))).mtimeMs, before);
 });
 
-test('preserves unowned and locally edited Skill files', async t => {
+test('preserves unowned Skill files', async t => {
   const unowned = await fixture(t);
   await fs.mkdir(unowned.directory, { recursive: true });
   await fs.writeFile(unowned.skillPath, 'user skill');
   await assert.rejects(unowned.install('role'), errorCode('conflict'));
   assert.equal(await fs.readFile(unowned.skillPath, 'utf8'), 'user skill');
-  const edited = await fixture(t);
-  await edited.install();
-  await fs.writeFile(edited.skillPath, 'user changes');
-  await assert.rejects(edited.install(), errorCode('modified'));
-  assert.equal(await fs.readFile(edited.skillPath, 'utf8'), 'user changes');
 });
 
 test('does not adopt invalid or foreign management markers', async t => {
@@ -150,4 +145,67 @@ test('finds the packaged Skill from the source module without a bundleRoot overr
   assert.equal(result.status, 'installed');
   const source = fileURLToPath(new URL('../skills/feishu-codex-hermes/SKILL.md', import.meta.url));
   assert.equal(await fs.readFile(result.skillPath, 'utf8'), await fs.readFile(source, 'utf8'));
+});
+
+test('reinstall backs up edited managed Skill bytes before restoring the bundled version', async t => {
+  const fx = await fixture(t);
+  const previous = await fx.install('saved role');
+  const markerPath = path.join(fx.directory, '.feishu-codex-managed.json');
+  const originalMarker = await fs.readFile(markerPath);
+  const edits = Buffer.from('\ufeffuser changes 中文\r\n');
+  await fs.writeFile(fx.skillPath, edits);
+  await fs.writeFile(fx.source, 'bundled v2');
+  const personal = path.join(fx.directory, 'personal.md');
+  await fs.writeFile(personal, 'keep this reference');
+  const result = await fx.install('saved role');
+  assert.equal(result.status, 'updated');
+  assert.ok(result.backupPath);
+  assert.equal(path.dirname(path.dirname(result.backupPath)), path.join(fx.hermesHome, '.feishu-codex', 'skill-backups'));
+  assert.deepEqual(await fs.readFile(result.backupPath), edits);
+  assert.deepEqual(await fs.readFile(path.join(path.dirname(result.backupPath), '.feishu-codex-managed.json')), originalMarker);
+  assert.equal(await fs.readFile(fx.skillPath, 'utf8'), 'bundled v2');
+  assert.equal(await fs.readFile(personal, 'utf8'), 'keep this reference');
+  assert.equal(result.roleReference, previous.roleReference);
+  assert.equal(await fs.readFile(path.join(fx.directory, result.roleReference!), 'utf8'), 'saved role');
+  assert.equal(JSON.parse(await fs.readFile(markerPath, 'utf8')).sha256, createHash('sha256').update('bundled v2').digest('hex'));
+  const recovery = JSON.parse(await fs.readFile(path.join(path.dirname(result.backupPath), 'recovery.json'), 'utf8'));
+  assert.equal(recovery.sha256, createHash('sha256').update(edits).digest('hex'));
+  assert.deepEqual(await fx.install(), { status: 'unchanged', skillPath: fx.skillPath });
+  assert.equal((await fs.readdir(path.dirname(path.dirname(result.backupPath)))).length, 1);
+});
+
+test('concurrent bots recover an edited Skill once and share the restored version', async t => {
+  const fx = await fixture(t);
+  await fx.install();
+  await fs.writeFile(fx.skillPath, 'old troubleshooting notes');
+  const results = await Promise.all([fx.install('role A'), fx.install('role B'), fx.install()]);
+  assert.equal(results.filter(result => result.backupPath).length, 1);
+  assert.deepEqual(results.map(result => result.status), ['updated', 'unchanged', 'unchanged']);
+  assert.equal(await fs.readFile(fx.skillPath, 'utf8'), 'bundled v1 中文');
+});
+
+test('backup failure never overwrites modified Skill or its marker', async t => {
+  const fx = await fixture(t);
+  await fx.install();
+  const markerPath = path.join(fx.directory, '.feishu-codex-managed.json');
+  const originalMarker = await fs.readFile(markerPath);
+  await fs.writeFile(fx.skillPath, 'local edits');
+  await fs.writeFile(path.join(fx.hermesHome, '.feishu-codex'), 'not a directory');
+  await assert.rejects(fx.install(), errorCode('conflict'));
+  assert.equal(await fs.readFile(fx.skillPath, 'utf8'), 'local edits');
+  assert.deepEqual(await fs.readFile(markerPath), originalMarker);
+});
+
+test('refuses linked backup directories instead of writing outside the profile', async t => {
+  const fx = await fixture(t);
+  await fx.install();
+  await fs.writeFile(fx.skillPath, 'local edits');
+  const outside = path.join(fx.base, 'outside-backups');
+  await fs.mkdir(outside);
+  const directory = path.join(fx.hermesHome, '.feishu-codex');
+  await fs.mkdir(directory);
+  await linkDirectory(outside, path.join(directory, 'skill-backups'));
+  await assert.rejects(fx.install(), errorCode('conflict'));
+  assert.equal(await fs.readFile(fx.skillPath, 'utf8'), 'local edits');
+  assert.deepEqual(await fs.readdir(outside), []);
 });

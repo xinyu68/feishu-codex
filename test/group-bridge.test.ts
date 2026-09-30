@@ -94,6 +94,31 @@ test('group and actor authorization are both required and are not copied between
   assert.equal(h.runs.length, 1);
 });
 
+test('bare mentions acknowledge each authorized bot once without starting or rebinding a conversation', async t => {
+  const h = setup(t);
+  await h.send('default', '', { id: 'om_ping', mentionOnly: true });
+  await h.send('default', '', { id: 'om_ping', mentionOnly: true });
+  await h.send('dev', '', { id: 'om_ping', mentionOnly: true });
+  assert.equal(h.runs.length, 0);
+  assert.equal(h.sent.length, 2);
+  assert.ok(h.sent.every(item => item.card.text.startsWith('我在。')));
+  assert.deepEqual(h.sent.map(item => item.chatId), ['oc_team', conversationKey('dev', 'oc_team')]);
+  assert.deepEqual(Object.keys(h.store.state.conversations), []);
+  assert.deepEqual(Object.keys(h.store.state.operations), []);
+  assert.equal(h.bridge.hasActiveWork(), false);
+});
+
+test('bare mentions still require both group and actor authorization', async t => {
+  const h = setup(t);
+  await h.send('dev', '', { mentionOnly: true, chatId: 'oc_unknown' });
+  await h.send('dev', '', { mentionOnly: true, actorId: 'ou_unknown' });
+  assert.equal(h.runs.length, 0);
+  assert.equal(h.sent.length, 2);
+  assert.ok(h.sent.every(item => item.card.text.includes('授权')));
+  assert.equal(h.store.state.pendingGroups[0]?.chatId, 'oc_unknown');
+  assert.equal(h.store.state.pendingActors[0]?.actorId, 'ou_unknown');
+});
+
 test('observed public background never starts a run or exposes a private conversation', async t => {
   const h = setup(t);
   h.store.observeGroup(h.message('default', '普通讨论：先做邮箱登录'));

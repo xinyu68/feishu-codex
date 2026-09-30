@@ -22,14 +22,13 @@ type Sent = { chatId: string; card: MessageCard; id: string };
 function setup(t: test.TestContext, sourceEngine: 'codex' | 'hermes' = 'codex') {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'structured-handoff-'));
   const store = new Store(dir);
-  store.saveConfig({ enabled: true, appId: 'cli_1234567890abcdef', allowedActors: ['pm-user'], allowedGroups: ['oc_team'],
+  store.saveConfig({ engine: sourceEngine, enabled: true, appId: 'cli_1234567890abcdef', allowedActors: ['pm-user'], allowedGroups: ['oc_team'],
     defaultWorkspace: dir, botName: '产品经理', roleInstructions: '整理需求', model: 'pm-model', progress: false });
   store.saveBot('dev', { enabled: true, appId: 'cli_abcdef1234567890', name: '开发人员', allowedActors: ['dev-user'],
     allowedGroups: ['oc_team'], roleInstructions: '实现功能', model: 'dev-model' });
   store.saveBot('qa', { enabled: true, appId: 'cli_abcdef0987654321', name: '测试人员', allowedActors: ['qa-user'],
     allowedGroups: ['oc_team'], roleInstructions: '验证功能', model: 'qa-model' });
   store.rememberBotIdentity('dev', { openId: 'ou_dev_bot', name: '开发助手' });
-  if (sourceEngine === 'hermes') store.saveBot('default', { engine: 'hermes' });
   const runs: Run[] = [];
   const sent: Sent[] = [];
   const attempts: Sent[] = [];

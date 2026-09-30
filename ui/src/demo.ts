@@ -21,7 +21,7 @@ const histories = new Map<string, Message[]>([['desktop-workbench', initialMessa
 const sessionChats = new Map<string, string>();
 const state: AppState = {
   csrfToken: 'demo', service: { name: 'Feishu Codex', version: '0.2.0', startedAt: now, uptimeSeconds: 240 },
-  config: { appId: 'cli_demo', hasSecret: true, enabled: true, allowedActors: ['ou_demo'], defaultWorkspace: cwd, model: '', effort: 'high', progress: true, autoNotifyDesktop: false, desktopNotificationMode: 'all', desktopNotificationMinMinutes: 1,
+  config: { appId: 'cli_demo', hasSecret: true, enabled: true, allowedActors: ['ou_demo'], defaultWorkspace: cwd, model: '', effort: 'high', progress: true, autoNotifyDesktop: true, desktopNotificationMode: 'long', desktopNotificationMinMinutes: 1,
     desktopNotificationTarget: { chatId: privateChats[0]!.chatId, actorId: privateChats[0]!.actorId, botAppId: privateChats[0]!.botAppId } },
   connection: { status: 'connected' }, codex: { available: true, authenticated: true, mode: 'shared', version: '0.117.0' },
   runtime: { state: 'ready', canWrite: true, runtime: { state: 'ready' }, bridge: { state: 'ready' }, desktop: { mode: 'shared', running: true } },
@@ -59,10 +59,7 @@ export async function demoRequest(route: string, body?: Record<string, unknown>,
     if (!botRoute[2] && verb === 'PATCH') {
       const patch = botPatch(body!);
       if ((patch.appId !== undefined && patch.appId !== bot.appId) || secretFrom(body!)) return activateCredentials(bot, body!);
-      if (patch.engine && patch.engine !== (bot.engine ?? 'codex')) {
-        switchBotEngine(bot);
-        patch.model = ''; patch.effort = '';
-      }
+      if (patch.engine && patch.engine !== (bot.engine ?? 'codex')) throw new Error('机器人创建后不能更换处理对话的 AI，请删除后重新添加。');
       const saved = saveBot({ ...bot, ...patch });
       return changed({ bot: saved });
     }
@@ -240,7 +237,7 @@ function assertUniqueApp(botId: string, appId: string): void {
 
 function activateCredentials(bot: BotProfile, body: Record<string, unknown>): unknown {
   const patch = botPatch(body);
-  if (state.bots!.some(item => item.id === bot.id) && patch.engine && patch.engine !== (bot.engine ?? 'codex')) throw new Error('请先保存应用凭据，再单独切换机器人执行端。');
+  if (state.bots!.some(item => item.id === bot.id) && patch.engine && patch.engine !== (bot.engine ?? 'codex')) throw new Error('机器人创建后不能更换处理对话的 AI，请删除后重新添加。');
   const appId = patch.appId ?? bot.appId;
   const hasSecret = Boolean(secretFrom(body)) || (appId === bot.appId && bot.hasSecret);
   if (!appId || !hasSecret) throw new Error('请填写有效的飞书 App ID 和 App Secret。');
@@ -260,6 +257,8 @@ function setConnection(bot: BotProfile, body: Record<string, unknown>): unknown 
 }
 
 function saveConfig(body: Record<string, unknown>): unknown {
+  const engine = botPatch({ engine: body.engine }).engine;
+  if (engine && engine !== (requireBot('default').engine ?? 'codex')) throw new Error('机器人创建后不能更换处理对话的 AI，请删除后重新添加。');
   syncDefaultBot();
   const bot = state.bots!.find(item => item.id === 'default');
   const patch = botPatch({ ...body, name: body.botName, engine: undefined });
@@ -322,17 +321,6 @@ function historyFor(conversation: Conversation): Message[] {
   if (!conversation.threadId) return [];
   if (!histories.has(conversation.threadId)) histories.set(conversation.threadId, []);
   return histories.get(conversation.threadId)!;
-}
-
-function switchBotEngine(bot: BotProfile): void {
-  const owned = state.conversations.filter(item => item.chatId !== 'local-preview' && (item.botId || 'default') === bot.id);
-  if (owned.some(item => item.busy || item.queued) || state.pendingRequests.some(item => owned.some(conversation => conversation.chatId === item.chatId))) {
-    throw new Error('这个机器人仍有任务或待处理请求，请等任务结束后切换执行端。');
-  }
-  for (const conversation of owned) {
-    Object.assign(conversation, { threadId: undefined, model: '', effort: '', title: '新会话', preview: '',
-      revision: (conversation.revision || 0) + 1, updatedAt: new Date().toISOString() });
-  }
 }
 
 function engineForChat(chatId?: string): 'codex' | 'hermes' {

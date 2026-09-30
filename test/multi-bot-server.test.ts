@@ -523,15 +523,8 @@ test('deletion is guarded while an accepted message is still checking desktop av
   assert.equal((await h.request('/api/bots/default', {}, 'DELETE')).status, 200);
 });
 
-test('engine changes and transport shutdown serialize against deletion and stale saves', async t => {
+test('transport shutdown serializes against deletion and stale saves', async t => {
   const h = await fixture(t); const bot = await h.create();
-  let release!: () => void; let entered!: () => void;
-  const wait = new Promise<void>(resolve => { release = resolve; }); const entry = new Promise<void>(resolve => { entered = resolve; });
-  h.app.bridge.setBotEngine = async (id, engine) => { entered(); await wait; h.app.store.saveBot(id, { engine }); };
-  const patch = h.request(`/api/bots/${bot.id}`, { engine: 'hermes' }, 'PATCH');
-  await entry;
-  try { assert.equal((await h.request(`/api/bots/${bot.id}`, {}, 'DELETE')).status, 409); }
-  finally { release(); await patch; }
   const transport = (h.app.bridge.transport as TransportRouter).get(bot.id)!;
   let releaseClose!: () => void; let enterClose!: () => void;
   const closeWait = new Promise<void>(resolve => { releaseClose = resolve; }); const closeEntry = new Promise<void>(resolve => { enterClose = resolve; });

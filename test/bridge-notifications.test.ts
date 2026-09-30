@@ -484,7 +484,7 @@ function completionEventFixture(t: test.TestContext) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-final-notifications-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const store = new Store(dir);
-  store.saveConfig({ allowedActors: ['actor'], defaultWorkspace: dir, autoNotifyDesktop: true });
+  store.saveConfig({ allowedActors: ['actor'], defaultWorkspace: dir, autoNotifyDesktop: true, desktopNotificationMode: 'all' });
   Object.assign(store.conversation('oc_notify', 'actor', dir), { threadId: 'desktop-thread' });
   let listener: ((event: import('../src/types.js').RuntimeEvent) => void) | undefined;
   const cards: MessageCard[] = [];

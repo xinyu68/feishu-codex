@@ -57,11 +57,8 @@ async function setup(page: Page, state = fixture(), url = '/') {
       if (operation === 'connection') { bot.enabled = Boolean(input.enabled); bot.connection.status = bot.enabled ? 'connected' : 'stopped'; }
       if (method === 'PATCH') {
         if (input.engine && input.engine !== (bot.engine || 'codex')) {
-          for (const conversation of state.conversations.filter(item => item.botId === id)) {
-            conversation.threadId = undefined; conversation.title = '新会话'; conversation.preview = '';
-          }
-          bot.model = ''; bot.effort = '';
-          if (input.engine === 'hermes' && state.config.desktopNotificationTarget?.botAppId === bot.appId) state.config.desktopNotificationTarget = null;
+          await route.fulfill({ status: 409, json: { error: '机器人创建后不能更换处理对话的 AI，请删除后重新添加。' } });
+          return;
         }
         Object.assign(bot, input);
       }
@@ -654,7 +651,8 @@ test('adding a Hermes bot sends the selected AI and shows Hermes conversation co
   await dialog.getByRole('button', { name: '验证并添加', exact: true }).click();
   await expect(page.getByRole('button', { name: '管理Hermes 产品', exact: true })).toBeVisible();
   await page.getByRole('tab', { name: '对话设置', exact: true }).click();
-  await expect(page.getByRole('combobox', { name: '处理对话的 AI' })).toHaveValue('hermes');
+  await expect(page.locator('.bot-engine-value:visible')).toHaveText('Hermes');
+  await expect(page.getByRole('combobox', { name: '处理对话的 AI' })).toHaveCount(0);
   await expect(page.getByRole('combobox', { name: '机器人模型' })).toHaveCount(0);
   await expect(page.getByRole('textbox', { name: '群聊角色说明' })).toBeVisible();
   await expect(page.getByRole('region', { name: '默认通知机器人' })).toHaveCount(0);
@@ -662,66 +660,42 @@ test('adding a Hermes bot sends the selected AI and shows Hermes conversation co
   expect(state.bots!.find(bot => bot.id === 'default')!.engine).toBeUndefined();
 });
 
-test('switching AI is explicit, cancel restores focus, and switching both ways keeps other bots unchanged', async ({ page }) => {
+test('existing bots show a read-only engine and preserve their conversation controls', async ({ page }) => {
   const state = fixture();
-  state.config.desktopNotificationTarget = { botAppId: 'cli_product', chatId: 'oc_product', actorId: 'ou_product' };
+  state.bots![1].engine = 'hermes';
+  state.config.desktopNotificationTarget = { botAppId: 'cli_default', chatId: 'oc_default', actorId: 'ou_default' };
+  const before = structuredClone(state);
+  const { writes } = await setup(page, state);
+  await page.getByRole('button', { name: '机器人', exact: true }).click();
+  await page.getByRole('tab', { name: '对话设置', exact: true }).click();
+  await expect(page.locator('.bot-engine-value:visible')).toHaveText('Codex');
+  await expect(page.getByRole('combobox', { name: '处理对话的 AI' })).toHaveCount(0);
+  await expect(page.getByRole('combobox', { name: '机器人模型' })).toBeVisible();
+  await page.getByRole('button', { name: '管理产品经理', exact: true }).click();
+  await expect(page.locator('.bot-engine-value:visible')).toHaveText('Hermes');
+  await expect(page.getByRole('combobox', { name: '处理对话的 AI' })).toHaveCount(0);
+  await expect(page.getByRole('tabpanel', { name: '对话设置' }).getByText('创建后不可更换；如需更换，请删除后重新添加。')).toBeVisible();
+  await expect(page.getByRole('combobox', { name: '机器人模型' })).toHaveCount(0);
+  await expect(page.getByRole('textbox', { name: '群聊角色说明' })).toBeVisible();
+  await expect(page.getByRole('button', { name: '删除机器人', exact: true })).toBeVisible();
+  await page.screenshot({ path: test.info().outputPath('fixed-engine-settings.png') });
+  expect(writes).toEqual([]);
+  expect(state).toEqual(before);
+});
+
+test('unavailable Hermes shows an error while its engine and binding stay fixed', async ({ page }) => {
+  const state = fixture();
+  state.bots![1].engine = 'hermes';
+  state.bots![1].engineStatus = { available: false, error: 'Hermes 服务尚未就绪，请检查本机安装和模型配置。' };
   const { writes } = await setup(page, state);
   await page.getByRole('button', { name: '机器人', exact: true }).click();
   await page.getByRole('button', { name: '管理产品经理', exact: true }).click();
-  const selector = page.getByRole('combobox', { name: '处理对话的 AI' });
-  await selector.selectOption('hermes');
-  let dialog = page.getByRole('alertdialog', { name: '切换到 Hermes？' });
-  await expect(dialog.getByRole('button', { name: '取消', exact: true })).toBeFocused();
-  await expect(dialog).toContainText('私聊和群聊将从新的 Hermes 会话开始');
-  await expect(dialog).toContainText('需重新选择 Codex 桌面通知');
-  await expect(page.getByRole('textbox', { name: '群聊角色说明' })).toBeDisabled();
-  await page.keyboard.press('Escape');
-  await expect(dialog).not.toBeVisible();
-  await expect(selector).toBeFocused();
-  await expect(selector).toHaveValue('codex');
-  expect(writes).toEqual([]);
-  await selector.selectOption('hermes');
-  await dialog.getByRole('button', { name: '确认切换', exact: true }).click();
-  await expect(dialog).not.toBeVisible();
-  await expect(selector).toHaveValue('hermes');
-  await expect(page.getByRole('combobox', { name: '机器人模型' })).toHaveCount(0);
-  expect(state.config.desktopNotificationTarget).toBeNull();
-  expect(state.conversations.find(item => item.botId === 'product')!.threadId).toBeUndefined();
-  expect(state.conversations.find(item => item.botId === 'default')!.threadId).toBe('thread-development');
-  await page.screenshot({ path: test.info().outputPath('hermes-settings.png') });
-  await selector.selectOption('codex');
-  dialog = page.getByRole('alertdialog', { name: '切换到 Codex？' });
-  await dialog.getByRole('button', { name: '确认切换', exact: true }).click();
-  await expect(dialog).not.toBeVisible();
-  await expect(selector).toHaveValue('codex');
-  await expect(page.getByRole('combobox', { name: '机器人模型' })).toBeVisible();
-  expect(writes).toEqual([
-    { path: '/api/bots/product', method: 'PATCH', body: { engine: 'hermes' } },
-    { path: '/api/bots/product', method: 'PATCH', body: { engine: 'codex' } },
-  ]);
-});
-
-test('unavailable Hermes leaves the old selection and binding and allows retry after startup', async ({ page }) => {
-  const { state } = await setup(page);
-  let unavailable = true;
-  await page.route('**/api/bots/product', async route => {
-    if (route.request().method() === 'PATCH' && unavailable) {
-      unavailable = false;
-      await route.fulfill({ status: 503, json: { error: 'Hermes 尚未启动，请先打开 Hermes。' } });
-    } else await route.fallback();
-  });
-  await page.getByRole('button', { name: '机器人', exact: true }).click();
-  await page.getByRole('button', { name: '管理产品经理', exact: true }).click();
-  const selector = page.getByRole('combobox', { name: '处理对话的 AI' });
-  await selector.selectOption('hermes');
-  const dialog = page.getByRole('alertdialog', { name: '切换到 Hermes？' });
-  await dialog.getByRole('button', { name: '确认切换', exact: true }).click();
-  await expect(dialog.getByRole('alert')).toContainText('Hermes 尚未启动');
-  await expect(selector).toHaveValue('codex');
+  await page.getByRole('tab', { name: '对话设置', exact: true }).click();
+  await expect(page.locator('.bot-engine-value:visible')).toHaveText('Hermes');
+  await expect(page.getByRole('combobox', { name: '处理对话的 AI' })).toHaveCount(0);
+  await expect(page.locator('.bot-engine-error')).toContainText('Hermes 服务尚未就绪');
   expect(state.conversations.find(item => item.botId === 'product')!.threadId).toBe('thread-product');
-  await dialog.getByRole('button', { name: '确认切换', exact: true }).click();
-  await expect(dialog).not.toBeVisible();
-  await expect(selector).toHaveValue('hermes');
+  expect(writes).toEqual([]);
 });
 
 test('a rejected Hermes creation keeps its credentials and selected AI for retry', async ({ page }) => {

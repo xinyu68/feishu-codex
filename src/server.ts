@@ -222,7 +222,7 @@ export async function startServer(options: { port?: number; dataDir?: string; co
     if (!/^cli_[\da-f]{16}$/i.test(appId) || !appSecret) throw new UserError('请填写有效的飞书 App ID 和 App Secret。');
     assertUniqueApp(botId, appId);
     const existingBot = store.bot(botId);
-    if (patch.engine && existingBot && patch.engine !== (existingBot.engine ?? 'codex')) throw new UserError('请先保存应用凭据，再单独切换机器人执行端。');
+    if (existingBot) assertBotEngineUnchanged(existingBot, patch);
     changingConnection = true;
     const previous = store.bot(botId);
     if (previous && previous.appId !== appId && (previous.allowedActors.length || previous.allowedGroups.length)) {
@@ -378,6 +378,7 @@ export async function startServer(options: { port?: number; dataDir?: string; co
           if (!botRoute[2] && request.method === 'PATCH') {
             if (changingConnection) throw new UserError('连接状态正在更新，请稍后重试。', 409);
             const patch = validateBot(body);
+            assertBotEngineUnchanged(current, patch);
             const changed = (patch.appId !== undefined && patch.appId !== current.appId) || Boolean(patch.appSecret && patch.appSecret !== current.appSecret);
             if (changed) {
               const appId = patch.appId ?? current.appId;
@@ -386,11 +387,6 @@ export async function startServer(options: { port?: number; dataDir?: string; co
             }
             changingConnection = true;
             try {
-              if (patch.engine && patch.engine !== (current.engine ?? 'codex')) {
-                await bridge.setBotEngine(botId, patch.engine);
-                hermesStatusAt = 0;
-                await checkHermes();
-              }
               requireBot(botId);
               if ((patch.engine ?? current.engine) === 'hermes') { patch.model = ''; patch.effort = ''; }
               store.saveBot(botId, patch);
@@ -410,6 +406,7 @@ export async function startServer(options: { port?: number; dataDir?: string; co
         }
         if (request.method === 'POST' && url.pathname === '/api/credentials') {
           requireBot('default');
+          if (body.engine !== undefined) assertBotEngineUnchanged(requireBot('default'), validateBot({ engine: body.engine }));
           const credentials = validateConfig(body);
           const appId = credentials.appId ?? store.config.appId;
           const appSecret = credentials.appSecret ?? (appId === store.config.appId ? store.config.appSecret : '');
@@ -417,6 +414,7 @@ export async function startServer(options: { port?: number; dataDir?: string; co
         }
         if (request.method === 'PUT' && url.pathname === '/api/config') {
           if (changingConnection) throw new UserError('连接状态正在更新，请稍后重试。', 409);
+          if (body.engine !== undefined) assertBotEngineUnchanged(requireBot('default'), validateBot({ engine: body.engine }));
           const patch = validateConfig(body);
           if (['appId', 'appSecret', 'enabled', 'allowedActors', 'allowedGroups', 'botName', 'roleInstructions', 'privateRoleInstructions', 'includeGroupContext'].some(key => key in patch)) requireBot('default');
           assertUniqueApp('default', patch.appId ?? store.config.appId);
@@ -678,6 +676,12 @@ function validateIdList(value: unknown, pattern: RegExp, error: string): string[
   if (!Array.isArray(value) || value.length > 100 || value.some(id => typeof id !== 'string' || !pattern.test(id))) throw new UserError(error);
   return [...new Set(value as string[])];
 }
+function assertBotEngineUnchanged(bot: BotProfile, patch: Partial<BotProfile>): void {
+  if (patch.engine !== undefined && patch.engine !== (bot.engine ?? 'codex')) {
+    throw new UserError('机器人创建后不能更换处理对话的 AI，请删除后重新添加。', 409);
+  }
+}
+
 function validateBot(body: Record<string, unknown>): Partial<BotProfile> {
   const patch: Partial<BotProfile> = {};
   if (body.engine !== undefined) {

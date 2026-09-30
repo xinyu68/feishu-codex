@@ -14,6 +14,8 @@ export interface HermesSkillOptions {
 export interface HermesSkillResult {
   status: 'installed' | 'updated' | 'unchanged';
   skillPath: string;
+  /** Preserved local edits, outside Hermes' indexed skills directory. */
+  backupPath?: string;
   /** Path relative to the installed Skill directory, never another role's reference. */
   roleReference?: string;
   roleHash?: string;
@@ -145,16 +147,22 @@ async function install(options: HermesSkillOptions): Promise<HermesSkillResult> 
   if (!installedMarker || installedMarker.schema !== 1 || installedMarker.owner !== owner || typeof installedMarker.sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(installedMarker.sha256)) {
     throw new HermesSkillError('conflict', 'Hermes Skill 不属于本应用，未接管现有 Skill');
   }
-  const currentHash = digest(await regularFile(skillPath));
+  const current = await regularFile(skillPath);
+  const currentHash = digest(current);
   // An interrupted update may have published the new Skill before its marker.
-  if (currentHash !== installedMarker.sha256 && currentHash !== desiredHash) {
-    throw new HermesSkillError('modified', 'Hermes Skill 已被本地修改，未覆盖现有内容');
-  }
+  const modified = currentHash !== installedMarker.sha256 && currentHash !== desiredHash;
   const reference = role ? await ensureRole(directory, role) : {};
+  // Managed integration rules follow the installed app version. Preserve edits
+  // before repairing them so an upgrade/reinstall cannot permanently block chat.
+  const backupPath = modified ? await backupModifiedSkill(options.hermesHome, current, markerBytes, desiredHash) : undefined;
+  if (backupPath && (digest(await regularFile(skillPath)) !== currentHash || digest(await regularFile(markerFile)) !== digest(markerBytes))) {
+    throw new HermesSkillError('busy', 'Hermes Skill 在备份期间发生变化，已保留原文件，请稍后重试');
+  }
   const unchanged = currentHash === desiredHash && installedMarker.sha256 === desiredHash;
   if (currentHash !== desiredHash) await replaceFile(skillPath, source);
   if (!unchanged) await replaceFile(markerFile, marker);
-  return { status: unchanged ? 'unchanged' : 'updated', skillPath, ...reference };
+  if (backupPath) console.warn(`Hermes 内置 Skill 已恢复为应用版本；原内容备份：${backupPath}`);
+  return { status: unchanged ? 'unchanged' : 'updated', skillPath, ...(backupPath ? { backupPath } : {}), ...reference };
 }
 
 /** Installs only the managed Skill and immutable role references in the selected profile. */
@@ -169,4 +177,27 @@ export async function ensureHermesSkill(options: HermesSkillOptions): Promise<He
   installations.set(key, operation);
   try { return await operation; }
   finally { if (installations.get(key) === operation) installations.delete(key); }
+}
+
+async function backupModifiedSkill(hermesHome: string, content: Buffer, marker: Buffer, replacementHash: string): Promise<string> {
+  const directory = path.join(hermesHome, '.feishu-codex');
+  const backups = path.join(directory, 'skill-backups');
+  await ensureDirectory(directory);
+  await ensureDirectory(backups);
+  const snapshot = path.join(backups, `${new Date().toISOString().replace(/[:.]/g, '-')}-${randomUUID()}`);
+  await fs.mkdir(snapshot);
+  const skillPath = path.join(snapshot, 'SKILL.md');
+  const markerPath = path.join(snapshot, markerName);
+  // Do not touch the installed files unless both original byte streams were
+  // successfully saved and read back. Even incomplete backups are retained.
+  await fs.writeFile(skillPath, content, { flag: 'wx' });
+  await fs.writeFile(markerPath, marker, { flag: 'wx' });
+  await fs.writeFile(path.join(snapshot, 'recovery.json'), JSON.stringify({
+    schema: 1, owner, sha256: digest(content), replacementSha256: replacementHash,
+    reason: 'managed-skill-modified', createdAt: new Date().toISOString(),
+  }, null, 2) + '\n', { flag: 'wx' });
+  if (digest(await regularFile(skillPath)) !== digest(content) || digest(await regularFile(markerPath)) !== digest(marker)) {
+    throw new HermesSkillError('modified', 'Hermes Skill 备份校验失败，已保留现有内容');
+  }
+  return skillPath;
 }

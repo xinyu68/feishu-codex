@@ -69,10 +69,9 @@ test('invalid threshold is clearly rejected without persisting or falsely report
 test('expanded long-task controls fit the compact desktop window', async ({ page }) => {
   await page.setViewportSize({ width: 900, height: 640 });
   await defaults(page, '/?demo=1');
-  await expect(page.getByText('需要时可说“做完飞书通知我”，仅通知本轮。')).toBeInViewport();
-  expect(await page.locator('.settings-content').evaluate(element => element.scrollHeight - element.clientHeight)).toBe(0);
-  await page.getByRole('checkbox', { name: '桌面任务完成后通知飞书' }).check();
-  await page.getByRole('combobox', { name: '桌面通知范围' }).selectOption('long');
+  await expect(page.getByRole('checkbox', { name: '桌面任务完成后通知飞书' })).toBeChecked();
+  await expect(page.getByRole('combobox', { name: '桌面通知范围' })).toHaveValue('long');
+  await expect(page.getByRole('spinbutton', { name: '长任务通知阈值（分钟）' })).toHaveValue('1');
   await expect(page.getByRole('spinbutton', { name: '长任务通知阈值（分钟）' })).toBeInViewport();
   await expect(page.getByText('从本轮开始执行到结束计时；明确要求的通知不受时长限制。')).toBeInViewport();
   expect(await page.locator('.settings-content').evaluate(element => element.scrollHeight - element.clientHeight)).toBe(0);
