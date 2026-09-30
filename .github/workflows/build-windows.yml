@@ -29,6 +29,8 @@ jobs:
           $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
           if ($env:RELEASE_TAG -ne "v$version") { throw "Release tag $env:RELEASE_TAG does not match package version v$version" }
       - run: npm ci
+      - name: Prepare Electron for native window tests
+        run: node node_modules/electron/install.js
       - run: npm run typecheck
       - run: npm test
       - run: npm run package:win
