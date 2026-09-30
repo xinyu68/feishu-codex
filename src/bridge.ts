@@ -2028,7 +2028,7 @@ function formatStatusTime(value: string): string {
 }
 
 async function requireHermesConsultation(runtime: CodexRuntime, signal: AbortSignal): Promise<void> {
-  const checkSignal = AbortSignal.any([signal, AbortSignal.timeout(8000)]);
+  const checkSignal = AbortSignal.any([signal, AbortSignal.timeout(30_000)]);
   let cancel!: () => void;
   const interrupted = new Promise<never>((_, reject) => {
     cancel = () => reject(checkSignal.reason);
@@ -2042,7 +2042,7 @@ async function requireHermesConsultation(runtime: CodexRuntime, signal: AbortSig
     signal.throwIfAborted();
     // Discovery errors can contain native connection details. Return a fixed,
     // actionable message before publishing anything or submitting a model task.
-    throw new GroupConsultError('无法连接本机 Hermes 服务，请先打开 Hermes 并确认可以正常对话，再重新发起任务。本次尚未向群里提问或提交咨询，请勿自动重试。', 503);
+    throw new GroupConsultError('Hermes 服务尚未就绪，请在应用的机器人页面检查本机 Hermes 安装与连接状态，再重新发起任务。本次尚未向群里提问或提交咨询，请勿自动重试。', 503);
   } finally {
     checkSignal.removeEventListener('abort', cancel);
   }

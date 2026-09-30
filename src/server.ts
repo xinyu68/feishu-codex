@@ -7,6 +7,7 @@ import { Store, localDay } from './store.js';
 import { Bridge, UserError, errorText } from './bridge.js';
 import { CodexClient } from './codex.js';
 import { HermesClient } from './hermes.js';
+import { ManagedHermesRuntime } from './hermes-runtime.js';
 import { normalizeHermesDashboardUrl } from './hermes-discovery.js';
 import { RuntimeRouter } from './runtime-router.js';
 import { GroupConsultError } from './group-consult.js';
@@ -38,7 +39,11 @@ export async function startServer(options: { port?: number; dataDir?: string; co
     canWatch: async () => { try { await checkWrite(); return true; } catch { return false; } },
     isConsultationThread: threadId => store.isConsultationThread(threadId),
   });
-  const runtimes = new RuntimeRouter(codex, options.hermes ?? (hermesConnection ? new HermesClient(hermesConnection) : undefined));
+  const managedHermes = !options.hermes && hermesConnection && !hermesConnection.baseUrl
+    ? new ManagedHermesRuntime({ log: (level, text) => store.log(level, text) }) : undefined;
+  const runtimes = new RuntimeRouter(codex, options.hermes ?? (hermesConnection ? new HermesClient({
+    ...hermesConnection, ...(managedHermes ? { discover: () => managedHermes.ensure() } : {}),
+  }) : undefined));
   const releaseLock = acquireLock(store.dir);
   const projects = async () => {
     const discovered = await (options.discovery?.projects ?? discoverProjects)();
@@ -537,6 +542,10 @@ export async function startServer(options: { port?: number; dataDir?: string; co
   store.log('info', `管理页已启动：http://127.0.0.1:${actualPort}`);
   store.log('info', runtime.mode === 'shared' ? 'Codex 使用共享会话服务' : 'Codex 使用每轮独立进程');
   void checkCodex();
+  // Warm/recover only when a Hermes bot exists. No gateway or event receiver is started.
+  void checkHermes();
+  const hermesHeartbeat = setInterval(() => { if (!closing) void checkHermes(); }, 15_000);
+  hermesHeartbeat.unref();
   const startup = (async () => {
     for (const bot of store.bots()) {
       if (closing) break;
@@ -549,10 +558,13 @@ export async function startServer(options: { port?: number; dataDir?: string; co
     unsubscribeBridge();
     clearInterval(heartbeat);
     clearInterval(hostHeartbeat);
+    clearInterval(hermesHeartbeat);
     for (const subscriber of subscribers) subscriber.end();
     subscribers.clear();
     await startup;
-    await bridge.close();
+    const closeErrors: unknown[] = [];
+    try { await bridge.close(); } catch (error) { closeErrors.push(error); }
+    try { await managedHermes?.close(); } catch (error) { closeErrors.push(error); }
     await router.close().catch(error => store.log('warn', `飞书连接关闭失败：${errorText(error)}`));
     await new Promise<void>((resolve) => {
       server.close(() => resolve());
@@ -561,13 +573,14 @@ export async function startServer(options: { port?: number; dataDir?: string; co
       server.closeAllConnections();
     });
     releaseLock();
+    if (closeErrors.length) throw new AggregateError(closeErrors, '部分对话服务未能正常退出。');
   };
   return { server, store, bridge, port: actualPort, close };
 }
 
 function readHermesConnection(dataDir: string, warn: (text: string) => void): { baseUrl?: string } | undefined {
   const file = path.join(dataDir, 'hermes-runtime.json');
-  // A fresh installation discovers an already-running Desktop only when Hermes is used.
+  // Default: own a headless runtime. Explicit loopback URLs remain externally managed.
   if (!fs.existsSync(file)) return {};
   try {
     const config = JSON.parse(fs.readFileSync(file, 'utf8')) as Record<string, unknown>;

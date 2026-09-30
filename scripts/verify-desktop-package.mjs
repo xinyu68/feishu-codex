@@ -31,6 +31,8 @@ export async function verifyDesktopPackage(resources) {
   const product = path.join(resources, 'product');
   const skill = 'skills/feishu-codex/SKILL.md';
   if (digest(await fs.readFile(path.join(sourceRoot, skill))) !== digest(await fs.readFile(path.join(product, skill)))) throw new Error('安装包内置 Skill 缺失或不完整。');
+  const hermesLauncher = 'scripts/hermes-runtime.py';
+  if (digest(await fs.readFile(path.join(sourceRoot, hermesLauncher))) !== digest(await fs.readFile(path.join(product, hermesLauncher)))) throw new Error('安装包 Hermes 启动组件缺失或不完整。');
   const expected = path.join(sourceRoot, '.desktop-package', 'product', 'node_modules');
   const dependencyFiles = await verifyDependencyTree(expected, path.join(product, 'node_modules'));
   const node = path.join(resources, 'node', 'node.exe');

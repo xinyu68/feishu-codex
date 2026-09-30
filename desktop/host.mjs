@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 import WebSocket from 'ws';
 import { atomicJson, captureProcessTree, closeWindowVerified, inspectWindows, readJson, runPowerShell, stopVerified } from './windows.mjs';
 import { canonicalEnvironment, canRetireReusedIdentity, desktopMode, matchesEntry, RestartBudget, samePath, sameProcess, writePermission } from './lifecycle.mjs';
-import { closeSharedDesktop, sharedDesktopToClose } from './shutdown.mjs';
+import { checkIdleServices, closeSharedDesktop, sharedDesktopToClose, waitForChildExit } from './shutdown.mjs';
 import { independentDesktop, stopIndependentDesktop } from './switch-desktop.mjs';
 import { defaultCodexHome, installBundledSkill, managedSkillOwner } from './bundled-skill.mjs';
 import { waitForLaunchAccount } from './launch-account.mjs';
@@ -388,7 +388,14 @@ export async function startHost(options = {}) {
   }
 
   async function shutdown({ closeDesktop = false, uninstall = false } = {}) {
-    await checkWrite();
+    const started = performance.now();
+    const timings = {};
+    const timed = async (name, operation) => {
+      const start = performance.now();
+      try { return await operation(); } finally { timings[name] = Math.round(performance.now() - start); }
+    };
+    snapshot = await timed('inspect', () => inspectFresh());
+    desktop = desktopMode(snapshot, Number(ws.port), launchedDesktop);
     if (Object.values(components).some(item => item.child?.pid && item.child.exitCode === null && !item.identity)) throw new Error('仍在确认刚启动的服务身份，请稍后退出。');
     const independent = uninstall && desktopMode(snapshot, Number(ws.port), launchedDesktop).mode === 'independent';
     const preservedDesktop = independent ? snapshot.desktopRoots?.[0] : null;
@@ -397,57 +404,65 @@ export async function startHost(options = {}) {
     // Pause bridge submissions before inspecting tasks or closing the desktop.
     stopping = true; await publish();
     try {
-      const assertIdle = async () => {
-        snapshot = await inspectFresh();
-        if (components.runtime.identity && snapshot.processes.some(candidate => sameProcess(components.runtime.identity, candidate))) {
-          const state = await probe(wsUrl, { idle: true, timeout: 20_000 });
-          if (state.active) throw new Error('还有 Codex 任务正在运行，请等任务完成，或先在 Codex 中停止任务，再退出应用。');
-        } else if (desktopIdentity) throw new Error('无法确认 Codex 的任务状态，请恢复连接后再退出。');
-        if (components.bridge.identity && snapshot.processes.some(candidate => sameProcess(components.bridge.identity, candidate))) {
-          const state = await (await fetch(`http://127.0.0.1:${bridgePort}/api/state`, { signal: AbortSignal.timeout(5_000) })).json();
-          if (state.activeWork || state.conversations?.some(conversation => conversation.busy) || state.pendingRequests?.length) throw new Error('飞书还有正在处理的消息，请稍后退出。');
-        }
+      const assertIdle = async current => {
+        const runtimeExists = components.runtime.identity && current.processes.some(candidate => sameProcess(components.runtime.identity, candidate));
+        const bridgeExists = components.bridge.identity && current.processes.some(candidate => sameProcess(components.bridge.identity, candidate));
+        if (!runtimeExists && desktopIdentity) throw new Error('无法确认 Codex 的任务状态，请恢复连接后再退出。');
+        return checkIdleServices({
+          runtime: runtimeExists ? () => probe(wsUrl, { idle: true, timeout: 20_000 }) : undefined,
+          bridge: bridgeExists ? async () => {
+            const response = await fetch(`http://127.0.0.1:${bridgePort}/api/state`, { signal: AbortSignal.timeout(5_000) });
+            if (!response.ok) throw new Error('无法确认飞书任务状态，请稍后重试退出。');
+            return response.json();
+          } : undefined,
+        });
       };
+      let current = snapshot;
       if (desktopIdentity) {
-        await closeSharedDesktop({ inspect: () => inspectFresh(), sharedPort: Number(ws.port), launched: desktopIdentity, assertIdle,
+        current = await timed('closeDesktop', () => closeSharedDesktop({ inspect: () => inspectFresh(), initialSnapshot: current, sharedPort: Number(ws.port), launched: desktopIdentity, assertIdle,
           captureTree: identity => captureProcessTree(root, dataDir, identity),
-          requestClose: identity => closeWindowVerified(root, dataDir, identity), terminate: identity => stopVerified(root, dataDir, identity) });
+          requestClose: identity => closeWindowVerified(root, dataDir, identity), terminate: identity => stopVerified(root, dataDir, identity) }));
         await log('已关闭本应用打开的共享 Codex。');
       }
       // Recheck live work after the close request, then use that same fresh
       // inspection to reject a newly opened desktop before stopping services.
-      await assertIdle();
-      desktop = desktopMode(snapshot, Number(ws.port), launchedDesktop);
-      if (desktop.mode !== 'closed' && !(independent && desktop.mode === 'independent' && sameProcess(preservedDesktop, snapshot.desktopRoots?.[0]))) throw new Error('检测到新打开的 Codex，已保留连接服务。请稍后重试退出。');
+      const state = await timed('checkTasks', () => assertIdle(current));
+      const assertDesktopClosed = current => {
+        desktop = desktopMode(current, Number(ws.port), launchedDesktop);
+        if (desktop.mode !== 'closed' && !(independent && desktop.mode === 'independent' && sameProcess(preservedDesktop, current.desktopRoots?.[0]))) throw new Error('检测到新打开的 Codex，已保留连接服务。请稍后重试退出。');
+      };
+      assertDesktopClosed(current);
       const bridge = components.bridge;
-      if (bridge.identity && snapshot.processes.some(candidate => sameProcess(bridge.identity, candidate))) {
-        const state = await (await fetch(`http://127.0.0.1:${bridgePort}/api/state`, { signal: AbortSignal.timeout(5_000) })).json();
-        if (state.activeWork || state.conversations?.some(conversation => conversation.busy) || state.pendingRequests?.length) throw new Error('飞书还有正在处理的消息，请稍后退出。');
+      if (state) await timed('closeBridge', async () => {
         const response = await fetch(`http://127.0.0.1:${bridgePort}/api/shutdown`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Bridge-Token': state.csrfToken }, body: '{}', signal: AbortSignal.timeout(10_000) });
         if (!response.ok) throw new Error('飞书服务暂时无法安全退出，请稍后重试。');
+        const deadline = performance.now() + 15_000;
+        if (bridge.child?.pid === bridge.identity.pid) await waitForChildExit(bridge.child);
         let exited = false;
-        for (let i = 0; i < 12; i++) {
-          await new Promise(resolve => setTimeout(resolve, 500)); snapshot = await inspectFresh();
-          if (!snapshot.processes.some(candidate => sameProcess(bridge.identity, candidate)) && !snapshot.connections.some(connection => connection.state === 'Listen' && connection.localPort === bridgePort)) { exited = true; break; }
+        while (performance.now() < deadline) {
+          current = await inspectFresh();
+          if (!current.processes.some(candidate => sameProcess(bridge.identity, candidate)) && !current.connections.some(connection => connection.state === 'Listen' && connection.localPort === bridgePort)) { exited = true; break; }
+          await new Promise(resolve => setTimeout(resolve, 100));
         }
         if (!exited) throw new Error('飞书服务尚未完成退出，未强行终止。');
-      }
-      snapshot = await inspectFresh();
-      if (components.runtime.identity && snapshot.processes.some(candidate => sameProcess(components.runtime.identity, candidate))) {
+      });
+      else current = await inspectFresh();
+      assertDesktopClosed(current);
+      if (components.runtime.identity && current.processes.some(candidate => sameProcess(components.runtime.identity, candidate))) {
         // The bridge is now stopped, so no accepted Feishu/UI submission can
         // cross this final idle barrier before the runtime is stopped.
-        const final = await probe(wsUrl, { idle: true, timeout: 20_000 });
+        const final = await timed('finalTaskCheck', () => probe(wsUrl, { idle: true, timeout: 20_000 }));
         if (final.active) throw new Error('检测到刚刚开始的任务，已保留连接服务，请稍后重试退出。');
       }
       // Both processes have independent verified identities. Neither accepts
       // new work after the bridge stops, so they can release in parallel.
-      const releases = await Promise.allSettled(['runtime', 'relay'].map(name => components[name].identity
-        ? stopVerified(root, dataDir, components[name].identity, definition(name).port) : Promise.resolve()));
+      const releases = await timed('closeServices', () => Promise.allSettled(['runtime', 'relay'].map(name => components[name].identity
+        ? stopVerified(root, dataDir, components[name].identity, definition(name).port) : Promise.resolve())));
       const failure = releases.find(result => result.status === 'rejected');
       if (failure) throw failure.reason;
       clearInterval(interval);
       for (const component of Object.values(components)) component.state = 'stopped';
-      await publish(); await log('桌面后台已安全退出。');
+      await publish(); await log(`桌面后台已安全退出。耗时 ${Math.round(performance.now() - started)}ms；分步 ${JSON.stringify(timings)}`);
       setTimeout(() => { server.close(); server.closeAllConnections(); (options.exit || process.exit)(0); }, 150);
       return { ok: true, closedDesktop: desktopIdentity };
     } catch (error) { stopping = false; await publish(); throw error; }

@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { closeSharedDesktop } from '../desktop/shutdown.mjs';
+import { checkIdleServices, closeSharedDesktop, waitForChildExit } from '../desktop/shutdown.mjs';
+import { EventEmitter } from 'node:events';
 
 const identity = { pid: 22, exe: 'C:\\Codex\\ChatGPT.exe', startedAt: '2026-09-26T01:02:03.0000000Z' };
 function fixture() {
@@ -62,4 +63,64 @@ test('captured children are released even when the desktop parent exits normally
   fx.options.terminate = async value => { assert.deepEqual(value, tree); fx.calls.push('tree'); };
   await closeSharedDesktop(fx.options);
   assert.deepEqual(fx.calls, ['idle', 'capture', 'window', 'idle', 'tree']);
+});
+
+test('Codex and Feishu idle checks start together and either busy result prevents exit', async () => {
+  const started = [];
+  let finishCodex, finishFeishu;
+  const checking = checkIdleServices({
+    runtime: () => { started.push('codex'); return new Promise(resolve => { finishCodex = resolve; }); },
+    bridge: () => { started.push('feishu'); return new Promise(resolve => { finishFeishu = resolve; }); },
+  });
+  assert.deepEqual(started, ['codex', 'feishu']);
+  finishFeishu({ activeWork: true, conversations: [], pendingRequests: [] });
+  finishCodex({ ready: true, active: 0 });
+  await assert.rejects(checking, /飞书还有/);
+  await assert.rejects(checkIdleServices({ runtime: async () => ({ ready: true, active: 1 }),
+    bridge: async () => ({ activeWork: false, conversations: [], pendingRequests: [] }) }), /Codex 任务/);
+});
+
+test('uncertain state and failed concurrent checks cannot authorize shutdown', async () => {
+  await assert.rejects(checkIdleServices({ runtime: async () => ({ ready: false, active: 0 }) }), /无法确认/);
+  await assert.rejects(checkIdleServices({ bridge: async () => ({}) }), /无法确认/);
+  let checked = false;
+  await assert.rejects(checkIdleServices({ runtime: async () => { throw new Error('connection lost'); },
+    bridge: async () => { checked = true; return { activeWork: false, conversations: [], pendingRequests: [] }; } }), /connection lost/);
+  assert.equal(checked, true);
+});
+
+test('tree capture and idle verification overlap, and closing waits for both', async () => {
+  const fx = fixture();
+  let finishCapture, finishIdle;
+  const snapshot = await fx.options.inspect();
+  let checks = 0;
+  fx.options.initialSnapshot = snapshot;
+  fx.options.assertIdle = async current => {
+    assert.ok(current.processes);
+    if (++checks === 1) { fx.calls.push('idle'); await new Promise(resolve => { finishIdle = resolve; }); }
+  };
+  fx.options.captureTree = async () => { fx.calls.push('capture'); return new Promise(resolve => { finishCapture = resolve; }); };
+  const closing = closeSharedDesktop(fx.options);
+  assert.deepEqual(fx.calls, ['idle', 'capture']);
+  finishIdle();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(fx.calls.includes('window'), false);
+  finishCapture(identity);
+  const after = await closing;
+  assert.deepEqual(after.desktopRoots, []);
+  assert.deepEqual(fx.calls, ['idle', 'capture', 'window', 'terminate']);
+});
+
+test('child exit uses its event, cleans listeners and does not terminate a slow process', async () => {
+  const child = Object.assign(new EventEmitter(), { exitCode: null, signalCode: null });
+  const waiting = waitForChildExit(child, 5000);
+  child.exitCode = 0;
+  child.emit('exit', 0);
+  assert.equal(await waiting, true);
+  assert.equal(child.listenerCount('exit'), 0);
+  assert.equal(await waitForChildExit(child), true);
+  child.exitCode = null;
+  assert.equal(await waitForChildExit(child, 10), false);
+  assert.equal(child.listenerCount('exit'), 0);
+  assert.equal(child.exitCode, null);
 });

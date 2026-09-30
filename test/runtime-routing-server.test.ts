@@ -6,6 +6,7 @@ import test from 'node:test';
 import { startServer } from '../src/server.js';
 import { Store } from '../src/store.js';
 import { HermesClient } from '../src/hermes.js';
+import { ManagedHermesRuntime } from '../src/hermes-runtime.js';
 import type { CodexRuntime } from '../src/types.js';
 
 async function setup(t: test.TestContext, available = true, options: { autoDiscover?: boolean; hermesConfig?: string } = {}) {
@@ -213,4 +214,28 @@ test('an unauthenticated Hermes runtime cannot create or replace a bot', async t
   assert.equal(h.app.store.bot('product')!.engine, 'codex');
   assert.deepEqual(h.verifications, []);
   assert.deepEqual(h.starts, []);
+});
+
+test('default Hermes uses the managed runtime and server shutdown owns its lifetime', async t => {
+  let starts = 0;
+  let stops = 0;
+  t.mock.method(ManagedHermesRuntime.prototype, 'ensure', async () => {
+    starts++;
+    return { baseUrl: 'http://127.0.0.1:1', token: 'test', version: 'test', hermesHome: 'test' };
+  });
+  t.mock.method(ManagedHermesRuntime.prototype, 'close', async () => { stops++; });
+  const h = await setup(t, true, { autoDiscover: true });
+  assert.equal(starts, 0, 'Codex-only users do not start Hermes');
+  assert.equal((await h.patch({ engine: 'hermes' })).status, 200);
+  assert.ok(starts > 0, 'the Hermes status path uses the managed backend');
+  await h.app.close();
+  assert.equal(stops, 1);
+});
+
+test('explicit Hermes URLs remain externally managed on server shutdown', async t => {
+  let stops = 0;
+  t.mock.method(ManagedHermesRuntime.prototype, 'close', async () => { stops++; });
+  const h = await setup(t, true, { autoDiscover: true, hermesConfig: '{"type":"desktop","baseUrl":"http://127.0.0.1:1"}' });
+  await h.app.close();
+  assert.equal(stops, 0);
 });

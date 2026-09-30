@@ -645,7 +645,7 @@ test('adding a Hermes bot sends the selected AI and shows Hermes conversation co
   const selector = dialog.getByRole('combobox', { name: '处理对话的 AI' });
   await expect(selector).toHaveValue('codex');
   await selector.selectOption('hermes');
-  await expect(dialog).toContainText('请先打开本机 Hermes');
+  await expect(dialog).toContainText('连接时自动启动服务');
   await dialog.getByRole('textbox', { name: '机器人名称' }).fill('Hermes 产品');
   await dialog.getByRole('textbox', { name: 'App ID', exact: true }).fill('cli_hermes');
   await dialog.locator('input[type=password]').fill('fixture-secret');

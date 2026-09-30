@@ -42,6 +42,7 @@ function Get-OwnedProcessTree($Identity, $Snapshot = $null) {
 function Stop-OwnedProcessTree($Identities) {
     $known = @{}
     foreach ($identity in @($Identities)) { $known[[int]$identity.pid] = $identity }
+    if (-not $known.Count) { return }
     $deadline = [DateTime]::UtcNow.AddSeconds(20)
     do {
         $live = @()
@@ -53,25 +54,41 @@ function Stop-OwnedProcessTree($Identities) {
             if (-not (Test-ProcessIdentity $identity $candidate)) { continue }
             foreach ($child in @(Get-OwnedProcessTree $identity $snapshot)) { $known[$child.pid] = $child; $expanded[$child.pid] = $true }
         }
-        foreach ($identity in @($known.Values | Sort-Object { [DateTimeOffset]::Parse($_.startedAt) })) {
-            $handle = Get-Process -Id $identity.pid -ErrorAction SilentlyContinue
-            if (-not $handle) { continue }
-            try {
-                # Retain the handle: PID reuse must never redirect Kill().
-                $null = $handle.Handle
-                $ticks = $handle.StartTime.ToUniversalTime().Ticks
-                if ($handle.Path -ine $identity.exe -or ($ticks - ($ticks % 10)) -ne [DateTimeOffset]::Parse($identity.startedAt).UtcDateTime.Ticks) {
-                    # A still-live recorded identity must not silently count as
-                    # stopped when Windows temporarily cannot expose its path.
-                    $candidate = $snapshot | Where-Object ProcessId -eq $identity.pid
-                    if (-not $handle.HasExited -and (Test-ProcessIdentity $identity $candidate)) { throw '退出前无法复核进程身份，已取消后续清理。' }
-                    continue
-                }
-                if (-not $handle.HasExited) { $handle.Kill(); [void]$handle.WaitForExit(2000); $live += $identity }
-            } catch {
-                if (-not $handle.HasExited) { throw }
-            } finally { $handle.Dispose() }
-        }
+        $pending = @()
+        try {
+            foreach ($identity in @($known.Values | Sort-Object { [DateTimeOffset]::Parse($_.startedAt) })) {
+                $handle = Get-Process -Id $identity.pid -ErrorAction SilentlyContinue
+                if (-not $handle) { continue }
+                try {
+                    # Retain the handle: PID reuse must never redirect Kill().
+                    $null = $handle.Handle
+                    $ticks = $handle.StartTime.ToUniversalTime().Ticks
+                    if ($handle.Path -ine $identity.exe -or ($ticks - ($ticks % 10)) -ne [DateTimeOffset]::Parse($identity.startedAt).UtcDateTime.Ticks) {
+                        # A still-live recorded identity must not silently count as
+                        # stopped when Windows temporarily cannot expose its path.
+                        $candidate = $snapshot | Where-Object ProcessId -eq $identity.pid
+                        if (-not $handle.HasExited -and (Test-ProcessIdentity $identity $candidate)) { throw '退出前无法复核进程身份，已取消后续清理。' }
+                        continue
+                    }
+                    if (-not $handle.HasExited) {
+                        $handle.Kill()
+                        $live += $identity
+                        $pending += $handle
+                        $handle = $null
+                    }
+                } catch {
+                    if (-not $handle.HasExited) { throw }
+                } finally { if ($handle) { $handle.Dispose() } }
+            }
+            # Request every verified process exit first. Waiting two seconds for
+            # each parent before signaling its children multiplies shutdown time.
+            # Retained handles protect against PID reuse throughout this shared wait.
+            $waitDeadline = [DateTime]::UtcNow.AddSeconds(2)
+            foreach ($handle in $pending) {
+                $remaining = [Math]::Max(0, [int]($waitDeadline - [DateTime]::UtcNow).TotalMilliseconds)
+                [void]$handle.WaitForExit($remaining)
+            }
+        } finally { foreach ($handle in $pending) { $handle.Dispose() } }
         if (-not $live.Count) { return }
         Start-Sleep -Milliseconds 200
     } while ([DateTime]::UtcNow -lt $deadline)

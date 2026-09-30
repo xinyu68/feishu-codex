@@ -11,4 +11,14 @@ $actualMicros = $actualTicks - ($actualTicks % 10)
 if ($handle.Path -ine $identity.exe -or $actualMicros -ne [DateTimeOffset]::Parse($identity.startedAt).UtcDateTime.Ticks) { throw '进程身份已发生变化，没有关闭窗口。' }
 # This only requests a normal window close. The host must recheck live tasks
 # before any separate operation to terminate a remaining background process.
-if ($handle.CloseMainWindow()) { [void]$handle.WaitForExit(3000) }
+try {
+    if ($handle.CloseMainWindow()) {
+        $deadline = [DateTime]::UtcNow.AddSeconds(3)
+        while (-not $handle.WaitForExit(100) -and [DateTime]::UtcNow -lt $deadline) {
+            $handle.Refresh()
+            # Electron may hide its window instead of exiting. Once hidden,
+            # let the host recheck tasks and release the captured process tree.
+            if ($handle.MainWindowHandle -eq [IntPtr]::Zero) { break }
+        }
+    }
+} finally { $handle.Dispose() }

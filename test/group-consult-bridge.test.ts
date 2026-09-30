@@ -451,7 +451,7 @@ for (const failure of ['offline', 'throws'] as const) {
     h.runWith(async (_input, prompt) => {
       for (let attempt = 0; attempt < 2; attempt++) {
         await assert.rejects(h.ask(prompt), error => {
-          assert.match((error as Error).message, /请先打开 Hermes/);
+          assert.match((error as Error).message, /请在应用的机器人页面检查/);
           assert.ok(!(error as Error).message.includes('secret-native'));
           return true;
         });

@@ -38,7 +38,7 @@ class RpcError extends Error {
   constructor(readonly method: string, readonly code: number) { super(`Hermes 操作失败（${method}，${code}）。`); }
 }
 
-/** One client of an already-running Hermes Desktop; owns neither its process nor its other conversations. */
+/** A client of the local Hermes runtime; process lifetime belongs to the server, never a consultation client. */
 export class HermesClient implements CodexRuntime {
   readonly supportsSteering = false;
   private socket?: WebSocket;

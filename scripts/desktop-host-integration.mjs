@@ -214,7 +214,9 @@ finally { $handle.Dispose() }
   assert.equal(desktopChild.exitCode, null, 'busy tasks must prevent closing even the windowless fake desktop');
   assert.equal((await command('checkWrite')).canWrite, true, 'cancelled shutdown must restore the write gate');
   simulatedActive = false;
+  const shutdownStarted = performance.now();
   await command('shutdownAll');
+  report.shutdownElapsedMs = Math.round(performance.now() - shutdownStarted);
   for (let i = 0; i < 30 && !exited; i++) await wait(100);
   assert.equal(exited, true);
   // The host invokes its exit hook after requesting server.close(); the OS

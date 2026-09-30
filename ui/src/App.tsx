@@ -425,7 +425,7 @@ function collaborationStatus(state: AppState | undefined, desktop: DesktopStatus
   const bot = state?.bots?.find(item => item.id === botId);
   if (bot?.engine === 'hermes') {
     if (offline || bot.connection.status !== 'connected') return { text: '当前机器人尚未连接飞书', good: false };
-    if (bot.engineStatus?.available === false) return { text: 'Hermes 尚未连接，请确认 Hermes 已打开', good: false };
+    if (bot.engineStatus?.available === false) return { text: 'Hermes 尚未就绪，请在机器人页面查看连接状态', good: false };
     return { text: '由本机 Hermes 处理对话', good: true };
   }
   if (desktop?.desktop?.mode === 'independent') return { text: 'Codex 未接入飞书，飞书发送已暂停', good: false };
