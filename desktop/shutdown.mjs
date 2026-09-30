@@ -1,4 +1,4 @@
-import { desktopMode, sameProcess } from './lifecycle.mjs';
+import { desktopMode, recordedProcessState, sameProcess } from './lifecycle.mjs';
 
 export function sharedDesktopToClose(snapshot, sharedPort, launched) {
   const mode = desktopMode(snapshot, sharedPort, launched);
@@ -54,4 +54,28 @@ export async function waitForChildExit(child, timeout = 6000) {
     // A child can have exited just before its event listener was attached.
     if (child.exitCode !== null || child.signalCode !== null) done(true);
   });
+}
+
+export function desktopExitPlan(snapshot, sharedPort, launched) {
+  if (desktopMode(snapshot, sharedPort, launched).mode === 'independent') {
+    return { desktopIdentity: null, preservedDesktops: [...snapshot.desktopRoots] };
+  }
+  return { desktopIdentity: sharedDesktopToClose(snapshot, sharedPort, launched), preservedDesktops: [] };
+}
+
+export function assertDesktopExitState(snapshot, sharedPort, launched, preservedDesktops) {
+  const mode = desktopMode(snapshot, sharedPort, launched);
+  if (mode.mode === 'closed') return;
+  if (mode.mode === 'independent' && snapshot.desktopRoots.length === preservedDesktops.length
+    && snapshot.desktopRoots.every(root => preservedDesktops.some(expected => sameProcess(expected, root)))) return;
+  throw new Error('检测到新打开的 Codex，已保留连接服务。请稍后重试退出。');
+}
+
+export function serviceExitIdentity(snapshot, identity) {
+  if (!identity) return null;
+  const state = recordedProcessState(identity, snapshot.processes);
+  if (state === 'unknown') throw new Error('无法确认服务进程身份，请稍后重试退出。');
+  // A terminated process can leave a Windows listener entry behind. There is
+  // nothing left to terminate; do not let that entry lock the application open.
+  return state === 'dead' ? null : identity;
 }

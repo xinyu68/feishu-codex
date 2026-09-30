@@ -12,6 +12,28 @@ import { captureProcessTree, closeWindowVerified, closeWindowsInspectors, inspec
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 after(closeWindowsInspectors);
 
+test('a verified exited service with a lingering Windows listener can finish cleanup without touching another process', { skip: process.platform !== 'win32', timeout: 40_000 }, async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'feishu-lingering-port-test-'));
+  const child = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { windowsHide: true, env: canonicalEnvironment(process.env), stdio: 'ignore' });
+  await once(child, 'spawn');
+  try {
+    const state = await inspectWindows(root, [18791], [child.pid]);
+    const identity = state.processes.find(item => item.pid === child.pid);
+    assert.ok(identity?.exe && identity.startedAt);
+    await fs.mkdir(path.join(directory, 'scripts'));
+    const script = await fs.readFile(path.join(root, 'scripts/desktop-stop-owned.ps1'), 'utf8');
+    // Model the Windows failure: TCP still reports the terminated owner's PID.
+    const mocked = script.replace(/^(\uFEFF?param\([^\n]*\)\r?\n)/, `$1function Get-NetTCPConnection { [pscustomobject]@{ OwningProcess = ${child.pid}; LocalAddress = '127.0.0.1' } }\n`);
+    assert.notEqual(mocked, script);
+    await fs.writeFile(path.join(directory, 'scripts/desktop-stop-owned.ps1'), '\uFEFF' + mocked.replace(/^\uFEFF/, ''));
+    await fs.copyFile(path.join(root, 'scripts/desktop-process-tree.ps1'), path.join(directory, 'scripts/desktop-process-tree.ps1'));
+    const exited = once(child, 'exit');
+    await stopVerified(directory, directory, identity, 18791);
+    await exited;
+    assert.notEqual(child.exitCode, null);
+  } finally { if (child.exitCode === null) child.kill(); }
+});
+
 test('Windows inspection reuses one hidden worker for repeated and concurrent checks', { skip: process.platform !== 'win32', timeout: 20_000 }, async () => {
   const snapshots = await Promise.all([
     inspectWindows(root, [8790, 18791, 18792], [process.pid]),

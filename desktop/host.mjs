@@ -8,7 +8,8 @@ import { fileURLToPath } from 'node:url';
 import WebSocket from 'ws';
 import { atomicJson, captureProcessTree, closeWindowVerified, inspectWindows, readJson, runPowerShell, stopVerified } from './windows.mjs';
 import { canonicalEnvironment, canRetireReusedIdentity, desktopMode, matchesEntry, RestartBudget, samePath, sameProcess, writePermission } from './lifecycle.mjs';
-import { checkIdleServices, closeSharedDesktop, sharedDesktopToClose, waitForChildExit } from './shutdown.mjs';
+import { assertDesktopExitState, checkIdleServices, closeSharedDesktop, desktopExitPlan, serviceExitIdentity, waitForChildExit } from './shutdown.mjs';
+import { recoverRuntimeEndpoint } from './runtime-endpoint.mjs';
 import { independentDesktop, stopIndependentDesktop } from './switch-desktop.mjs';
 import { defaultCodexHome, installBundledSkill, managedSkillOwner } from './bundled-skill.mjs';
 import { waitForLaunchAccount } from './launch-account.mjs';
@@ -135,8 +136,8 @@ export async function startHost(options = {}) {
   const accessible = async value => typeof value === 'string' && value && Boolean(await fs.stat(value).catch(() => null));
   const customCodex = savedRuntime.codexPath && !/[\\/]OpenAI[\\/]Codex[\\/]bin[\\/]/i.test(savedRuntime.codexPath) && await accessible(savedRuntime.codexPath) ? savedRuntime.codexPath : null;
   const customMcpNode = savedRuntime.mcpNodePath && !/[\\/]OpenAI[\\/]Codex[\\/]runtimes[\\/]cua_node[\\/]/i.test(savedRuntime.mcpNodePath) && await accessible(savedRuntime.mcpNodePath) ? savedRuntime.mcpNodePath : null;
-  const wsUrl = options.wsUrl || savedRuntime.wsUrl || 'ws://127.0.0.1:18791';
-  const ws = new URL(wsUrl);
+  let wsUrl = options.wsUrl || savedRuntime.wsUrl || 'ws://127.0.0.1:18791';
+  let ws = new URL(wsUrl);
   if (ws.protocol !== 'ws:' || ws.hostname !== '127.0.0.1' || ws.username || ws.password || ws.pathname !== '/' || ws.search || ws.hash || Number(ws.port) < 1024) throw new Error('Codex 连接地址必须是本机地址。');
   if (![port, bridgePort].every(value => Number.isInteger(value) && value >= 1024 && value < 65536) || new Set([port, bridgePort, Number(ws.port)]).size !== 3) throw new Error('后台端口配置无效。');
   const deployment = await readJson(path.join(directory, 'deployment.json'));
@@ -162,6 +163,19 @@ export async function startHost(options = {}) {
   const oldHost = await readJson(path.join(directory, 'host-identity.json'));
   if (oldHost && sameProcess(oldHost, snapshot.processes.find(item => item.pid === oldHost.pid))) throw new Error('桌面后台已经运行。');
   if (snapshot.connections.some(item => item.state === 'Listen' && item.localPort === port)) throw new Error('桌面后台端口被其他程序占用。');
+  if (!options.wsUrl) {
+    const oldRuntime = await readJson(path.join(directory, 'runtime-identity.json'));
+    const recoveredUrl = await recoverRuntimeEndpoint({ snapshot, identity: oldRuntime, url: wsUrl, probe, reservedPorts: [port, bridgePort] });
+    if (recoveredUrl) {
+      await atomicJson(path.join(directory, 'runtime-endpoint-recovery.json'), { previousUrl: wsUrl, wsUrl: recoveredUrl, previousIdentity: oldRuntime, recoveredAt: new Date().toISOString() });
+      await atomicJson(path.join(dataDir, 'runtime.json'), { ...savedRuntime, mode: 'shared', wsUrl: recoveredUrl });
+      ports[2] = Number(new URL(recoveredUrl).port);
+      wsUrl = recoveredUrl; ws = new URL(recoveredUrl);
+      await fs.unlink(path.join(directory, 'runtime-identity.json'));
+      await log('旧 Codex 服务已退出，但 Windows 尚未释放端口；已切换到可用的本机连接端口，未终止其他程序。');
+      snapshot = await inspectFresh();
+    }
+  }
   try {
     const skill = await installBundledSkill({ root, codexHome });
     if (skill.status !== 'unchanged') await log(`内置 Skill：${skill.status} · ${skill.path}${['conflict', 'modified'].includes(skill.status) ? '（保留现有文件）' : ''}`);
@@ -399,9 +413,7 @@ export async function startHost(options = {}) {
     snapshot = await timed('inspect', () => inspectFresh());
     desktop = desktopMode(snapshot, Number(ws.port), launchedDesktop);
     if (Object.values(components).some(item => item.child?.pid && item.child.exitCode === null && !item.identity)) throw new Error('仍在确认刚启动的服务身份，请稍后退出。');
-    const independent = uninstall && desktopMode(snapshot, Number(ws.port), launchedDesktop).mode === 'independent';
-    const preservedDesktop = independent ? snapshot.desktopRoots?.[0] : null;
-    const desktopIdentity = independent ? null : sharedDesktopToClose(snapshot, Number(ws.port), launchedDesktop);
+    const { desktopIdentity, preservedDesktops } = desktopExitPlan(snapshot, Number(ws.port), launchedDesktop);
     if (desktopIdentity && !closeDesktop) throw Object.assign(new Error('本应用打开的 Codex 仍在运行，可以与 Feishu Codex 一起退出。'), { code: 'SHARED_CODEX_RUNNING' });
     // Pause bridge submissions before inspecting tasks or closing the desktop.
     stopping = true; await publish();
@@ -431,7 +443,7 @@ export async function startHost(options = {}) {
       const state = await timed('checkTasks', () => assertIdle(current));
       const assertDesktopClosed = current => {
         desktop = desktopMode(current, Number(ws.port), launchedDesktop);
-        if (desktop.mode !== 'closed' && !(independent && desktop.mode === 'independent' && sameProcess(preservedDesktop, current.desktopRoots?.[0]))) throw new Error('检测到新打开的 Codex，已保留连接服务。请稍后重试退出。');
+        assertDesktopExitState(current, Number(ws.port), launchedDesktop, preservedDesktops);
       };
       assertDesktopClosed(current);
       const bridge = components.bridge;
@@ -458,8 +470,10 @@ export async function startHost(options = {}) {
       }
       // Both processes have independent verified identities. Neither accepts
       // new work after the bridge stops, so they can release in parallel.
-      const releases = await timed('closeServices', () => Promise.allSettled(['runtime', 'relay'].map(name => components[name].identity
-        ? stopVerified(root, dataDir, components[name].identity, definition(name).port) : Promise.resolve())));
+      const releases = await timed('closeServices', () => Promise.allSettled(['runtime', 'relay'].map(async name => {
+        const identity = serviceExitIdentity(current, components[name].identity);
+        if (identity) await stopVerified(root, dataDir, identity, definition(name).port);
+      })));
       const failure = releases.find(result => result.status === 'rejected');
       if (failure) throw failure.reason;
       clearInterval(interval);

@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { checkIdleServices, closeSharedDesktop, waitForChildExit } from '../desktop/shutdown.mjs';
+import { assertDesktopExitState, checkIdleServices, closeSharedDesktop, desktopExitPlan, serviceExitIdentity, waitForChildExit } from '../desktop/shutdown.mjs';
 import { EventEmitter } from 'node:events';
 
 const identity = { pid: 22, exe: 'C:\\Codex\\ChatGPT.exe', startedAt: '2026-09-26T01:02:03.0000000Z' };
@@ -123,4 +123,24 @@ test('child exit uses its event, cleans listeners and does not terminate a slow 
   assert.equal(await waitForChildExit(child, 10), false);
   assert.equal(child.listenerCount('exit'), 0);
   assert.equal(child.exitCode, null);
+});
+
+test('normal app exit preserves an independent Codex and rejects replacement or newly opened desktops', async () => {
+  const fx = fixture(); fx.independent();
+  const before = await fx.options.inspect();
+  const plan = desktopExitPlan(before, 18791, identity);
+  assert.equal(plan.desktopIdentity, null); assert.deepEqual(plan.preservedDesktops, [identity]);
+  assert.doesNotThrow(() => assertDesktopExitState(before, 18791, identity, plan.preservedDesktops));
+  assert.throws(() => assertDesktopExitState({ ...before, desktopRoots: [{ ...identity, startedAt: 'replacement' }] }, 18791, identity, plan.preservedDesktops), /新打开/);
+  assert.throws(() => assertDesktopExitState({ ...before, desktopRoots: [...before.desktopRoots, { ...identity, pid: 33 }] }, 18791, identity, plan.preservedDesktops), /新打开/);
+  assert.throws(() => desktopExitPlan({ ...before, unknownDesktop: true }, 18791, identity), /无法确认/);
+  assert.deepEqual(fx.calls, []);
+});
+
+test('an exited runtime with a lingering Windows port does not receive a stop request, while uncertain live identity still blocks exit', () => {
+  const listener = { state: 'Listen', localPort: 18791, pid: identity.pid, localAddress: '127.0.0.1' };
+  assert.equal(serviceExitIdentity({ processes: [], connections: [listener] }, identity), null);
+  assert.equal(serviceExitIdentity({ processes: [{ ...identity, startedAt: 'reused' }] }, identity), null);
+  assert.deepEqual(serviceExitIdentity({ processes: [identity] }, identity), identity);
+  assert.throws(() => serviceExitIdentity({ processes: [{ ...identity, exe: '' }] }, identity), /无法确认/);
 });

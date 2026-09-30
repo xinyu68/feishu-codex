@@ -11,5 +11,15 @@ if ($Port) {
     if (@($listeners | Where-Object { $_.OwningProcess -ne $identity.pid -or $_.LocalAddress -ne '127.0.0.1' }).Count) { throw '监听端口属于其他进程，没有停止任何服务。' }
 }
 Stop-OwnedProcessTree $tree
-if ($Port -and @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue).Count) { throw '端口尚未释放，已取消后续清理。' }
+if ($Port) {
+    $remaining = @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue)
+    if ($remaining.Count) {
+        $owner = Get-CimInstance Win32_Process -Filter "ProcessId = $($identity.pid)" -ErrorAction Stop
+        if (-not $owner -and -not @($remaining | Where-Object { $_.OwningProcess -ne $identity.pid -or $_.LocalAddress -ne '127.0.0.1' }).Count) {
+            Write-Output '已确认服务进程退出；Windows 仍保留旧监听记录，下次启动将恢复连接。'
+            exit 0
+        }
+        throw '端口尚未释放，已取消后续清理。'
+    }
+}
 Write-Output '已确认服务及子进程退出，端口已释放。'
