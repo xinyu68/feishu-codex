@@ -592,7 +592,7 @@ export class HermesClient implements CodexRuntime {
       const result = await this.runSession({
         cwd: input.cwd, threadId: input.threadId, model: input.model, effort: input.effort,
         prompt: `${consultationInstructions(input)}\n\n<consultation_material>\n${input.prompt}\n</consultation_material>`,
-        onProgress: input.onProgress, onRequest: declineConsultationRequest,
+        onProgress: input.onProgress, onRequest: input.onRequest ?? declineConsultationRequest,
         onThread: id => { session = this.sessions.get(id); },
         onBeforeSubmit: async () => {
           if (input.signal.aborted) throw consultationAborted();

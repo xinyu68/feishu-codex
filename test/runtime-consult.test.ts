@@ -2,6 +2,15 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { RuntimeRouter } from '../src/runtime-router.js';
 import type { CodexRuntime, RuntimeConsultInput } from '../src/types.js';
+import { consultationInstructions, declineConsultationRequest } from '../src/runtime-consult.js';
+
+test('delegation permits execution tools while missing interactive authorization is never fabricated', async () => {
+  const prompt = consultationInstructions({ roleInstructions: '测试角色' });
+  assert.match(prompt, /修改文件、执行命令、测试和操作外部应用/);
+  assert.match(prompt, /不限定搜索方式或工具种类/);
+  assert.doesNotMatch(prompt, /本次只做查询与分析|不要请求用户交互或审批/);
+  assert.deepEqual(await declineConsultationRequest({ id: 'a', kind: 'approval', title: '', text: '' }), { decision: 'decline' });
+});
 
 test('consultation routing selects the requested engine without ordinary run or history calls', async () => {
   const calls: Array<{ engine: string; input: RuntimeConsultInput }> = [];

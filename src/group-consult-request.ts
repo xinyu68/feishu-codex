@@ -1,6 +1,8 @@
 export const GROUP_CONSULT_TOOL_NAME = 'consult_feishu_group_agent';
 export const GROUP_CONSULT_PATH = '/api/group/consult';
-export const GROUP_CONSULT_TIMEOUT_MS = 55_000;
+export const GROUP_CONSULT_EXECUTION_TIMEOUT_MS = 30 * 60_000;
+export const GROUP_CONSULT_TIMEOUT_MS = GROUP_CONSULT_EXECUTION_TIMEOUT_MS + 10_000;
+export const GROUP_CONSULT_MCP_TIMEOUT_SECONDS = GROUP_CONSULT_TIMEOUT_MS / 1000 + 20;
 export const MAX_GROUP_CONSULT_TARGET_LENGTH = 100;
 export const MAX_GROUP_CONSULT_QUESTION_LENGTH = 6000;
 export const MAX_GROUP_CONSULT_CONTEXT_LENGTH = 12_000;
@@ -22,7 +24,7 @@ export const GROUP_CONSULT_REQUEST_SCHEMA = {
     },
     question: {
       type: 'string', minLength: 1, maxLength: MAX_GROUP_CONSULT_QUESTION_LENGTH,
-      description: '请该角色回答的具体问题，必须属于当前用户已授权的任务；工具会等待答复并在本轮返回。',
+      description: '委派该角色执行的具体任务或问题，必须属于当前用户已授权的范围；可包括查询、改文件、执行命令和外部应用操作。工具等待执行结果并在本轮返回。',
     },
     context: {
       type: 'string', minLength: 1, maxLength: MAX_GROUP_CONSULT_CONTEXT_LENGTH,

@@ -10,6 +10,7 @@ import { readTurnTiming } from './turn-timing.js';
 import { isThreadInitializationRace, isThreadWriterConflict, THREAD_WRITER_MESSAGE } from './codex-errors.js';
 import { CodexRpcError, IGNORE_SERVER_REQUEST, WebsocketCodexConnection, validateCodexWebsocketUrl, type CodexConnection } from './codex-websocket.js';
 import { consultationAborted, consultationInstructions, declineConsultationRequest } from './runtime-consult.js';
+import { GROUP_CONSULT_MCP_TIMEOUT_SECONDS, GROUP_CONSULT_TOOL_NAME } from './group-consult-request.js';
 import type { CodexRunInput, CodexRuntime, CodexUsage, HistoryMessage, ModelInfo, RuntimeAnswer, RuntimeRequest, RuntimeConsultInput, RuntimeEvent, UsageLimit, UsageWindow } from './types.js';
 
 type RecordValue = Record<string, unknown>;
@@ -635,7 +636,7 @@ export class CodexClient implements CodexRuntime {
   async consult(input: RuntimeConsultInput): Promise<{ threadId: string; text: string }> {
     if (input.signal.aborted) throw consultationAborted();
     const connection = this.connect(input.cwd);
-    const runInput: CodexRunInput = { cwd: input.cwd, prompt: input.prompt, onProgress: input.onProgress, onRequest: declineConsultationRequest };
+    const runInput: CodexRunInput = { cwd: input.cwd, prompt: input.prompt, onProgress: input.onProgress, onRequest: input.onRequest ?? declineConsultationRequest };
     const tracker = new TurnTracker(runInput, this.options.idleTimeoutMs ?? 15 * 60_000, Boolean(this.options.websocketUrl));
     let threadId = '';
     let turnId = '';
@@ -882,6 +883,7 @@ class TurnTracker {
   private done = false;
   private readonly items = new Map<string, { text: string; phase: string }>();
   private readonly earlyEvents: Array<{ method: string; params: RecordValue }> = [];
+  private readonly delegatedCalls = new Set<string>();
   private timer?: NodeJS.Timeout;
 
   constructor(private readonly input: CodexRunInput, private readonly idleTimeoutMs: number, private readonly strictTurn = false) {
@@ -903,9 +905,11 @@ class TurnTracker {
     const turn = record(params.turn);
     const eventTurn = string(params.turnId) || string(turn.id);
     if ((eventTurn && eventTurn !== this.turnId) || (this.strictTurn && !eventTurn)) return;
-    this.touch();
     const item = record(params.item);
     const itemId = string(item.id) || string(params.itemId);
+    if (method === 'item/started' && item.type === 'mcpToolCall' && item.server === 'feishu_completion' && item.tool === GROUP_CONSULT_TOOL_NAME) this.delegatedCalls.add(itemId);
+    if (method === 'item/completed') this.delegatedCalls.delete(itemId);
+    this.touch();
     if ((method === 'item/started' || method === 'item/completed') && item.type === 'agentMessage') {
       const previous = this.items.get(itemId);
       const text = string(item.text) || previous?.text || '';
@@ -958,7 +962,8 @@ class TurnTracker {
   dispose(): void { if (this.timer) clearTimeout(this.timer); }
   private touch(): void {
     if (this.timer) clearTimeout(this.timer);
-    this.timer = setTimeout(() => this.fail(new Error('Codex 长时间未返回事件，请检查网络后重试。')), this.idleTimeoutMs);
+    const timeout = this.delegatedCalls.size ? Math.max(this.idleTimeoutMs, GROUP_CONSULT_MCP_TIMEOUT_SECONDS * 1000) : this.idleTimeoutMs;
+    this.timer = setTimeout(() => this.fail(new Error('Codex 长时间未返回事件，请检查网络后重试。')), timeout);
   }
   private progress(text: string): void {
     try { void Promise.resolve(this.input.onProgress?.(text)).catch(() => undefined); }

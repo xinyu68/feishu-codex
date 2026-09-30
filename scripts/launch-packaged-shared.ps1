@@ -11,6 +11,7 @@ param(
 # PowerShell is hidden by the desktop host; the package-context child uses
 # wscript.exe so automatic launch does not create a console window.
 $ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 
 function Write-LaunchJson([string]$Path, $Value) {
     $temporaryPath = $Path + '.' + [Guid]::NewGuid().ToString('N') + '.tmp'
@@ -101,4 +102,7 @@ try {
 }
 
 $report | ConvertTo-Json -Depth 6
-if ($report.error) { throw [InvalidOperationException]::new([string]$report.error) }
+if ($report.error) {
+    [Console]::Error.WriteLine([string]$report.error)
+    exit 1
+}

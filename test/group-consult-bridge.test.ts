@@ -10,6 +10,65 @@ import { RuntimeRouter } from '../src/runtime-router.js';
 import { conversationKey, namespaceMessage } from '../src/routing.js';
 import type { CodexRunInput, CodexRuntime, InboundMessage, RuntimeConsultInput, MessageCard } from '../src/types.js';
 
+test('delegated task approvals and questions use the target bot and originating actor', async t => {
+  const h = setup(t), targetChat = conversationKey('pm', 'oc_team');
+  h.consultWith(async input => {
+    for (const kind of ['approval', 'question'] as const) {
+      const waiting = input.onRequest!({ id: 'native-id', kind, title: '请确认', text: '执行委派任务',
+        ...(kind === 'question' ? { questions: [{ id: 'detail', question: '哪个文件？' }] } : {}) });
+      const pending = h.bridge.pendingRequests()[0]!;
+      assert.equal(pending.chatId, targetChat); assert.equal(pending.actorId, 'target-user');
+      assert.match(pending.title, /产品经理/);
+      await assert.rejects(h.bridge.answer(pending.id, { decision: 'accept' }, { chatId: targetChat, actorId: 'source-user' }), /不属于/);
+      const answer = kind === 'approval' ? { decision: 'accept' as const } : { answers: { detail: { answers: ['README.md'] } } };
+      await h.bridge.receive(h.message('pm', { text: kind === 'approval' ? `/approve ${pending.id}` : `/answer ${pending.id} README.md` }));
+      assert.deepEqual(await waiting, answer);
+      assert.equal(h.bridge.pendingRequests().length, 0);
+    }
+    return { text: '已完成委派任务' };
+  });
+  h.runWith(async (_input, prompt) => (await h.ask(prompt)).answer);
+  await h.bridge.receive(h.message());
+  assert.ok(h.replies.includes('已完成委派任务'));
+});
+
+test('cancelling a delegated task closes its approval without accepting it', async t => {
+  const h = setup(t), controller = new AbortController();
+  h.consultWith(async input => {
+    const waiting = input.onRequest!({ id: 'native-id', kind: 'approval', title: '审批', text: '执行任务' });
+    assert.equal(h.bridge.pendingRequests().length, 1);
+    controller.abort();
+    assert.deepEqual(await waiting, { decision: 'decline', answers: {} });
+    assert.equal(h.bridge.pendingRequests().length, 0);
+    return { text: '取消后不得发布' };
+  });
+  h.runWith(async (_input, prompt) => {
+    await assert.rejects(h.bridge.consultInGroup({ context_token: h.token(prompt), target: '产品经理', question: '执行任务' }, controller.signal), /取消/);
+    return '已取消';
+  });
+  await h.bridge.receive(h.message());
+  assert.equal(h.replies.includes('取消后不得发布'), false);
+});
+
+test('an approval cannot authorize a delegated task after the target context changed', async t => {
+  const h = setup(t), targetChat = conversationKey('pm', 'oc_team');
+  h.consultWith(async input => {
+    const waiting = input.onRequest!({ id: 'native-id', kind: 'approval', title: '审批', text: '执行任务' });
+    const pending = h.bridge.pendingRequests()[0]!;
+    h.store.conversation(targetChat, 'target-user', h.dir, 'group').revision = 2;
+    await assert.rejects(h.bridge.answer(pending.id, { decision: 'accept' }, { chatId: targetChat, actorId: 'target-user' }), /已失效/);
+    assert.deepEqual(await waiting, { decision: 'decline', answers: {} });
+    return { text: '不得发布' };
+  });
+  h.runWith(async (_input, prompt) => {
+    await assert.rejects(h.ask(prompt));
+    return '上下文改变';
+  });
+  await h.bridge.receive(h.message());
+  assert.equal(h.bridge.pendingRequests().length, 0);
+  assert.equal(h.replies.includes('不得发布'), false);
+});
+
 function setup(t: test.TestContext, sourceEngine: 'codex' | 'hermes' = 'codex', targetEngine: 'codex' | 'hermes' = 'hermes') {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'group-consult-bridge-'));
   const store = new Store(dir);

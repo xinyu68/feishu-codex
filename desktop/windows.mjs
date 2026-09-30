@@ -30,11 +30,15 @@ export function runPowerShell(script, args = [], { timeout = 30_000, interactive
       windowsHide: !interactive, env: canonicalEnvironment(process.env), stdio: interactive ? 'inherit' : ['ignore', 'pipe', 'pipe'],
     });
     let stdout = '', stderr = '';
+    // PowerShell helpers emit UTF-8. Decode across chunk boundaries so a split
+    // Chinese character is not replaced before the next buffer arrives.
+    child.stdout?.setEncoding('utf8');
+    child.stderr?.setEncoding('utf8');
     child.stdout?.on('data', value => { stdout += value; if (stdout.length > 8_000_000) child.kill(); });
     child.stderr?.on('data', value => { stderr += value; if (stderr.length > 1_000_000) child.kill(); });
     const timer = setTimeout(() => { child.kill(); reject(new Error('Windows 操作超时；未终止 Codex 或服务。')); }, timeout);
     child.once('error', error => { clearTimeout(timer); reject(error); });
-    child.once('exit', code => {
+    child.once('close', code => {
       clearTimeout(timer);
       if (code === 0) resolve(stdout.trim());
       else reject(new Error(stderr.trim() || stdout.trim() || `Windows 操作失败（${code}）`));

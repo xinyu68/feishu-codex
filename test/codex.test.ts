@@ -80,23 +80,25 @@ test('concurrent independent threads do not mix results', async () => {
   } finally { await fx.cleanup(); }
 });
 
-test('standalone consultation starts an ephemeral session and declines all approvals', async () => {
+test('standalone consultation starts an ephemeral session and forwards approvals and questions', async () => {
   const fx = await fixture('approval');
   try {
     const result = await fx.client.consult({ cwd: fx.directory, prompt: 'analyze supplied text', roleInstructions: 'product perspective',
-      model: 'consult-model', effort: 'high', signal: new AbortController().signal });
+      model: 'consult-model', effort: 'high', signal: new AbortController().signal,
+      onRequest: async () => ({ decision: 'accept', answers: { pick: { answers: ['confirmed'] } } }) });
     assert.equal(result.text, 'new-thread: final answer');
     const rows = await fx.trace();
     const start = rows.find(row => row.method === 'thread/start').params;
     assert.equal(start.ephemeral, true);
     assert.equal(start.sandbox, 'danger-full-access');
     assert.equal(start.model, 'consult-model');
-    assert.match(start.developerInstructions, /不要调用任何工具/);
+    assert.match(start.developerInstructions, /本轮允许按需使用当前可用的 Skill、MCP/);
+    assert.doesNotMatch(start.developerInstructions, /不要调用任何工具/);
     assert.match(start.developerInstructions, /product perspective/);
     assert.equal(rows.some(row => ['thread/resume', 'turn/steer'].includes(row.method)), false);
     const answers = rows.filter(row => String(row.id).startsWith('approval-'));
-    assert.deepEqual(answers.slice(0, 3).map(row => row.result), [{ decision: 'decline' }, { decision: 'decline' }, { permissions: {}, scope: 'turn' }]);
-    assert.match(answers[3].result.answers.pick.answers[0], /独立咨询/);
+    assert.deepEqual(answers.slice(0, 3).map(row => row.result), [{ decision: 'accept' }, { decision: 'accept' }, { permissions: { network: { enabled: true } }, scope: 'turn' }]);
+    assert.equal(answers[3].result.answers.pick.answers[0], 'confirmed');
   } finally { await fx.cleanup(); }
 });
 

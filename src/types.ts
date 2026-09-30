@@ -113,7 +113,7 @@ export type TurnTiming = { startedAtMs?: number; completedAtMs?: number; duratio
 export interface CodexRuntime {
   readonly supportsSteering?: boolean;
   run(input: CodexRunInput): Promise<{ threadId: string; text: string; turnId?: string; images?: string[] }>;
-  /** A separate analysis session; never resumes or publishes into an ordinary chat. */
+  /** A separate delegated task session; never resumes an ordinary chat. */
   consult?(input: RuntimeConsultInput): Promise<{ threadId: string; text: string }>;
   subscribe?(listener: (event: RuntimeEvent) => void): () => void;
   watch?(threadId: string): Promise<void>;
@@ -195,6 +195,7 @@ export type RuntimeConsultInput = {
   engine?: 'codex' | 'hermes';
   signal: AbortSignal;
   onProgress?: (text: string) => void;
+  onRequest?: (request: RuntimeRequest) => Promise<RuntimeAnswer>;
   /** Recheck the source authorization immediately before submitting the consultation. */
   onBeforeSubmit?: () => void | Promise<void>;
 };

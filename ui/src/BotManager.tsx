@@ -403,6 +403,12 @@ function AddBotDialog({ close, created, perform }: { close: () => void; created:
 
 function DefaultNotificationBot({ state, bot, configSave, startAccess }: { state: AppState; bot: BotProfile; configSave: ConfigAutosave; startAccess: () => void }) {
   const targets = (state.notificationTargets || []).filter(item => item.botId === bot.id);
+  const unapprovedPrivate = state.conversations.some(item => (item.botId || 'default') === bot.id
+    && item.chatType !== 'group' && item.actorId && !bot.allowedActors.includes(item.actorId));
+  const needsAuthorization = !bot.allowedActors.length || unapprovedPrivate;
+  const setupHint = needsAuthorization
+    ? '请在访问权限中允许接收通知的私聊账号。'
+    : `账号已授权。请在飞书私聊「${bot.name}」发一条消息，收到后即可设置。`;
   const hasDraft = configSave.draft.desktopNotificationTarget !== undefined;
   const target = hasDraft ? configSave.draft.desktopNotificationTarget : state.config.desktopNotificationTarget;
   const selectedTarget = target && targets.find(item => notificationTargetKey(item) === notificationTargetKey(target));
@@ -427,7 +433,7 @@ function DefaultNotificationBot({ state, bot, configSave, startAccess }: { state
       </div>
     </div>
     {targets.length > 1 && <label className="bot-default-recipient"><span>通知接收人</span><Select aria-label="通知接收人" value={targets.some(item => notificationTargetKey(item) === chosen) ? chosen : ''} disabled={saving} onChange={event => setChoice(event.target.value)}><option value="">请选择一个私聊账号</option>{targets.map(item => <option key={notificationTargetKey(item)} value={notificationTargetKey(item)}>私聊账号 · {item.actorId.slice(-6)}</option>)}</Select></label>}
-    {!targets.length && <p className="bot-default-hint">请先私聊这个机器人，再到访问权限允许该账号。<button type="button" className="text-button" onClick={startAccess}>去授权</button></p>}
+    {!targets.length && <p className="bot-default-hint" role="status">{setupHint}{needsAuthorization && <button type="button" className="text-button" onClick={startAccess}>去授权</button>}</p>}
     {invalidHere && <p className="bot-default-error">原接收位置已失效，请重新设置。<button type="button" className="text-button" onClick={() => void configSave.save({ desktopNotificationTarget: null })}>取消默认</button></p>}
     {hasDraft && (selectedTarget || savedHere || !target) && <p className={`bot-default-feedback ${failed ? 'error' : ''}`} role="status">{failed ? '默认通知设置尚未保存。' : '正在保存默认通知设置…'}{failed && <button type="button" className="text-button" onClick={() => void configSave.retry()}>重试</button>}</p>}
   </section>;

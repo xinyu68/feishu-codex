@@ -156,9 +156,10 @@ test('revoked default remains visibly invalid without switching to another eligi
 
 test('no private recipient guides authorization and still allows clearing an invalid default', async ({ page }) => {
   const fx = await fixture(page); fx.state.config.desktopNotificationTarget = selection(targets[1]!); fx.state.notificationTargets = [];
+  fx.state.bots![1]!.allowedActors = [];
   await page.goto('/'); await bot(page, '代码审查');
   await expect(detail(page).getByRole('button', { name: '设为默认通知机器人', exact: true })).toBeDisabled();
-  await expect(detail(page)).toContainText('请先私聊这个机器人，再到访问权限允许该账号');
+  await expect(detail(page)).toContainText('请在访问权限中允许接收通知的私聊账号');
   await detail(page).getByRole('button', { name: '去授权', exact: true }).click();
   await expect(detail(page).getByRole('tab', { name: /访问权限/ })).toHaveAttribute('aria-selected', 'true');
   expect(fx.writes).toEqual([]);
@@ -167,6 +168,27 @@ test('no private recipient guides authorization and still allows clearing an inv
   await expect(page.getByText('默认通知已失效，请重新设置。', { exact: true })).toHaveCount(0);
   await expect(detail(page).getByRole('button', { name: '设为默认通知机器人', exact: true })).toBeDisabled();
   expect(fx.writes).toEqual([{ desktopNotificationTarget: null }]);
+});
+
+test('authorized Codex with only group history explains the missing DM and becomes selectable when it arrives', async ({ page }) => {
+  const fx = await fixture(page);
+  fx.state.bots![1]!.engine = 'hermes';
+  fx.state.notificationTargets = [];
+  fx.state.conversations.forEach(item => { item.chatType = 'group'; });
+  await page.goto('/'); await settings(page);
+  await expect(page.getByText('待建立通知私聊', { exact: true })).toBeVisible();
+  await bot(page, '写作助手');
+  await expect(detail(page)).toContainText('账号已授权。请在飞书私聊「写作助手」发一条消息');
+  await expect(detail(page).getByRole('button', { name: '去授权', exact: true })).toHaveCount(0);
+  const setDefault = detail(page).getByRole('button', { name: '设为默认通知机器人', exact: true });
+  await expect(setDefault).toBeDisabled();
+  fx.state.conversations[0]!.chatType = 'p2p';
+  fx.state.notificationTargets = [targets[0]!];
+  await fx.refresh();
+  await expect(setDefault).toBeEnabled();
+  await setDefault.click();
+  await expect.poll(() => fx.state.config.desktopNotificationTarget).toEqual(selection(targets[0]!));
+  expect(fx.writes).toEqual([{ desktopNotificationTarget: selection(targets[0]!) }]);
 });
 
 test('a bot with several eligible private recipients requires an explicit recipient before setting or updating its default', async ({ page }) => {

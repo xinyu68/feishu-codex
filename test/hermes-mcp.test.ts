@@ -73,6 +73,7 @@ test('creates through POST, uses Hermes mode, and leaves other settings intact',
   assert.deepEqual(entry.args, [fx.scriptPath]);
   assert.equal(entry.env.FEISHU_CODEX_MANAGED_MCP, 'hermes-v1');
   assert.equal(entry.env.FEISHU_CODEX_MCP_MODE, 'hermes');
+  assert.equal(entry.timeout, 1830);
   assert.match(entry.env.FEISHU_CODEX_MANAGED_MCP_SHA256, /^[a-f0-9]{64}$/);
   assert.deepEqual(fx.config.mcp_servers.personal, personal);
   assert.equal(fx.config.model, 'existing-model');

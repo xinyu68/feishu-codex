@@ -412,7 +412,8 @@ test('Hermes consultation works while its source is busy without installing or r
     assert.equal(created.reasoning_effort, 'high');
     assert.equal(created.messages, undefined);
     const prompt = ownTrace.find(row => row.method === 'prompt.submit')!.params.text;
-    assert.match(prompt, /不要调用任何工具/);
+    assert.match(prompt, /本轮允许按需使用当前可用的 Skill、MCP/);
+    assert.doesNotMatch(prompt, /不要调用任何工具/);
     assert.match(prompt, /Product perspective/);
     assert.doesNotMatch(prompt, /hold source|feishu_bridge_context/);
     assert.deepEqual(ownTrace.filter(row => row.method === 'session.close').map(row => row.params.session_id), ['live-2']);
@@ -437,10 +438,14 @@ test('Hermes dedicated consultation resumes its own stored session across privat
     assert.equal(fx.trace.filter(row => row.method === 'reload.mcp').length, 0);
     assert.equal(fx.rows.size, 1);
     assert.equal([...fx.rows.values()][0]!.history.filter(item => item.role === 'user').length, 2);
+    for (const row of fx.trace.filter(row => row.method === 'prompt.submit')) {
+      assert.match(row.params.text, /本轮允许按需使用当前可用的 Skill、MCP/);
+      assert.doesNotMatch(row.params.text, /不要调用任何工具/);
+    }
   } finally { await fx.cleanup(); }
 });
 
-test('Hermes consultation discards handoff receipts and refuses approval without exposing public runtime events', async () => {
+test('Hermes consultation discards recursive handoffs and forwards approval without exposing public runtime events', async () => {
   const fx = await fixture({ onPrompt(socket, row) {
     const payload = { name: handoffTool, tool_id: 'consult-handoff', args: handoffArgs, result: { structuredContent: handoffArgs } };
     fx.event(socket, row, 'tool.start', payload);
@@ -452,10 +457,29 @@ test('Hermes consultation discards handoff receipts and refuses approval without
   try {
     const events: unknown[] = [];
     fx.client.subscribe(event => events.push(event));
-    await fx.client.consult({ cwd: 'C:/work', prompt: '<feishu_group_collaboration>role</feishu_group_collaboration>', signal: new AbortController().signal });
+    await fx.client.consult({ cwd: 'C:/work', prompt: '<feishu_group_collaboration>role</feishu_group_collaboration>', signal: new AbortController().signal,
+      onRequest: async request => { assert.equal(request.kind, 'approval'); return { decision: 'accept' }; } });
     assert.deepEqual(events, []);
-    assert.equal(fx.trace.find(row => row.method === 'approval.respond')!.params.choice, 'deny');
+    assert.equal(fx.trace.find(row => row.method === 'approval.respond')!.params.choice, 'once');
     assert.equal(fx.trace.some(row => row.method === 'skills.reload'), false);
+  } finally { await fx.cleanup(); }
+});
+
+test('Hermes consultation can finish a query tool and return its answer without publishing tool payloads', async () => {
+  const fx = await fixture({ onPrompt(socket, row) {
+    fx.event(socket, row, 'message.delta', { text: '正在查询最新报价。' });
+    fx.event(socket, row, 'tool.start', { name: 'mcp_market_quote', tool_id: 'quote-1' });
+    fx.event(socket, row, 'tool.complete', { name: 'mcp_market_quote', tool_id: 'quote-1',
+      result: { text: 'private tool payload', quote: 'test-price', timestamp: 'test-time' } });
+    fx.finish(socket, row, '测试报价 test-price，报价时间 test-time，来源为查询工具。');
+  } });
+  try {
+    const progress: string[] = [];
+    const result = await fx.client.consult({ cwd: 'C:/work', prompt: '请查询最新报价并注明来源和时间。',
+      signal: new AbortController().signal, onProgress: text => progress.push(text) });
+    assert.equal(result.text, '测试报价 test-price，报价时间 test-time，来源为查询工具。');
+    assert.deepEqual(progress, ['正在查询最新报价。']);
+    assert.equal(fx.trace.some(row => ['approval.respond', 'session.interrupt', 'reload.mcp'].includes(row.method)), false);
   } finally { await fx.cleanup(); }
 });
 

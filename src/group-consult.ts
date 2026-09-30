@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { validateGroupConsultRequest, type GroupConsultRequest, type GroupConsultResult } from './group-consult-request.js';
+import { GROUP_CONSULT_EXECUTION_TIMEOUT_MS, validateGroupConsultRequest, type GroupConsultRequest, type GroupConsultResult } from './group-consult-request.js';
 
 export class GroupConsultError extends Error {
   constructor(message: string, readonly status = 409) { super(message); }
@@ -26,7 +26,7 @@ export class GroupConsultations {
   private scopes = new Map<string, Scope>();
   private pending = new Set<Pending>();
   private budgets = new Map<string, number>();
-  constructor(private readonly timeoutMs = 45_000, private readonly publicationTimeoutMs = 8_000) {}
+  constructor(private readonly timeoutMs = GROUP_CONSULT_EXECUTION_TIMEOUT_MS, private readonly publicationTimeoutMs = 8_000) {}
 
   setPort(port: number): void {
     if (!Number.isSafeInteger(port) || port < 1 || port > 65535 || this.scopes.size) throw new Error('Invalid consultation listener change');
@@ -97,7 +97,7 @@ export class GroupConsultations {
       readyAnswer = text.trim();
       clearTimeout(timeout);
       // Preserve an actual answer when only group delivery is slow. The caller's
-      // 55-second budget leaves room for the 45-second model + 8-second publish limits.
+      // client budget leaves room for execution plus the 8-second publish limit.
       timeout = setTimeout(() => controller.abort(publicationTimeout), this.publicationTimeoutMs);
     };
     const check = setInterval(() => this.cancelInvalid(), 250);

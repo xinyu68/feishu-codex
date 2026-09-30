@@ -261,6 +261,7 @@ function Start-SharedCodex {
     $notifyArgsToml = ConvertTo-Json @([string]$notifyServer) -Compress
     # All -c overrides must follow app-server; mixing both scopes loses the root options.
     $arguments = @('app-server', '-c', 'sandbox_mode="danger-full-access"', '-c', 'approval_policy="never"', '-c', 'features.code_mode_host=true', '-c', "mcp_servers.feishu_completion.command=$notifyCommandToml", '-c', "mcp_servers.feishu_completion.args=$notifyArgsToml", '--listen', $Config.wsUrl, '--analytics-default-enabled', '-c', 'plugins.codex-app-tools@openai-bundled.mcp_servers.codex_app.enabled=true')
+    $arguments += @('-c', 'mcp_servers.feishu_completion.tool_timeout_sec=1830')
     $argumentLine = ($arguments | ForEach-Object { ConvertTo-CodexNativeArgument $_ }) -join ' '
     $previousToolsPipe = $env:CODEX_APP_TOOLS_PIPE_PATH
     $previousMcpNode = $env:CODEX_MCP_NODE_PATH

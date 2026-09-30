@@ -12,6 +12,21 @@ import { validateCodexWebsocketUrl, type RpcMessage, type RpcParams } from '../s
 type Turn = { id: string; status: string; items: RpcParams[] };
 type Received = { socket: WebSocket; message: RpcMessage };
 const pause = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+test('a source waiting on delegated work outlives its idle timer and resumes after the MCP result', async () => {
+  const fx = await fixture(undefined, { idleTimeoutMs: 120 });
+  fx.onStart = async (socket, message) => {
+    const turn = fx.begin('new-thread', String(message.params?.clientUserMessageId));
+    fx.reply(socket, message, { turn: { id: turn.id, status: 'inProgress' } });
+    const item = { id: 'delegate-1', type: 'mcpToolCall', server: 'feishu_completion', tool: 'consult_feishu_group_agent' };
+    fx.notify('item/started', { threadId: 'new-thread', turnId: turn.id, item });
+    await pause(300);
+    fx.notify('item/completed', { threadId: 'new-thread', turnId: turn.id, item });
+    fx.complete('new-thread', turn, 'continued after delegation');
+  };
+  try { assert.equal((await fx.client.run({ cwd: process.cwd(), prompt: 'delegate' })).text, 'continued after delegation'); }
+  finally { await fx.cleanup(); }
+});
 function deferred<T = void>() {
   let resolve!: (value: T) => void;
   const promise = new Promise<T>(done => { resolve = done; });
@@ -195,6 +210,10 @@ test('dedicated consultation resumes its own persisted Codex thread without desk
     assert.equal(fx.received.filter(row => row.message.method === 'thread/start').length, 1);
     assert.equal(fx.received.find(row => row.message.method === 'thread/start')!.message.params!.ephemeral, false);
     assert.deepEqual(fx.received.filter(row => row.message.method === 'thread/resume').map(row => row.message.params!.threadId), [first.threadId]);
+    for (const row of fx.received.filter(row => ['thread/start', 'thread/resume'].includes(row.message.method))) {
+      assert.match(String(row.message.params!.developerInstructions), /本轮允许按需使用当前可用的 Skill、MCP/);
+      assert.doesNotMatch(String(row.message.params!.developerInstructions), /不要调用任何工具/);
+    }
     fx.onLoaded = (socket, message) => fx.reply(socket, message, { data: [first.threadId], nextCursor: null });
     await fx.client.watchLoaded();
     assert.equal(fx.received.filter(row => row.message.method === 'thread/resume').length, 1);

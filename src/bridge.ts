@@ -22,6 +22,7 @@ type Queue = { active: boolean; cancelled: boolean; threadId?: string; items: Wo
 type PendingRequest = RuntimeRequest & {
   chatId: string; actorId: string; createdAt: string; messageId?: string; localOnly?: boolean; operationId?: string;
   resolve: (answer: RuntimeAnswer) => void; timer: ReturnType<typeof setTimeout>;
+  valid?: () => boolean;
 };
 type Discover = { projects: () => Promise<Project[]>; threads: (cwd: string) => Promise<ThreadSummary[]>; assertCanWrite?: () => void | Promise<void> };
 const STREAM_MAX_THREADS = 32;
@@ -587,7 +588,7 @@ export class Bridge {
     })).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
   }
   pendingRequests() {
-    return [...this.requests.values()].map(({ resolve, timer, ...item }) => item);
+    return [...this.requests.values()].map(({ resolve, timer, valid, ...item }) => item);
   }
   async history(chatId: string): Promise<{ messages: ChatMessage[]; source: string; threadId?: string }> {
     const conversation = this.store.state.conversations[chatId];
@@ -1209,6 +1210,10 @@ export class Bridge {
       throw new UserError('这个请求已经失效，请以最新卡片为准。');
     }
     if (actor && (request.actorId !== actor.actorId || request.chatId !== actor.chatId)) throw new UserError('这个请求不属于当前账号或对话。', 403);
+    if (request.valid && !request.valid()) {
+      this.resolveRequest(request, { decision: 'decline', answers: {} }, '任务已停止或上下文已变化');
+      throw new UserError('任务已停止或上下文已变化，请求已失效。', 409);
+    }
     if (!this.store.isAuthorized(request.chatId, request.actorId)) throw new UserError('账号或群聊的授权已撤销，请求不能继续。', 403);
     const operationMessage = request.operationId ? this.flights.get(request.operationId)?.message ?? this.queues.get(request.chatId)?.currentMessage : undefined;
     if (operationMessage?.handoff && !this.relayIsLive(this.groupRelays.get(operationMessage.handoff.chainId), true)) {
@@ -1221,6 +1226,7 @@ export class Bridge {
     this.resolveRequest(request, answer, request.kind === 'question' ? '已提交回答' : answer.decision === 'accept' ? '已同意' : '已拒绝');
   }
   private resolveRequest(request: PendingRequest, answer: RuntimeAnswer, title: string): void {
+    if (this.requests.get(request.id) !== request) return;
     this.requests.delete(request.id);
     clearTimeout(request.timer);
     this.finishedRequests.set(request.id, { chatId: request.chatId, actorId: request.actorId, text: title });
@@ -1234,16 +1240,22 @@ export class Bridge {
   private finishRequests(chatId: string, title: string, operationId?: string) {
     for (const request of this.requests.values()) if (request.chatId === chatId && (!operationId || request.operationId === operationId)) this.resolveRequest(request, { decision: 'decline', answers: {} }, title);
   }
-  private async requestUser(message: InboundMessage, raw: RuntimeRequest): Promise<RuntimeAnswer> {
-    if (!this.store.isAuthorized(message.chatId, message.actorId)
+  private async requestUser(message: InboundMessage, raw: RuntimeRequest, options?: { signal: AbortSignal; valid: () => boolean }): Promise<RuntimeAnswer> {
+    if (options?.signal.aborted || (options && !options.valid()) || !this.store.isAuthorized(message.chatId, message.actorId)
       || (message.handoff && !this.relayIsLive(this.groupRelays.get(message.handoff.chainId), true))) return { decision: 'decline', answers: {} };
     const id = crypto.randomUUID();
+    const cancelled = () => {
+      const pending = this.requests.get(id);
+      if (pending) this.resolveRequest(pending, { decision: 'decline', answers: {} }, '任务已停止');
+    };
     return new Promise<RuntimeAnswer>((resolve) => {
       const request: PendingRequest = {
         ...raw, id, chatId: message.chatId, actorId: message.actorId, operationId: message.id, localOnly: message.localOnly, createdAt: new Date().toISOString(), resolve,
+        valid: options ? () => !options.signal.aborted && options.valid() : undefined,
         timer: setTimeout(() => this.resolveRequest(request, { decision: 'decline', answers: {} }, '请求已超时'), 10 * 60_000)
       };
       this.requests.set(id, request);
+      options?.signal.addEventListener('abort', cancelled, { once: true });
       const questionText = raw.questions?.map((question) => `${question.question}${question.options?.length ? '\n' + question.options.map((option) => `• ${option.label}`).join('\n') : ''}`).join('\n\n') ?? '';
       const text = [raw.text, questionText, raw.kind === 'question' ? `回复 /answer ${id} 你的回答（多题请在管理页填写）` : ''].filter(Boolean).join('\n\n');
       if (!message.localOnly && message.chatId !== 'local-preview') {
@@ -1255,7 +1267,7 @@ export class Bridge {
           if (!this.requests.has(id)) return this.transport?.updateCard(messageId, { title: '请求已处理', text: raw.text });
         }).catch((error) => this.store.log('warn', `请求卡片发送失败，可在管理页处理：${errorText(error)}`));
       }
-    });
+    }).finally(() => options?.signal.removeEventListener('abort', cancelled));
   }
   private async command(message: InboundMessage, name: string, arg: string): Promise<void> {
     if (message.localOnly) throw new UserError('本地试聊请直接发送文字；切换项目、会话、新建和停止请使用页面按钮。');
@@ -1863,7 +1875,7 @@ export class Bridge {
         throw new UserError('目标角色正在处理任务或咨询，请先使用已有信息继续。', 409);
       }
       const snapshot = { appId: bot.appId, engine: bot.engine ?? 'codex', role: bot.roleInstructions,
-        model: bot.model, effort: bot.effort, name: bot.name, revision: conversation?.revision, threadId: conversation?.threadId };
+        model: bot.model, effort: bot.effort, name: bot.name, revision: conversation?.revision ?? 0, threadId: conversation?.threadId };
       const consultationKeyFor = (targetConversation: string) => crypto.createHash('sha256').update(JSON.stringify([
         message.chatId, target.consultationIdentity ?? target.threadId, bot.id, snapshot.appId, snapshot.engine,
         targetConversation, target.cwd, snapshot.role, snapshot.model, snapshot.effort,
@@ -1884,7 +1896,7 @@ export class Bridge {
           && !this.removingBots.has(bot.id) && !this.changingContext.has(targetChatId)
           && this.store.resolveGroupActor(message.chatId, message.actorId, bot.id) === actorId
           && this.store.isAuthorized(targetChatId, actorId, 'group') && this.transport?.isAvailable?.(targetChatId) !== false
-          && current?.revision === snapshot.revision && current?.threadId === snapshot.threadId
+          && (current?.revision ?? 0) === snapshot.revision && current?.threadId === snapshot.threadId
           && (!current || (current.cwd === target.cwd && !this.boundBusy(current))));
       };
       const runtime = this.runtimeForChat(targetChatId);
@@ -1902,6 +1914,7 @@ export class Bridge {
           && this.store.isAuthorized(targetChatId, actorId, 'group') && transport.isAvailable?.(targetChatId) !== false);
       };
       return { botId: bot.id, target: bot.name, valid: targetValid, run: async (signal, answerReady) => {
+        const operationId = crypto.randomUUID();
         let consultationThread: string | undefined;
         let targetStarted = false;
         const reply = new GroupConsultReply({ transport, chatId: targetChatId, name: bot.name, signal,
@@ -1948,6 +1961,8 @@ export class Bridge {
               .replace(/fc1\.\d{1,5}\.[a-f0-9]{64}/g, '[咨询凭据已省略]'),
             signal, onBeforeSubmit: () => { if (!targetValid()) throw new UserError('咨询上下文已变化，未提交任务。', 403); },
             onProgress: text => reply.update(text),
+            onRequest: raw => this.requestUser({ id: operationId, chatId: targetChatId, actorId, text: request.question, chatType: 'group' },
+              { ...raw, title: `${bot.name} · ${raw.title}` }, { signal, valid: targetValid }),
           });
           signal.throwIfAborted();
           if (!targetValid()) throw new UserError('咨询上下文已变化，未发布答复。', 403);
@@ -1963,7 +1978,10 @@ export class Bridge {
         } catch (error) {
           if (targetStarted) await reply.fail(signal.aborted);
           throw error;
-        } finally { signal.removeEventListener('abort', cancelled); finishConsultation(); }
+        } finally {
+          this.finishRequests(targetChatId, '本次协作已结束', operationId);
+          signal.removeEventListener('abort', cancelled); finishConsultation();
+        }
       } };
     } });
   }

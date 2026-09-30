@@ -529,6 +529,8 @@ const notificationTargetKey = (target: DesktopNotificationTarget) => JSON.string
 
 function NotificationTargetSummary({ targets, value, pending, openBots }: { targets: NotificationTarget[]; value?: DesktopNotificationTarget | null; pending: boolean; openBots: () => void }) {
   const selected = value && targets.find(target => notificationTargetKey(target) === notificationTargetKey(value));
-  const label = value && !selected ? '已失效，请重新设置' : selected ? `${selected.botName} · 私聊` : '未指定（唯一私聊时自动选择）';
+  const label = value && !selected ? '已失效，请重新设置' : selected ? `${selected.botName} · 私聊`
+    : !targets.length ? '待建立通知私聊'
+    : targets.length === 1 ? `未指定（将使用 ${targets[0].botName} 私聊）` : '未指定，请选择默认机器人';
   return <div className="notification-target-summary"><div><span>默认通知机器人</span><strong className={value && !selected ? 'unavailable' : ''}>{label}{pending && <small>（尚未保存）</small>}</strong></div><button type="button" className="text-button" onClick={openBots}>管理默认机器人<ChevronRight size={13} /></button></div>;
 }

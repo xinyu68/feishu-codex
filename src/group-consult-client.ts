@@ -1,9 +1,27 @@
+import http from 'node:http';
+import { Readable } from 'node:stream';
 import {
   GROUP_CONSULT_PATH, GROUP_CONSULT_TIMEOUT_MS, MAX_GROUP_CONSULT_ANSWER_LENGTH, MAX_GROUP_CONSULT_TARGET_LENGTH,
   groupConsultPort, validateGroupConsultRequest, type GroupConsultRequest, type GroupConsultResult,
 } from './group-consult-request.js';
 
 const MAX_RESPONSE_BYTES = 256 * 1024;
+
+/** Native HTTP avoids fetch's five-minute response-header limit on long tasks. */
+function requestLoopback(url: string, init: RequestInit): Promise<Response> {
+  return new Promise((resolve, reject) => {
+    const request = http.request(url, {
+      method: 'POST', headers: init.headers as Record<string, string>, signal: init.signal ?? undefined,
+    }, response => {
+      const status = response.statusCode ?? 502;
+      if (status >= 300 && status < 400) { response.resume(); reject(new Error('Loopback redirects are not supported')); return; }
+      if (status === 204 || status === 205) { response.resume(); resolve(new Response(null, { status })); return; }
+      resolve(new Response(Readable.toWeb(response) as ReadableStream<Uint8Array>, { status }));
+    });
+    request.on('error', reject);
+    request.end(init.body as string);
+  });
+}
 type ConsultOptions = { signal?: AbortSignal; timeoutMs?: number; fetch?: typeof globalThis.fetch };
 
 export class GroupConsultClientError extends Error {
@@ -43,7 +61,7 @@ export async function consultFeishuGroupAgent(value: GroupConsultRequest, option
   const signal = options.signal ? AbortSignal.any([options.signal, timeout]) : timeout;
   try {
     signal.throwIfAborted();
-    const response = await (options.fetch ?? globalThis.fetch)(`http://127.0.0.1:${groupConsultPort(request.context_token)}${GROUP_CONSULT_PATH}`, {
+    const response = await (options.fetch ?? requestLoopback)(`http://127.0.0.1:${groupConsultPort(request.context_token)}${GROUP_CONSULT_PATH}`, {
       method: 'POST', redirect: 'error', signal,
       headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
       body: JSON.stringify(request),

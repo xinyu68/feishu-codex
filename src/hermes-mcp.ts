@@ -3,6 +3,7 @@ import { stat } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { normalizeHermesDashboardUrl, type HermesDashboardEndpoint } from './hermes-discovery.js';
+import { GROUP_CONSULT_MCP_TIMEOUT_SECONDS } from './group-consult-request.js';
 
 export interface HermesMcpOptions {
   endpoint: HermesDashboardEndpoint;
@@ -64,7 +65,7 @@ async function desiredEntry(options: HermesMcpOptions): Promise<Json> {
   const defaultScript = fileURLToPath(new URL(import.meta.url.endsWith('.ts') ? '../build/server/notify-mcp.js' : './notify-mcp.js', import.meta.url));
   const script = await runtimeFile(options.scriptPath ?? defaultScript, false);
   const env: Json = { [ownerKey]: 'hermes-v1', [modeKey]: 'hermes' };
-  const entry = { command, args: [script], env };
+  const entry = { command, args: [script], env, timeout: GROUP_CONSULT_MCP_TIMEOUT_SECONDS };
   env[hashKey] = fingerprint(entry);
   return entry;
 }
