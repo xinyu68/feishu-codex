@@ -14,6 +14,7 @@ import { canonicalEnvironment } from '../desktop/lifecycle.mjs';
 // Execute the actual NSIS customUnInstall macro against disposable profiles.
 // Neither the user's installed program nor their agents are uninstalled.
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const workspaceIsDataRoot = process.argv.includes('--workspace=data-root');
 const base = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'feishu-hermes-uninstall-hook-')));
 const installDir = path.join(base, '测试安装');
 const product = path.join(installDir, 'resources/product');
@@ -49,7 +50,8 @@ for (const file of residue) {
   await fs.mkdir(path.dirname(path.join(dataDir, file)), { recursive: true });
   await fs.writeFile(path.join(dataDir, file), 'app data');
 }
-await fs.writeFile(path.join(dataDir, 'config.json'), JSON.stringify({ defaultWorkspace: path.join(userHome, 'project') }));
+await fs.writeFile(path.join(dataDir, 'config.json'), JSON.stringify({ defaultWorkspace: workspaceIsDataRoot ? dataDir : path.join(userHome, 'project') }));
+await fs.writeFile(path.join(dataDir, 'state.json'), JSON.stringify({ conversations: { one: { cwd: workspaceIsDataRoot ? dataDir : path.join(userHome, 'project') } } }));
 const profileDir = path.join(userHome, 'roaming', 'feishu-codex');
 await fs.mkdir(profileDir, { recursive: true });
 await fs.writeFile(path.join(profileDir, 'Cache'), 'cached');
@@ -136,6 +138,6 @@ SectionEnd
 }
 assert.equal(await fs.readFile(path.join(hermesHome, 'sessions.db'), 'utf8'), 'keep sessions');
 assert.equal(await fs.readFile(path.join(codexHome, 'auth.json'), 'utf8'), 'keep login');
-const report = { passed: true, directory: base, realUserDataTouched: false, checks: ['actual NSIS hook skips upgrade cleanup', 'normal uninstall removes Codex and Hermes managed skills and Hermes MCP', 'clear-data checkbox removes attachments, setup and migration records, Hermes runtime config and app cache', 'unchecked checkbox and upgrades retain app data', 'no running Hermes required', 'Chinese installation/profile paths supported', 'sessions, login and other MCP settings retained'], checkedAt: new Date().toISOString() };
-await fs.writeFile(path.join(root, 'artifacts/hermes-uninstall-hook-verification.json'), JSON.stringify(report, null, 2));
+const report = { workspaceIsDataRoot, passed: true, directory: base, realUserDataTouched: false, checks: ['actual NSIS hook skips upgrade cleanup', 'normal uninstall removes Codex and Hermes managed skills and Hermes MCP', 'clear-data checkbox removes attachments, setup and migration records, Hermes runtime config and app cache', 'unchecked checkbox and upgrades retain app data', 'no running Hermes required', 'Chinese installation/profile paths supported', 'sessions, login and other MCP settings retained'], checkedAt: new Date().toISOString() };
+await fs.writeFile(path.join(root, workspaceIsDataRoot ? 'artifacts/hermes-uninstall-data-root-verification.json' : 'artifacts/hermes-uninstall-hook-verification.json'), JSON.stringify(report, null, 2));
 console.log(JSON.stringify(report, null, 2));

@@ -405,3 +405,28 @@ test('compiled static assets are served with correct types while private files r
     assert.equal((await fetch(`${h.base}${resource}`)).status, 404, resource);
   }
 });
+
+for (const previousAppId of ['', 'cli_1234567890abcdef']) test(
+  previousAppId ? 'successful app replacement retains the newly verified bot identity' : 'first setup retains bot identity without needing a reconnect', async t => {
+    const appId = 'cli_abcdef0123456789';
+    const identity = { openId: 'ou_new_bot', name: 'Codex' };
+    const h = await fixture(t, {
+      async verifyCredentials() {},
+      createTransport(options) { return {
+        async start() { options.onBotIdentity?.(identity); options.onStatus('connected'); },
+        async close() { options.onStatus('stopped'); },
+        async sendText() { return ''; }, async sendCard() { return ''; }, async sendImage() { return ''; }, async sendFile() { return ''; },
+        async updateCard() {}, async startTyping() { return async () => {}; },
+      }; },
+    });
+    h.app.store.saveConfig({ appId: previousAppId, appSecret: previousAppId ? 'old-secret' : '', allowedActors: ['ou_old'], allowedGroups: ['oc_old'] });
+    if (previousAppId) h.app.store.rememberBotIdentity('default', { openId: 'ou_old_bot', name: 'Old bot' });
+    h.app.store.conversation('oc_old', 'ou_old', undefined, 'group').threadId = 'old-thread';
+    const response = await h.request('/api/credentials', { appId, appSecret: 'new-secret' });
+    assert.equal(response.status, 200, await response.clone().text());
+    assert.deepEqual(h.app.store.botIdentity('default'), { ...identity, appId });
+    assert.deepEqual(new Store(h.directory).botIdentity('default'), { ...identity, appId });
+    assert.equal(h.app.store.state.conversations.oc_old, undefined);
+    assert.deepEqual(h.app.store.config.allowedActors, []);
+    assert.deepEqual(h.app.store.config.allowedGroups, []);
+  });

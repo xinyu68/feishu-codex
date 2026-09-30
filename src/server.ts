@@ -252,7 +252,7 @@ export async function startServer(options: { port?: number; dataDir?: string; co
       store.saveBot(botId, { ...patch, appId, appSecret, enabled: true });
       const { ready } = await startTransport(requireBot(botId));
       await waitForConnected(ready);
-      if (previous && previous.appId !== appId) store.resetBotBindings(botId);
+      if (previous && previous.appId !== appId) store.resetBotBindings(botId, { preserveCurrentBotIdentity: true });
       deliverPending();
       return { config: store.publicConfig(), connection: connectionFor(botId), bot: publicBots().find(bot => bot.id === botId) };
     } catch (error) {

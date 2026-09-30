@@ -36,7 +36,7 @@ async function fixture(t: test.TestContext) {
       clients.set(options.appId, options);
       let sequence = 0;
       return {
-        async start() { starts.push(options.appId); options.onStatus(failApps.has(options.appId) ? 'error' : 'connected'); },
+        async start() { starts.push(options.appId); options.onBotIdentity?.({ openId: 'ou_' + options.appId, name: options.appId }); options.onStatus(failApps.has(options.appId) ? 'error' : 'connected'); },
         async close() { closes.push(options.appId); options.onStatus('stopped'); },
         async sendText(chatId, text) { sends.push({ appId: options.appId, chatId, text }); return `om_${++sequence}`; },
         async sendCard(chatId, card) { sends.push({ appId: options.appId, chatId, text: card.text }); return `om_${++sequence}`; },
@@ -109,6 +109,8 @@ test('failed creation rolls back configuration; replacing credentials restores o
   assert.equal(restored.connection.status, 'connected');
   assert.equal(h.app.store.bot(bot.id)?.appSecret, '开发-secret');
   assert.equal(h.app.store.state.conversations[boundChat]?.threadId, 'existing-thread');
+  assert.equal(h.app.store.botIdentity(bot.id)?.appId, developerApp);
+  assert.equal(h.app.store.botIdentity(bot.id)?.openId, 'ou_' + developerApp);
 });
 
 test('blank secrets are kept only within the same app and authorizations are app scoped', async t => {
@@ -128,6 +130,8 @@ test('blank secrets are kept only within the same app and authorizations are app
   assert.deepEqual(h.app.store.bot(bot.id)?.allowedActors, []);
   assert.deepEqual(h.app.store.bot(bot.id)?.allowedGroups, []);
   assert.equal(h.app.store.state.conversations[boundChat], undefined);
+  assert.equal(h.app.store.botIdentity(bot.id)?.appId, otherApp);
+  assert.equal(h.app.store.botIdentity(bot.id)?.openId, 'ou_' + otherApp);
 });
 
 test('group observations and downloads require both bot-specific actor and group authorization', async t => {

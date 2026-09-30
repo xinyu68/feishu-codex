@@ -47,6 +47,7 @@ test('explicit data clearing removes app credentials and cache while preserving 
 });
 for (const ownedDirectory of ['desktop', 'attachments']) test(`a project inside ${ownedDirectory} is preserved`, { skip: process.platform !== 'win32' }, async () => {
   const fx = await fixture();
+  await fs.writeFile(path.join(fx.dataDir, 'config.json'), JSON.stringify({ defaultWorkspace: fx.dataDir }));
   const project = path.join(fx.dataDir, ownedDirectory, 'my-project');
   await fs.mkdir(project); await fs.writeFile(path.join(project, 'code.txt'), 'project');
   await fs.writeFile(path.join(fx.dataDir, 'state.json'), JSON.stringify({ conversations: { one: { cwd: project } } }));
@@ -82,4 +83,39 @@ test('clearing only app data removes the empty root and is safe to repeat', { sk
   await fx.run();
   assert.equal(await fs.readFile(backup, 'utf8'), 'personal changes');
   assert.equal(await fs.readFile(path.join(originalProject, 'code.txt'), 'utf8'), 'project');
+});
+
+for (const workspaceSource of ['config', 'conversation']) test(
+  'app data used as the ' + workspaceSource + ' workspace still clears owned data and preserves user files',
+  { skip: process.platform !== 'win32' }, async () => {
+    const fx = await fixture();
+    if (workspaceSource === 'config') {
+      await fs.writeFile(path.join(fx.dataDir, 'config.json'), JSON.stringify({ defaultWorkspace: fx.dataDir }));
+    } else {
+      await fs.writeFile(path.join(fx.dataDir, 'state.json'), JSON.stringify({ conversations: { one: { cwd: fx.dataDir } } }));
+    }
+    await fs.writeFile(path.join(fx.dataDir, 'personal-notes.txt'), 'keep notes');
+    await fx.run();
+    for (const file of [...residualFiles, 'config.json', 'state.json', 'service.lock', 'config.json.12345.tmp', 'desktop']) {
+      assert.equal(await fs.stat(path.join(fx.dataDir, file)).catch(() => null), null, file);
+    }
+    assert.equal(await fs.stat(fx.profileDir).catch(() => null), null);
+    assert.equal(await fs.readFile(path.join(fx.dataDir, 'personal-notes.txt'), 'utf8'), 'keep notes');
+    assert.equal(await fs.readFile(path.join(fx.dataDir, 'my-project', 'code.txt'), 'utf8'), 'project');
+    assert.equal(await fs.readFile(path.join(fx.codexHome, 'auth.json'), 'utf8'), 'login');
+    assert.equal(await fs.readFile(path.join(fx.codexHome, 'history.jsonl'), 'utf8'), 'history');
+    await fx.run();
+    assert.equal(await fs.readFile(path.join(fx.dataDir, 'personal-notes.txt'), 'utf8'), 'keep notes');
+  });
+test('an app-only workspace root is removed when both config and conversations point to it', { skip: process.platform !== 'win32' }, async () => {
+  const fx = await fixture();
+  const externalProject = path.join(fx.directory, 'external-project');
+  await fs.rename(path.join(fx.dataDir, 'my-project'), externalProject);
+  await fs.writeFile(path.join(fx.dataDir, 'config.json'), JSON.stringify({ defaultWorkspace: fx.dataDir }));
+  await fs.writeFile(path.join(fx.dataDir, 'state.json'), JSON.stringify({ conversations: { one: { cwd: fx.dataDir } } }));
+  await fx.run();
+  assert.equal(await fs.stat(fx.dataDir).catch(() => null), null);
+  assert.equal(await fs.stat(fx.profileDir).catch(() => null), null);
+  assert.equal(await fs.readFile(path.join(externalProject, 'code.txt'), 'utf8'), 'project');
+  await fx.run();
 });

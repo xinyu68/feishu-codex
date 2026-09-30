@@ -160,3 +160,18 @@ test('remembering a group thread preserves its successful handoff policy migrati
   assert.equal(store.state.threadBindings.thread_group!.groupHandoffPolicyVersion, 1);
   assert.equal(store.state.threadBindings.thread_group!.roleInstructions, '原来的角色');
 });
+
+test('binding reset only preserves an explicitly requested identity belonging to the current app', t => {
+  const { store, message } = fixture(t);
+  store.rememberBotIdentity('dev', { openId: 'ou_bot', name: 'Codex' });
+  store.rememberActorIdentity(message('dev', { id: 'om_old' }));
+  store.resetBotBindings('dev', { preserveCurrentBotIdentity: true });
+  assert.equal(store.botIdentity('dev')?.openId, 'ou_bot');
+  assert.equal(store.state.groupActorIdentities.oc_team, undefined);
+  store.state.botIdentities.dev!.appId = 'cli_obsolete';
+  store.resetBotBindings('dev', { preserveCurrentBotIdentity: true });
+  assert.equal(store.state.botIdentities.dev, undefined);
+  store.rememberBotIdentity('dev', { openId: 'ou_bot', name: 'Codex' });
+  store.resetBotBindings('dev');
+  assert.equal(store.state.botIdentities.dev, undefined);
+});

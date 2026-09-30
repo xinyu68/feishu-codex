@@ -45,7 +45,11 @@
     foreach ($candidate in $candidates) {
         $target = [IO.Path]::GetFullPath($candidate).TrimEnd('\')
         if ($target -ine $profileRoot -and [IO.Path]::GetDirectoryName($target) -ine $dataRoot) { throw '数据清理路径超出应用目录。' }
-        if (@($projects | Where-Object { (Is-InDirectory $_ $target) -or (Is-InDirectory $target $_) }).Count) { Write-Output '已保留包含项目文件的目录。'; continue }
+        # The application data root can itself be the default workspace. That
+        # must not protect every owned file from an explicit data-clear request.
+        # The whitelist still excludes user files; separately configured nested
+        # projects and projects containing a custom data directory stay protected.
+        if (@($projects | Where-Object { $_ -ine $dataRoot -and ((Is-InDirectory $_ $target) -or (Is-InDirectory $target $_)) }).Count) { Write-Output '已保留包含项目文件的目录。'; continue }
         if (-not (Test-Path -LiteralPath $target)) { continue }
         $pending = [Collections.Generic.Stack[string]]::new(); $pending.Push($target)
         while ($pending.Count) {

@@ -283,8 +283,12 @@ export class Store {
     this.saveConfig(patch);
     this.save();
   }
-  resetBotBindings(botId: string): void {
+  resetBotBindings(botId: string, options: { preserveCurrentBotIdentity?: boolean } = {}): void {
+    // Credential activation has already identified the new app. Clear old
+    // conversations and actor evidence without discarding that verified identity.
+    const identity = options.preserveCurrentBotIdentity ? this.botIdentity(botId) : undefined;
     this.clearBotIdentities(botId);
+    if (identity) this.state.botIdentities[botId] = identity;
     for (const [key] of Object.entries(this.state.conversations)) if (key !== 'local-preview' && parseRoute(key).botId === botId) {
       delete this.state.conversations[key]; delete this.state.history[key];
     }
