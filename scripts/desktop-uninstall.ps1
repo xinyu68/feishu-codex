@@ -6,6 +6,7 @@
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 . (Join-Path $PSScriptRoot 'desktop-process-tree.ps1')
+. (Join-Path $PSScriptRoot 'desktop-service-listeners.ps1')
 $InstallDir = [IO.Path]::GetFullPath($InstallDir).TrimEnd('\')
 if ($InstallDir -eq [IO.Path]::GetPathRoot($InstallDir).TrimEnd('\')) { throw '安装目录无效。' }
 $productRoot = Join-Path $InstallDir 'resources\product'
@@ -31,41 +32,6 @@ function Get-LiveIdentity($Identity) {
     if (Test-ProcessIdentity $Identity $candidate) { return $Identity }
     return $null
 }
-function Get-BlockingServiceListeners {
-    $ports = @(8790, 18791, 18792)
-    $records = @()
-    $runtimePath = Join-Path $DataDir 'runtime.json'
-    $currentUrl = 'ws://127.0.0.1:18791'
-    if (Test-Path -LiteralPath $runtimePath -PathType Leaf) {
-        $settings = [IO.File]::ReadAllText($runtimePath) | ConvertFrom-Json
-        if ($settings.wsUrl) { $currentUrl = [string]$settings.wsUrl }
-    }
-    $endpoint = [Uri]$currentUrl
-    if ($endpoint.Scheme -ne 'ws' -or $endpoint.Host -ne '127.0.0.1' -or $endpoint.Port -lt 1024 -or $endpoint.Port -gt 65535) { throw '本机连接记录无效，未清除任何数据。' }
-    $ports += $endpoint.Port
-    $records += @{ port = $endpoint.Port; identity = (Read-State 'runtime-identity') }
-    $recovery = Read-State 'runtime-endpoint-recovery'
-    if ($recovery -and $recovery.previousUrl) {
-        $previous = [Uri]$recovery.previousUrl
-        if ($previous.Scheme -ne 'ws' -or $previous.Host -ne '127.0.0.1' -or $previous.Port -lt 1024 -or $previous.Port -gt 65535) { throw '连接恢复记录无效，未清除任何数据。' }
-        $ports += $previous.Port
-        $records += @{ port = $previous.Port; identity = $recovery.previousIdentity }
-    }
-    foreach ($listener in @(Get-NetTCPConnection -LocalPort ($ports | Select-Object -Unique) -State Listen -ErrorAction SilentlyContinue)) {
-        $stale = $false
-        foreach ($record in $records) {
-            $identity = $record.identity
-            if ($listener.LocalAddress -eq '127.0.0.1' -and $listener.LocalPort -eq $record.port -and $identity -and $identity.pid -gt 0 -and $identity.exe -and $identity.startedAt -and $listener.OwningProcess -eq $identity.pid) {
-                # Only a confirmed absent process can explain a stale Windows socket.
-                # A reused PID, foreign listener or failed inspection still blocks cleanup.
-                $candidate = Get-CimInstance Win32_Process -Filter "ProcessId = $([int]$identity.pid)" -ErrorAction Stop
-                if (-not $candidate) { $stale = $true }
-            }
-        }
-        if (-not $stale) { $listener }
-    }
-}
-
 function Find-OwnedTask {
     $task = Get-ScheduledTask -TaskName $taskName -TaskPath '\' -ErrorAction SilentlyContinue
     if (-not $task -or @($task.Actions).Count -ne 1) { return $null }
@@ -91,7 +57,7 @@ try {
         foreach ($name in @('host', 'runtime', 'bridge', 'relay', 'desktop')) {
             if (Get-LiveIdentity (Read-State ($name + '-identity'))) { throw '保留的数据仍被其他安装使用，未清除任何数据。' }
         }
-        if (@(Get-BlockingServiceListeners).Count) { throw '仍有本机服务正在运行，未清除任何数据。' }
+        if (@(Get-BlockingServiceListeners -DataDir $DataDir).Count) { throw '仍有本机服务正在运行，未清除任何数据。' }
     }
     if ($ownsData -and $control -and ($control.root -ine $productRoot -or $control.dataDir -ine $DataDir)) { throw '后台归属不一致，请打开应用恢复连接后重试。' }
     $serviceTrees = @()
@@ -185,7 +151,7 @@ try {
     }
     Write-UninstallLog '退出检查通过；Codex 账号、配置和历史记录保持不变。'
     if ($Phase -eq 'ClearData') {
-        if (@(Get-BlockingServiceListeners).Count) { throw '仍有本机服务正在运行，未清除任何数据。' }
+        if (@(Get-BlockingServiceListeners -DataDir $DataDir).Count) { throw '仍有本机服务正在运行，未清除任何数据。' }
         . (Join-Path $PSScriptRoot 'desktop-clear-data.ps1')
         Remove-FeishuApplicationData -DataDir $DataDir
     }

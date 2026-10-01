@@ -6,7 +6,9 @@
 )
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+try {
 . (Join-Path $PSScriptRoot 'desktop-process-tree.ps1')
+. (Join-Path $PSScriptRoot 'desktop-service-listeners.ps1')
 $ProductRoot = [IO.Path]::GetFullPath($ProductRoot).TrimEnd('\')
 $NodePath = [IO.Path]::GetFullPath($NodePath)
 $DataDir = [IO.Path]::GetFullPath($DataDir).TrimEnd('\')
@@ -51,8 +53,13 @@ foreach ($name in @('host', 'runtime', 'bridge', 'relay', 'desktop')) {
         if (Test-ProcessIdentity $identity $candidate) { throw '原来的服务或 Codex 仍在运行，请先退出原安装的全部服务，再点击恢复连接。' }
     }
 }
-if (@(Get-NetTCPConnection -LocalPort 8790,18791,18792 -State Listen -ErrorAction SilentlyContinue).Count) { throw '本机服务端口正在使用，请先退出原安装的全部服务，再点击恢复连接。' }
+if (@(Get-BlockingServiceListeners -DataDir $DataDir).Count) { throw '本机服务端口正在使用，请先退出原安装的全部服务，再点击恢复连接。' }
 if ([Environment]::GetEnvironmentVariable('CODEX_APP_SERVER_WS_URL', 'User') -or [Environment]::GetEnvironmentVariable('CODEX_APP_SERVER_WS_URL', 'Machine')) { throw '检测到旧的 Codex 连接设置，请查看日志确认原安装状态。' }
 if ($CheckOnly) { Write-Output '恢复检查通过。'; return }
 & (Join-Path $PSScriptRoot 'desktop-register.ps1') -ProductRoot $ProductRoot -NodePath $NodePath -DataDir $DataDir
 Write-Output '已恢复本机启动项，原有配置保持不变。'
+
+} catch {
+    [Console]::Error.WriteLine($_.Exception.Message)
+    exit 1
+}

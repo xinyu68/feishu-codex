@@ -122,6 +122,7 @@ test('uninstall removes only its exact scheduled task and login entry, restoring
     const contents = await fs.readFile(path.join(root, 'scripts', 'desktop-uninstall.ps1'), 'utf8');
     await fs.writeFile(helper, contents.replace("$taskName = 'Feishu Codex Desktop Host'", `$taskName = ${quoted(taskName)}`));
     await fs.copyFile(path.join(root, 'scripts', 'desktop-process-tree.ps1'), path.join(fx.directory, 'desktop-process-tree.ps1'));
+    await fs.copyFile(path.join(root, 'scripts', 'desktop-service-listeners.ps1'), path.join(fx.directory, 'desktop-service-listeners.ps1'));
     const args = `//B //NoLogo "${path.join(fx.productRoot, 'scripts', 'desktop-host.vbs')}" "${fx.productRoot}" "${path.join(fx.installDir, 'resources', 'node', 'node.exe')}" "${fx.dataDir}"`;
     await ps('setup', `
 $action = New-ScheduledTaskAction -Execute (Join-Path $env:SystemRoot 'System32\\wscript.exe') -Argument ${quoted(args)} -WorkingDirectory ${quoted(fx.productRoot)}

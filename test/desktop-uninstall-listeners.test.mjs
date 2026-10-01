@@ -11,20 +11,17 @@ test('uninstall checks the recovered port and ignores only a recorded absent lis
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'feishu-uninstall-listeners-'));
   const script = path.join(directory, 'check.ps1');
   try {
-    const source = await fs.readFile(path.join(root, 'scripts/desktop-uninstall.ps1'), 'utf8');
-    const helper = source.slice(source.indexOf('function Get-BlockingServiceListeners {'), source.indexOf('function Find-OwnedTask {'));
+    const helper = (await fs.readFile(path.join(root, 'scripts/desktop-service-listeners.ps1'), 'utf8')).replace(/^\uFEFF/, '');
     assert.ok(helper.includes('Get-CimInstance'));
+    await fs.mkdir(path.join(directory, 'desktop'));
+    await fs.writeFile(path.join(directory, 'desktop/runtime-endpoint-recovery.json'), JSON.stringify({
+      previousUrl: 'ws://127.0.0.1:18791', previousIdentity: { pid: 4242, exe: 'C:\\fixture\\codex.exe', startedAt: '2026-10-01T00:00:00Z' },
+    }));
     await fs.writeFile(script, '\uFEFF$ErrorActionPreference = "Stop"\n' + `
 $DataDir = $PSScriptRoot
 $script:live = $false
 $script:failure = $false
 $script:listeners = @()
-function Read-State($Name) {
-    if ($Name -eq 'runtime-endpoint-recovery') {
-        return @{ previousUrl = 'ws://127.0.0.1:18791'; previousIdentity = @{ pid = 4242; exe = 'C:\\fixture\\codex.exe'; startedAt = '2026-10-01T00:00:00Z' } }
-    }
-    return $null
-}
 function Get-NetTCPConnection($LocalPort, $State) {
     if (64087 -notin $LocalPort) { throw 'Recovered port was not inspected' }
     return $script:listeners
@@ -37,12 +34,12 @@ function Get-CimInstance($Class, $Filter) {
 [IO.File]::WriteAllText((Join-Path $DataDir 'runtime.json'), '{"wsUrl":"ws://127.0.0.1:64087","mode":"shared"}')
 ` + helper + `
 $script:listeners = @(@{ LocalPort = 18791; LocalAddress = '127.0.0.1'; OwningProcess = 4242 })
-if (@(Get-BlockingServiceListeners).Count -ne 0) { throw 'Confirmed absent old owner blocked cleanup' }
+if (@(Get-BlockingServiceListeners -DataDir $DataDir).Count -ne 0) { throw 'Confirmed absent old owner blocked cleanup' }
 $script:live = $true
-if (@(Get-BlockingServiceListeners).Count -ne 1) { throw 'Live or reused owner was ignored' }
+if (@(Get-BlockingServiceListeners -DataDir $DataDir).Count -ne 1) { throw 'Live or reused owner was ignored' }
 $script:live = $false
 $script:failure = $true
-try { Get-BlockingServiceListeners | Out-Null; throw 'Inspection failure was ignored' } catch { if ($_.Exception.Message -ne 'Inspection unavailable') { throw } }
+try { Get-BlockingServiceListeners -DataDir $DataDir | Out-Null; throw 'Inspection failure was ignored' } catch { if ($_.Exception.Message -ne 'Inspection unavailable') { throw } }
 $script:failure = $false
 foreach ($listener in @(
     @{ LocalPort = 64087; LocalAddress = '127.0.0.1'; OwningProcess = 4242 },
@@ -50,7 +47,7 @@ foreach ($listener in @(
     @{ LocalPort = 18791; LocalAddress = '0.0.0.0'; OwningProcess = 4242 }
 )) {
     $script:listeners = @($listener)
-    if (@(Get-BlockingServiceListeners).Count -ne 1) { throw 'Unconfirmed listener was ignored' }
+    if (@(Get-BlockingServiceListeners -DataDir $DataDir).Count -ne 1) { throw 'Unconfirmed listener was ignored' }
 }
 Write-Output 'passed'
 `);
@@ -58,6 +55,8 @@ Write-Output 'passed'
   } finally {
     await fs.unlink(script).catch(() => {});
     await fs.unlink(path.join(directory, 'runtime.json')).catch(() => {});
+    await fs.unlink(path.join(directory, 'desktop/runtime-endpoint-recovery.json')).catch(() => {});
+    await fs.rmdir(path.join(directory, 'desktop')).catch(() => {});
     await fs.rmdir(directory).catch(() => {});
   }
 });

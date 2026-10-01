@@ -55,3 +55,59 @@ if (-not $?) { exit 1 }
   assert.match(await check(false), /恢复检查通过/);
   await assert.rejects(check(true), /端口正在使用/);
 });
+
+test('Windows reinstall restores registration past a confirmed stale port and retains configuration', { skip: process.platform !== 'win32', timeout: 30_000 }, async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'feishu-reinstall-stale-'));
+  const productRoot = path.join(directory, 'product'), dataDir = path.join(directory, 'data');
+  const q = value => `'${value.replaceAll("'", "''")}'`;
+  const script = path.join(directory, 'check.ps1');
+  for (const name of ['build/server/server.js', 'build/ui/index.html', 'desktop/host.mjs', 'scripts/desktop-host.vbs', 'scripts/desktop-register.ps1']) {
+    const file = path.join(productRoot, name); await fs.mkdir(path.dirname(file), { recursive: true }); await fs.writeFile(file, 'fixture');
+  }
+  const deployment = { version: 1, state: 'active', productRoot };
+  const runtime = { wsUrl: 'ws://127.0.0.1:64087', mode: 'shared' };
+  const config = { appId: 'cli_fixture', appSecret: 'fixture-only' };
+  await atomicJson(path.join(dataDir, 'desktop/deployment.json'), deployment);
+  await atomicJson(path.join(dataDir, 'runtime.json'), runtime);
+  await atomicJson(path.join(dataDir, 'config.json'), config);
+  await atomicJson(path.join(dataDir, 'desktop/runtime-endpoint-recovery.json'), {
+    previousUrl: 'ws://127.0.0.1:18791', wsUrl: runtime.wsUrl,
+    previousIdentity: { pid: 4242, exe: 'C:\\fixture\\codex.exe', startedAt: '2026-10-01T00:00:00Z' },
+  });
+  const marker = path.join(dataDir, 'registration.marker');
+  // Run a copied launcher so its relative register script is the isolated stub,
+  // never the production scheduled-task implementation.
+  for (const name of ['desktop-restore-setup.ps1', 'desktop-process-tree.ps1', 'desktop-service-listeners.ps1']) {
+    await fs.copyFile(path.join(root, 'scripts', name), path.join(productRoot, 'scripts', name));
+  }
+  await fs.writeFile(path.join(productRoot, 'scripts/desktop-register.ps1'), '\uFEFF' + `param($ProductRoot, $NodePath, $DataDir)\n[IO.File]::WriteAllText((Join-Path $DataDir 'registration.marker'), 'registered')\n`);
+  const run = async (port = 18791, live = false, unknown = false) => {
+    await fs.writeFile(script, '\uFEFF' + `
+function Get-ScheduledTask { return $null }
+function Get-NetTCPConnection($LocalPort, $State) {
+    if (64087 -notin $LocalPort) { throw 'Actual runtime port missing' }
+    return @{ LocalPort = ${port}; LocalAddress = '127.0.0.1'; OwningProcess = 4242 }
+}
+function Get-CimInstance {
+    ${unknown ? "throw 'Inspection unavailable'" : live ? 'return @{ ProcessId = 4242 }' : 'return $null'}
+}
+& ${q(path.join(productRoot, 'scripts/desktop-restore-setup.ps1'))} -ProductRoot ${q(productRoot)} -NodePath ${q(process.execPath)} -DataDir ${q(dataDir)}
+if (-not $?) { exit 1 }
+`);
+    return runPowerShell(script);
+  };
+  assert.match(await run(), /已恢复本机启动项/);
+  assert.equal(await fs.readFile(marker, 'utf8'), 'registered');
+  await fs.unlink(marker);
+  for (const args of [[18791, true], [64087, false], [18791, false, true]]) {
+    await assert.rejects(run(...args), error => {
+      assert.match(error.message, /端口正在使用|Inspection unavailable/);
+      assert.doesNotMatch(error.message, /所在位置|CategoryInfo|FullyQualifiedErrorId|At .*line/);
+      return true;
+    });
+    await assert.rejects(fs.access(marker));
+  }
+  assert.deepEqual(await readJson(path.join(dataDir, 'desktop/deployment.json')), deployment);
+  assert.deepEqual(await readJson(path.join(dataDir, 'runtime.json')), runtime);
+  assert.deepEqual(await readJson(path.join(dataDir, 'config.json')), config);
+});
