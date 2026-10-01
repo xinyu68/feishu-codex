@@ -5,8 +5,6 @@
 )
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
-. (Join-Path $PSScriptRoot 'desktop-process-tree.ps1')
-. (Join-Path $PSScriptRoot 'desktop-service-listeners.ps1')
 $InstallDir = [IO.Path]::GetFullPath($InstallDir).TrimEnd('\')
 if ($InstallDir -eq [IO.Path]::GetPathRoot($InstallDir).TrimEnd('\')) { throw '安装目录无效。' }
 $productRoot = Join-Path $InstallDir 'resources\product'
@@ -50,6 +48,8 @@ function Find-OwnedTask {
 
 try {
     Write-UninstallLog ('开始 ' + $Phase + '：' + $InstallDir)
+    . (Join-Path $PSScriptRoot 'desktop-process-tree.ps1')
+    . (Join-Path $PSScriptRoot 'desktop-service-listeners.ps1')
     $deployment = Read-State 'deployment'
     $control = Read-State 'host-control'
     $ownsData = $deployment -and $deployment.productRoot -ieq $productRoot

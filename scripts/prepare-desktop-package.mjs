@@ -2,11 +2,13 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
+import { verifyInstallerHelpers } from './verify-desktop-package.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const stage = path.join(root, '.desktop-package');
 const product = path.join(stage, 'product');
 if (process.platform !== 'win32' || process.arch !== 'x64') throw new Error('请在 Windows x64 上构建安装包。');
+await verifyInstallerHelpers(root);
 for (const file of ['build/server/server.js', 'build/ui/index.html', 'desktop/main.mjs', 'desktop/host.mjs']) {
   await fs.access(path.join(root, file));
 }

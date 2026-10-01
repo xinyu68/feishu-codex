@@ -28,6 +28,7 @@ export async function verifyDependencyTree(expected, actual) {
 }
 
 export async function verifyDesktopPackage(resources) {
+  const installerHelpers = await verifyInstallerHelpers();
   const product = path.join(resources, 'product');
   const skill = 'skills/feishu-codex/SKILL.md';
   if (digest(await fs.readFile(path.join(sourceRoot, skill))) !== digest(await fs.readFile(path.join(product, skill)))) throw new Error('安装包内置 Skill 缺失或不完整。');
@@ -60,7 +61,26 @@ export async function verifyDesktopPackage(resources) {
       else resolve(result.trim());
     });
   });
-  return { passed: true, resources, dependencyFiles, output, checkedAt: new Date().toISOString() };
+  return { passed: true, resources, dependencyFiles, installerHelpers, output, checkedAt: new Date().toISOString() };
+}
+
+export async function verifyInstallerHelpers(projectRoot = sourceRoot) {
+  const manifest = await fs.readFile(path.join(projectRoot, 'scripts/nsis-uninstall.nsh'), 'utf8');
+  const scripts = new Map();
+  for (const match of manifest.matchAll(/File\s+\/oname=\$PLUGINSDIR\\([\w.-]+\.ps1)\s+"\$\{PROJECT_DIR\}\\([^"]+)"/g)) {
+    const [, name, relative] = match;
+    if (scripts.has(name)) throw new Error(`安装检查重复嵌入脚本：${name}`);
+    const file = path.resolve(projectRoot, ...relative.split('\\'));
+    if (!file.startsWith(path.resolve(projectRoot) + path.sep)) throw new Error(`安装检查脚本路径无效：${name}`);
+    scripts.set(name, { name, relative: relative.replaceAll('\\', '/'), contents: await fs.readFile(file, 'utf8') });
+  }
+  if (!scripts.has('desktop-uninstall.ps1')) throw new Error('安装包未嵌入安装检查入口。');
+  for (const script of scripts.values()) {
+    for (const match of script.contents.matchAll(/^\s*\.\s*\(Join-Path\s+\$PSScriptRoot\s+'([^']+)'\)/gm)) {
+      if (!scripts.has(match[1])) throw new Error(`安装检查缺少内嵌脚本：${match[1]}（${script.name}）`);
+    }
+  }
+  return [...scripts.values()].map(({ name, relative }) => ({ name, relative }));
 }
 
 export default async function afterPack(context) {

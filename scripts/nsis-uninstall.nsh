@@ -11,6 +11,7 @@
   ; Embed the helper so upgrading an older build also uses the new exit checks.
   File /oname=$PLUGINSDIR\desktop-uninstall.ps1 "${PROJECT_DIR}\scripts\desktop-uninstall.ps1"
   File /oname=$PLUGINSDIR\desktop-process-tree.ps1 "${PROJECT_DIR}\scripts\desktop-process-tree.ps1"
+  File /oname=$PLUGINSDIR\desktop-service-listeners.ps1 "${PROJECT_DIR}\scripts\desktop-service-listeners.ps1"
   File /oname=$PLUGINSDIR\desktop-clear-data.ps1 "${PROJECT_DIR}\scripts\desktop-clear-data.ps1"
   Push $R0
   Push $R1
@@ -25,7 +26,7 @@
   Pop $R1
   DetailPrint "$R1"
   ${If} $R0 != 0
-    MessageBox MB_OK|MB_ICONEXCLAMATION "无法安全退出，安装或卸载已取消。请打开 Feishu Codex，等待任务结束并退出全部服务后重试。详情见用户目录 .feishu-codex\desktop\uninstall.log。" /SD IDOK
+    MessageBox MB_OK|MB_ICONEXCLAMATION "安装或卸载检查未通过，操作已取消。详情见用户目录 .feishu-codex\desktop\uninstall.log，请按日志提示处理后重试。" /SD IDOK
     Pop $R2
     Pop $R1
     Pop $R0
