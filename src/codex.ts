@@ -33,6 +33,7 @@ export type CodexClientOptions = {
 const ACCESS_CONFIG = { sandbox_mode: 'danger-full-access', approval_policy: 'never' };
 const SNAPSHOT_INITIALIZATION_RETRY_DELAYS_MS = [75, 200, 500, 1_000] as const;
 const WATCH_INITIALIZATION_RETRY_DELAYS_MS = [100, 250, 500, 1_000] as const;
+const RESUME_INITIALIZATION_RETRY_DELAYS_MS = [100, 250, 500, 1_000, 2_000, 4_000] as const;
 const WATCH_RECONNECT_DELAY_MS = 2_000;
 const GENERATED_IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp', '.ico', '.tif', '.tiff', '.heic']);
 type GeneratedImageStamp = { size: number; mtimeMs: number };
@@ -355,9 +356,30 @@ export class CodexClient implements CodexRuntime {
       await connection.initialize();
       const channelContext = channelContextParameters(connection.initialized, input.channel !== undefined);
       const compactChannelHeader = Boolean(channelContext.additionalContext);
-      const response = record(await connection.request(input.threadId ? 'thread/resume' : 'thread/start', input.threadId
-        ? { threadId: input.threadId, excludeTurns: true, ...threadInstructionOverrides(input, compactChannelHeader) }
-        : { cwd: input.cwd, ...(input.model ? { model: input.model } : {}), sandbox: 'danger-full-access', approvalPolicy: 'never', config: ACCESS_CONFIG, ...threadInstructionOverrides(input, compactChannelHeader) }));
+      const response = input.threadId
+        ? await (async () => {
+          // thread/start can return before the new rollout is readable by a
+          // second connection. Retry only this read, never turn/start or steer.
+          for (let attempt = 0; ; attempt++) {
+            if (run.stopped) throw new Error('已停止当前任务');
+            try {
+              return record(await connection.request('thread/resume', {
+                threadId: input.threadId, excludeTurns: true,
+                ...threadInstructionOverrides(input, compactChannelHeader),
+              }));
+            } catch (error) {
+              if (!(error instanceof CodexRpcError) || !isThreadInitializationRace(error.message)) throw error;
+              const retryDelay = RESUME_INITIALIZATION_RETRY_DELAYS_MS[attempt];
+              if (retryDelay === undefined) throw error;
+              await delay(retryDelay);
+            }
+          }
+        })()
+        : record(await connection.request('thread/start', {
+          cwd: input.cwd, ...(input.model ? { model: input.model } : {}), sandbox: 'danger-full-access',
+          approvalPolicy: 'never', config: ACCESS_CONFIG,
+          ...threadInstructionOverrides(input, compactChannelHeader),
+        }));
       const threadId = string(record(response.thread).id);
       if (!threadId) throw new Error('Codex 没有返回会话编号');
       run.threadId = threadId;

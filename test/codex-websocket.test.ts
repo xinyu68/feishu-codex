@@ -450,6 +450,39 @@ test('write gate runs immediately before mutation; watcher detach leaves native 
   assert.equal(fx.status.get('thread'),'active');assert.equal(fx.received.some(row=>row.message.method==='turn/interrupt'),false);
  }finally{await fx.cleanup();}
 });
+test('a Feishu follow-up retries a new thread rollout before submitting exactly once', async () => {
+  const fx = await fixture();
+  let resumes = 0;
+  let checkedWriteGate = 0;
+  fx.onResume = (socket, message) => {
+    resumes++;
+    if (resumes < 3) fx.send(socket, { id: message.id, error: { code: -32000, message: 'no rollout found for thread id fresh' } });
+    else fx.reply(socket, message, { thread: { id: 'fresh', status: { type: 'idle' } } });
+    return true;
+  };
+  try {
+    const result = await fx.client.run({ cwd: process.cwd(), threadId: 'fresh', prompt: 'follow-up', onBeforeSubmit: async () => { checkedWriteGate++; } });
+    assert.equal(result.threadId, 'fresh');
+    assert.equal(resumes, 3);
+    assert.equal(checkedWriteGate, 1);
+    assert.equal(fx.received.filter(row => row.message.method === 'turn/start').length, 1);
+    assert.equal(fx.received.filter(row => row.message.method === 'turn/steer').length, 0);
+  } finally { await fx.cleanup(); }
+});
+test('a permanent thread resume error fails without submitting or retrying', async () => {
+  const fx = await fixture();
+  let resumes = 0;
+  fx.onResume = (socket, message) => {
+    resumes++;
+    fx.send(socket, { id: message.id, error: { code: -32602, message: 'invalid thread id' } });
+    return true;
+  };
+  try {
+    await assert.rejects(fx.client.run({ cwd: process.cwd(), threadId: 'invalid', prompt: 'follow-up' }), /invalid thread id/);
+    assert.equal(resumes, 1);
+    assert.equal(fx.received.some(row => ['turn/start', 'turn/steer'].includes(row.message.method ?? '')), false);
+  } finally { await fx.cleanup(); }
+});
 test('watch retries an initializing rollout serially and deduplicates callers',async()=>{
  const fx=await fixture();let attempts=0;let concurrent=0;let maximum=0;
  fx.onResume=async(socket,message)=>{
