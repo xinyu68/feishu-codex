@@ -2,6 +2,11 @@ name: Build Windows installer
 
 on:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Upload installer to an existing draft release (for example v1.0.2)'
+        required: false
+        type: string
   release:
     types: [published]
 
@@ -21,10 +26,10 @@ jobs:
           node-version: '24'
           cache: npm
       - name: Verify release version
-        if: github.event_name == 'release'
+        if: github.event_name == 'release' || inputs.release_tag != ''
         shell: pwsh
         env:
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
         run: |
           $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
           if ($env:RELEASE_TAG -ne "v$version") { throw "Release tag $env:RELEASE_TAG does not match package version v$version" }
@@ -63,17 +68,22 @@ jobs:
           retention-days: 14
           if-no-files-found: error
       - name: Attach update files to release
-        if: github.event_name == 'release'
+        if: github.event_name == 'release' || inputs.release_tag != ''
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
         run: |
           $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
           $files = @("release/Feishu-Codex-$version-Setup.exe", "release/Feishu-Codex-$version-Setup.exe.blockmap", 'release/latest.yml', 'release/SHA256SUMS.txt')
           foreach ($file in $files) { if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { throw "Missing release file: $file" } }
-          $release = gh release view $env:RELEASE_TAG --json assets | ConvertFrom-Json
+          $release = gh release view $env:RELEASE_TAG --json tagName,targetCommitish,isDraft,assets | ConvertFrom-Json
           if ($LASTEXITCODE -ne 0) { throw 'Cannot inspect release assets' }
+          if ($release.tagName -ne $env:RELEASE_TAG) { throw 'Release tag mismatch' }
+          if ($env:GITHUB_EVENT_NAME -eq 'workflow_dispatch') {
+            if (-not $release.isDraft) { throw 'Manual attachment requires an existing draft release' }
+            if ($release.targetCommitish -ne $env:GITHUB_SHA) { throw 'Draft release does not match the workflow source commit' }
+          }
           $names = $files | ForEach-Object { Split-Path -Leaf $_ }
           $existing = @($release.assets | Where-Object { $_.name -in $names })
           if ($existing.Count -eq $names.Count -and @($existing | Where-Object { $_.state -ne 'uploaded' -or $_.size -le 0 }).Count -eq 0) {
