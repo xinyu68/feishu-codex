@@ -58,7 +58,9 @@ export class HermesClient implements CodexRuntime {
   private turns = new Map<string, { state: TurnState; timing: TurnTiming }>();
   private closed = false;
   private listeners = new Set<(event: RuntimeEvent) => void>();
-  private integration?: Promise<void>;
+  private integration?: Promise<boolean>;
+  private integrationDeferred = false;
+  private sessionsNeedingReload = new Set<string>();
   private consultationClients = new Set<HermesClient>();
 
   constructor(private options: Options = {}) {}
@@ -239,20 +241,29 @@ export class HermesClient implements CodexRuntime {
         await (this.options.ensureMcp ?? ensureHermesMcp)({ endpoint, ...(this.options.bridgePort ? { bridgePort: this.options.bridgePort() } : {}) });
         const list = await this.rpc('session.active_list', {});
         if (array(list.sessions).some(row => object(row).status !== 'idle')) {
-          throw new Error('Hermes 正在处理其他任务，待其结束后重试以加载内置 Skill 和 MCP；消息尚未提交。');
+          this.integrationDeferred = true;
+          return false;
         }
         await this.rpc('skills.reload', {});
         const loaded = await this.rpc('reload.mcp', { confirm: true });
         if (loaded.status !== 'reloaded') throw new Error('Hermes 尚未确认加载 MCP，消息尚未提交。');
+        if (this.integrationDeferred) {
+          for (const session of this.sessions.values()) this.sessionsNeedingReload.add(session.liveId);
+          this.integrationDeferred = false;
+        }
+        return true;
       })().catch(error => { this.integration = undefined; throw error; });
     }
-    await this.integration;
+    if (!await this.integration) this.integration = undefined;
     return skill;
   }
 
   private async openSession(input: CodexRunInput, consultation = false, persistentConsultation = false): Promise<Session> {
     const existing = input.threadId && this.sessions.get(input.threadId);
-    if (existing) return existing;
+    if (existing) {
+      if (!consultation) await this.reloadSessionToolsIfIdle(existing);
+      return existing;
+    }
     if (input.threadId) {
       // Unlike resume, active_list is read-only and does not take the Desktop's
       // event transport away from a task which is already running.
@@ -271,17 +282,24 @@ export class HermesClient implements CodexRuntime {
     const stored = string(result.stored_session_id || result.session_key || result.resumed);
     if (!liveId || !stored) throw new Error('Hermes 未返回可恢复的会话编号，消息尚未提交。');
     if (result.running === true || object(result.info).running === true) throw new Error('这个 Hermes 会话正在处理任务，请完成或停止后再发送。');
-    if (input.threadId && !consultation) {
-      const list = await this.rpc('session.active_list', {});
-      if (array(list.sessions).some(row => object(row).status !== 'idle')) throw new Error('Hermes 正在处理其他任务，暂不能刷新当前会话工具，请稍后重试。');
-      const loaded = await this.rpc('reload.mcp', { session_id: liveId, confirm: true });
-      if (loaded.status !== 'reloaded') throw new Error('Hermes 尚未确认当前会话的 MCP 工具，消息尚未提交。');
-    }
     const info = object(result.info);
     const session = { liveId, threadId: `hermes:${stored}`, cwd: string(info.cwd) || input.cwd, title: string(info.title) || 'Hermes 会话', model: string(info.model) };
     this.sessions.set(session.threadId, session);
     if (input.threadId) this.sessions.set(input.threadId, session);
+    if (input.threadId && !consultation) this.sessionsNeedingReload.add(liveId);
+    if (!consultation) await this.reloadSessionToolsIfIdle(session);
     return session;
+  }
+
+  private async reloadSessionToolsIfIdle(session: Session): Promise<void> {
+    if (!this.sessionsNeedingReload.has(session.liveId)) return;
+    const list = await this.rpc('session.active_list', {});
+    // Hermes reload.mcp restarts the global MCP registry, even with session_id.
+    // Keep ordinary messages flowing while an unrelated session is working.
+    if (array(list.sessions).some(row => object(row).status !== 'idle')) return;
+    const loaded = await this.rpc('reload.mcp', { session_id: session.liveId, confirm: true });
+    if (loaded.status !== 'reloaded') throw new Error('Hermes 尚未确认当前会话的 MCP 工具，消息尚未提交。');
+    this.sessionsNeedingReload.delete(session.liveId);
   }
 
   private async assertIdle(session: Session): Promise<void> {
@@ -604,6 +622,8 @@ export class HermesClient implements CodexRuntime {
     }
     this.sessions.clear();
     this.integration = undefined;
+    this.integrationDeferred = false;
+    this.sessionsNeedingReload.clear();
   }
 
   async consult(input: RuntimeConsultInput): Promise<{ threadId: string; text: string }> {

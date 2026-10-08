@@ -276,7 +276,7 @@ export async function startHost(options = {}) {
       const env = canonicalEnvironment(process.env, { CODEX_HOME: codexHome, FEISHU_CODEX_DATA_DIR: dataDir, FEISHU_CODEX_PORT: bridgePort,
         FEISHU_CODEX_WS_URL: wsUrl, FEISHU_CODEX_DESKTOP_HOST: '1', FEISHU_CODEX_WRITE_GATE_FILE: path.join(directory, 'host-state.json'),
         FEISHU_CODEX_UI_DIR: path.join(root, 'build', 'ui'), CODEX_APP_TOOLS_PIPE_PATH: stablePipe,
-        CODEX_MCP_NODE_PATH: customMcpNode || snapshot.mcpNodePath, CODEX_APP_SERVER_WS_URL: null, CODEX_APP_SERVER_FORCE_CLI: null });
+        CODEX_MCP_NODE_PATH: customMcpNode || process.execPath, CODEX_APP_SERVER_WS_URL: null, CODEX_APP_SERVER_FORCE_CLI: null });
       const output = await fs.open(path.join(directory, `${name}.stdout.log`), 'a');
       const error = await fs.open(path.join(directory, `${name}.stderr.log`), 'a');
       try {

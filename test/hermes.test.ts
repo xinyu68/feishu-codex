@@ -219,6 +219,48 @@ test('Hermes refuses a busy resumed desktop session without taking its transport
   } finally { await fx.cleanup(); }
 });
 
+test('Hermes accepts a new conversation while another task runs and reloads its tools once idle', async () => {
+  const fx = await fixture();
+  try {
+    const other = { live: 'other-live', stored: 'other-stored', running: true, history: [] };
+    fx.rows.set(other.live, other);
+    const first = await fx.client.run({ cwd: 'C:/work', prompt: 'hello' });
+    assert.equal(first.text, 'answer');
+    assert.equal(fx.trace.filter(row => row.method === 'prompt.submit').length, 1);
+    assert.equal(fx.trace.some(row => row.method === 'reload.mcp' || row.method === 'skills.reload'), false);
+
+    other.running = false;
+    const second = await fx.client.run({ cwd: 'C:/work', threadId: first.threadId, prompt: 'next' });
+    assert.equal(second.text, 'answer');
+    const reloads = fx.trace.filter(row => row.method === 'reload.mcp');
+    assert.ok(reloads.some(row => row.params.session_id === 'live-1'));
+    assert.equal(fx.trace.filter(row => row.method === 'prompt.submit').length, 2);
+    assert.ok(fx.trace.findIndex(row => row.method === 'reload.mcp') < fx.trace.findLastIndex(row => row.method === 'prompt.submit'));
+  } finally { await fx.cleanup(); }
+});
+
+test('Hermes defers a resumed conversation tool refresh instead of rejecting its message', async () => {
+  const fx = await fixture();
+  try {
+    const first = await fx.client.run({ cwd: 'C:/work', prompt: 'first' });
+    const other = { live: 'other-live', stored: 'other-stored', running: true, history: [] };
+    fx.rows.set(other.live, other);
+    const resumed = new HermesClient(fx.clientOptions);
+    try {
+      const start = fx.trace.length;
+      const result = await resumed.run({ cwd: 'C:/work', threadId: first.threadId, prompt: 'while other busy' });
+      assert.equal(result.text, 'answer');
+      assert.equal(fx.trace.slice(start).filter(row => row.method === 'prompt.submit').length, 1);
+      assert.equal(fx.trace.slice(start).some(row => row.method === 'reload.mcp'), false);
+
+      other.running = false;
+      const next = await resumed.run({ cwd: 'C:/work', threadId: first.threadId, prompt: 'after other idle' });
+      assert.equal(next.text, 'answer');
+      assert.ok(fx.trace.slice(start).some(row => row.method === 'reload.mcp' && row.params.session_id === 'live-1'));
+    } finally { await resumed.close(); }
+  } finally { await fx.cleanup(); }
+});
+
 test('Hermes stop waits for idle and interrupts only its own run', async () => {
   let submitted!: () => void;
   const ready = new Promise<void>(resolve => { submitted = resolve; });

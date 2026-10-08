@@ -60,7 +60,11 @@ async function runtimeFile(value: string, node: boolean): Promise<string> {
 }
 
 async function desiredEntry(options: HermesMcpOptions): Promise<Json> {
-  const command = await runtimeFile(options.command ?? (process.env.CODEX_MCP_NODE_PATH || process.execPath), true);
+  const inheritedNode = process.env.CODEX_MCP_NODE_PATH;
+  // Older hosts passed Codex's versioned bundled Node here. An app update can
+  // remove that runtime while the bridge's own Node remains available.
+  const command = await runtimeFile(options.command ?? (inheritedNode && !/[\\/]OpenAI[\\/]Codex[\\/]runtimes[\\/]cua_node[\\/]/i.test(inheritedNode)
+    ? inheritedNode : process.execPath), true);
   // The Bridge runs under Node in resources/product/build/server in a packaged
   // install. Source development still targets the compiled server, never .ts.
   const defaultScript = fileURLToPath(new URL(import.meta.url.endsWith('.ts') ? '../build/server/notify-mcp.js' : './notify-mcp.js', import.meta.url));

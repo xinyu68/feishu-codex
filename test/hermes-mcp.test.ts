@@ -203,6 +203,8 @@ test('uses the configured Node runtime and falls back to the Bridge Node for an 
   assert.equal(fx.config.mcp_servers.feishu_completion.command, process.execPath);
   process.env.CODEX_MCP_NODE_PATH = '';
   assert.equal((await fx.install({ command: undefined })).status, 'unchanged');
+  process.env.CODEX_MCP_NODE_PATH = path.join(fx.directory, 'OpenAI', 'Codex', 'runtimes', 'cua_node', 'removed', 'bin', 'node.exe');
+  assert.equal((await fx.install({ command: undefined })).status, 'unchanged');
   process.env.CODEX_MCP_NODE_PATH = path.join(fx.directory, 'missing', 'node.exe');
   await assert.rejects(fx.install({ command: undefined }), errorCode('invalid-runtime'));
   assert.equal((await fx.install({ command: process.execPath })).status, 'unchanged');
