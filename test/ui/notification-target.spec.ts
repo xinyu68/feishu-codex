@@ -74,10 +74,10 @@ test('one-click default notification bot saves with automatic notifications off,
   await settings(page);
   await expect(page.getByRole('checkbox', { name: '桌面任务完成后通知飞书' })).not.toBeChecked();
   await expect(page.getByRole('combobox', { name: '默认通知接收位置', exact: true })).toHaveCount(0);
-  await page.getByRole('button', { name: '管理默认机器人', exact: true }).click();
+  await page.getByRole('button', { name: '管理 Codex 默认机器人', exact: true }).click();
   await expect(page.getByRole('button', { name: '机器人', exact: true })).toHaveClass(/selected/);
   await page.getByRole('button', { name: '管理代码审查', exact: true }).click();
-  await detail(page).getByRole('button', { name: '设为默认通知机器人', exact: true }).click();
+  await detail(page).getByRole('button', { name: '设为 Codex 默认通知', exact: true }).click();
   await expect.poll(() => fx.state.config.desktopNotificationTarget).toEqual(selection(targets[1]!));
   await expect(badges(page)).toHaveCount(1);
   await expect(page.getByRole('button', { name: '管理代码审查', exact: true })).toContainText('默认通知');
@@ -86,11 +86,11 @@ test('one-click default notification bot saves with automatic notifications off,
   expect(fx.state.config.autoNotifyDesktop).toBe(false);
 
   await page.reload(); await settings(page);
-  await page.getByRole('button', { name: '管理默认机器人', exact: true }).click();
+  await page.getByRole('button', { name: '管理 Codex 默认机器人', exact: true }).click();
   await expect(page.getByRole('button', { name: '管理代码审查', exact: true })).toHaveAttribute('aria-pressed', 'true');
   await expect(badges(page)).toHaveCount(1);
   await page.getByRole('button', { name: '管理写作助手', exact: true }).click();
-  await detail(page).getByRole('button', { name: '设为默认通知机器人', exact: true }).click();
+  await detail(page).getByRole('button', { name: '设为 Codex 默认通知', exact: true }).click();
   await expect.poll(() => fx.state.config.desktopNotificationTarget).toEqual(selection(targets[0]!));
   await expect(badges(page)).toHaveCount(1);
   await expect(page.getByRole('button', { name: '管理代码审查', exact: true })).not.toContainText('默认通知');
@@ -103,7 +103,7 @@ test('one-click default notification bot saves with automatic notifications off,
 test('failed default-bot change preserves its draft across navigation and refresh without claiming it was saved', async ({ page }) => {
   const fx = await fixture(page); fx.state.config.desktopNotificationTarget = selection(targets[0]!); fx.faults.reject = true;
   await page.goto('/'); await bot(page, '代码审查');
-  await detail(page).getByRole('button', { name: '设为默认通知机器人', exact: true }).click();
+  await detail(page).getByRole('button', { name: '设为 Codex 默认通知', exact: true }).click();
   await expect(page.getByRole('alert').first()).toContainText('自动保存失败');
   expect(fx.state.config.desktopNotificationTarget).toEqual(selection(targets[0]!));
   await expect(detail(page).getByText('已设为默认', { exact: true })).toHaveCount(0);
@@ -132,7 +132,7 @@ test('failed clearing keeps a null draft through navigation and can be retried',
   await page.getByRole('button', { name: '重试保存', exact: true }).click();
   await expect.poll(() => fx.state.config.desktopNotificationTarget).toBeNull();
   await expect(badges(page)).toHaveCount(0);
-  await expect(detail(page).getByRole('button', { name: '设为默认通知机器人', exact: true })).toBeEnabled();
+  await expect(detail(page).getByRole('button', { name: '设为 Codex 默认通知', exact: true })).toBeEnabled();
   expect(fx.writes).toEqual([{ desktopNotificationTarget: null }, { desktopNotificationTarget: null }]);
 });
 
@@ -141,16 +141,16 @@ test('revoked default remains visibly invalid without switching to another eligi
   await page.goto('/'); await bot(page, '代码审查');
   await expect(badges(page)).toHaveCount(1);
   fx.state.notificationTargets = [targets[0]!]; await fx.refresh();
-  await expect(page.getByText('默认通知已失效，请重新设置。', { exact: true }).first()).toBeVisible();
+  await expect(page.getByText('Codex 默认通知已失效，请重新设置。', { exact: true }).first()).toBeVisible();
   await expect(badges(page)).toHaveCount(0);
-  await expect(detail(page).getByRole('button', { name: '设为默认通知机器人', exact: true })).toBeDisabled();
+  await expect(detail(page).getByRole('button', { name: '设为 Codex 默认通知', exact: true })).toBeDisabled();
   expect(fx.writes).toEqual([]);
   expect(fx.state.config.desktopNotificationTarget).toEqual(selection(targets[1]!));
   await page.getByRole('button', { name: '管理写作助手', exact: true }).click();
-  await detail(page).getByRole('button', { name: '设为默认通知机器人', exact: true }).click();
+  await detail(page).getByRole('button', { name: '设为 Codex 默认通知', exact: true }).click();
   await expect.poll(() => fx.state.config.desktopNotificationTarget).toEqual(selection(targets[0]!));
   await expect(badges(page)).toHaveCount(1);
-  await expect(page.getByText('默认通知已失效，请重新设置。', { exact: true })).toHaveCount(0);
+  await expect(page.getByText('Codex 默认通知已失效，请重新设置。', { exact: true })).toHaveCount(0);
   expect(fx.state.config.autoNotifyDesktop).toBe(false);
 });
 
@@ -158,15 +158,15 @@ test('no private recipient guides authorization and still allows clearing an inv
   const fx = await fixture(page); fx.state.config.desktopNotificationTarget = selection(targets[1]!); fx.state.notificationTargets = [];
   fx.state.bots![1]!.allowedActors = [];
   await page.goto('/'); await bot(page, '代码审查');
-  await expect(detail(page).getByRole('button', { name: '设为默认通知机器人', exact: true })).toBeDisabled();
+  await expect(detail(page).getByRole('button', { name: '设为 Codex 默认通知', exact: true })).toBeDisabled();
   await expect(detail(page)).toContainText('请在访问权限中允许接收通知的私聊账号');
   await detail(page).getByRole('button', { name: '去授权', exact: true }).click();
   await expect(detail(page).getByRole('tab', { name: /访问权限/ })).toHaveAttribute('aria-selected', 'true');
   expect(fx.writes).toEqual([]);
   await detail(page).getByRole('button', { name: '取消默认', exact: true }).click();
   await expect.poll(() => fx.state.config.desktopNotificationTarget).toBeNull();
-  await expect(page.getByText('默认通知已失效，请重新设置。', { exact: true })).toHaveCount(0);
-  await expect(detail(page).getByRole('button', { name: '设为默认通知机器人', exact: true })).toBeDisabled();
+  await expect(page.getByText('Codex 默认通知已失效，请重新设置。', { exact: true })).toHaveCount(0);
+  await expect(detail(page).getByRole('button', { name: '设为 Codex 默认通知', exact: true })).toBeDisabled();
   expect(fx.writes).toEqual([{ desktopNotificationTarget: null }]);
 });
 
@@ -176,11 +176,11 @@ test('authorized Codex with only group history explains the missing DM and becom
   fx.state.notificationTargets = [];
   fx.state.conversations.forEach(item => { item.chatType = 'group'; });
   await page.goto('/'); await settings(page);
-  await expect(page.getByText('待建立通知私聊', { exact: true })).toBeVisible();
+  await expect(page.getByText('待建立通知私聊', { exact: true }).first()).toBeVisible();
   await bot(page, '写作助手');
   await expect(detail(page)).toContainText('账号已授权。请在飞书私聊「写作助手」发一条消息');
   await expect(detail(page).getByRole('button', { name: '去授权', exact: true })).toHaveCount(0);
-  const setDefault = detail(page).getByRole('button', { name: '设为默认通知机器人', exact: true });
+  const setDefault = detail(page).getByRole('button', { name: '设为 Codex 默认通知', exact: true });
   await expect(setDefault).toBeDisabled();
   fx.state.conversations[0]!.chatType = 'p2p';
   fx.state.notificationTargets = [targets[0]!];
@@ -197,7 +197,7 @@ test('a bot with several eligible private recipients requires an explicit recipi
   fx.state.notificationTargets!.push(extra); fx.state.bots![1]!.allowedActors.push(extra.actorId);
   await page.goto('/'); await bot(page, '代码审查');
   const recipient = detail(page).getByRole('combobox', { name: '通知接收人', exact: true });
-  const setDefault = detail(page).getByRole('button', { name: '设为默认通知机器人', exact: true });
+  const setDefault = detail(page).getByRole('button', { name: '设为 Codex 默认通知', exact: true });
   await expect(recipient).toHaveValue('');
   await expect(setDefault).toBeDisabled();
   expect(fx.writes).toEqual([]);
@@ -221,7 +221,7 @@ test('an external default change refreshes the badge and management destination 
   fx.state.config.desktopNotificationTarget = selection(targets[1]!); await fx.refresh();
   await expect(page.getByRole('button', { name: '管理代码审查', exact: true })).toContainText('默认通知');
   await expect(page.getByRole('button', { name: '管理写作助手', exact: true })).not.toContainText('默认通知');
-  await settings(page); await page.getByRole('button', { name: '管理默认机器人', exact: true }).click();
+  await settings(page); await page.getByRole('button', { name: '管理 Codex 默认机器人', exact: true }).click();
   await expect(page.getByRole('button', { name: '管理代码审查', exact: true })).toHaveAttribute('aria-pressed', 'true');
   expect(fx.writes).toEqual([]);
 });
@@ -239,8 +239,8 @@ for (const change of ['removed bot', 'replaced app'] as const) {
       fx.state.notificationTargets![1] = { ...targets[1]!, botAppId: 'cli_replaced' };
     }
     await page.goto('/'); await settings(page);
-    await page.getByRole('button', { name: '管理默认机器人', exact: true }).click();
-    await expect(page.getByText('默认通知已失效，请重新设置。', { exact: true })).toBeVisible();
+    await page.getByRole('button', { name: '管理 Codex 默认机器人', exact: true }).click();
+    await expect(page.getByText('Codex 默认通知已失效，请重新设置。', { exact: true })).toBeVisible();
     await expect(badges(page)).toHaveCount(0);
     expect(fx.writes).toEqual([]);
     await page.getByRole('button', { name: '清除失效默认', exact: true }).click();
@@ -250,3 +250,73 @@ for (const change of ['removed bot', 'replaced app'] as const) {
     expect(fx.writes).toEqual([{ desktopNotificationTarget: null }]);
   });
 }
+
+function addHermes(fx: Awaited<ReturnType<typeof fixture>>, id: string) {
+  const target: NotificationTarget = { botId: id, botName: 'Hermes ' + id, botAppId: 'cli_' + id,
+    chatId: 'bot:' + id + ':oc_' + id, actorId: 'ou_' + id, engine: 'hermes' };
+  fx.state.bots!.push({ id, name: target.botName, engine: 'hermes', appId: target.botAppId, hasSecret: true,
+    enabled: true, allowedActors: [target.actorId], allowedGroups: [], roleInstructions: '', model: '', effort: '',
+    connection: { status: 'connected' }, engineStatus: { available: true } });
+  fx.state.notificationTargets!.push(target);
+  return target;
+}
+
+test('Codex and Hermes defaults stay independent across changes, clearing and settings navigation', async ({ page }) => {
+  const fx = await fixture(page);
+  const h1 = addHermes(fx, 'h1'); const h2 = addHermes(fx, 'h2');
+  fx.state.config.desktopNotificationTarget = selection(targets[0]!);
+  fx.state.config.hermesNotificationTarget = selection(h1);
+  const before = structuredClone(fx.state.conversations);
+  await page.goto('/'); await bot(page, h2.botName);
+  const sidebar = page.getByRole('complementary', { name: '机器人列表' });
+  await expect(sidebar.getByRole('region', { name: 'Codex 机器人', exact: true })).toContainText('写作助手');
+  await expect(sidebar.getByRole('region', { name: 'Hermes 机器人', exact: true })).toContainText(h2.botName);
+  await expect(badges(page)).toHaveCount(2);
+  await detail(page).getByRole('button', { name: '设为 Hermes 默认通知', exact: true }).click();
+  await expect.poll(() => fx.state.config.hermesNotificationTarget).toEqual(selection(h2));
+  expect(fx.state.config.desktopNotificationTarget).toEqual(selection(targets[0]!));
+  await settings(page);
+  await expect(page.getByRole('button', { name: '管理 Codex 默认机器人', exact: true })).toBeVisible();
+  await page.getByRole('button', { name: '管理 Hermes 默认机器人', exact: true }).click();
+  await expect(detail(page)).toHaveAttribute('aria-label', h2.botName + '设置');
+  await detail(page).getByRole('tab', { name: '连接设置', exact: true }).click();
+  await expect(detail(page).getByRole('region', { name: 'Hermes 默认通知机器人', exact: true })).toBeVisible();
+  await page.screenshot({ path: 'artifacts/split-defaults-bots.png' });
+  await detail(page).getByRole('button', { name: '取消默认', exact: true }).click();
+  await expect.poll(() => fx.state.config.hermesNotificationTarget).toBeNull();
+  expect(fx.state.config.desktopNotificationTarget).toEqual(selection(targets[0]!));
+  await bot(page, '代码审查');
+  await detail(page).getByRole('button', { name: '设为 Codex 默认通知', exact: true }).click();
+  await expect.poll(() => fx.state.config.desktopNotificationTarget).toEqual(selection(targets[1]!));
+  expect(fx.state.config.hermesNotificationTarget).toBeNull();
+  expect(fx.state.conversations).toEqual(before);
+  expect(fx.operations.every(route => route === '/api/config')).toBe(true);
+});
+
+test('each empty engine group can add a bot with that type already selected', async ({ page }) => {
+  await fixture(page); await page.goto('/'); await bot(page, '写作助手');
+  await page.getByRole('button', { name: '添加 Hermes 机器人', exact: true }).click();
+  const dialog = page.getByRole('dialog', { name: '添加机器人' });
+  await expect(dialog.getByRole('combobox', { name: '处理对话的 AI' })).toHaveValue('hermes');
+  await dialog.getByRole('button', { name: '取消', exact: true }).click();
+  await settings(page);
+  await expect(page.locator('.notification-destinations')).toContainText('未添加机器人');
+});
+
+test('failed Hermes default saving retains its draft without corrupting the saved Codex choice', async ({ page }) => {
+  const fx = await fixture(page); const h1 = addHermes(fx, 'h1'); const h2 = addHermes(fx, 'h2');
+  fx.state.config.desktopNotificationTarget = selection(targets[0]!);
+  fx.state.config.hermesNotificationTarget = selection(h1);
+  fx.faults.reject = true;
+  await page.goto('/'); await bot(page, h2.botName);
+  await detail(page).getByRole('button', { name: '设为 Hermes 默认通知', exact: true }).click();
+  await expect(page.getByRole('alert').first()).toContainText('自动保存失败');
+  expect(fx.state.config.desktopNotificationTarget).toEqual(selection(targets[0]!));
+  expect(fx.state.config.hermesNotificationTarget).toEqual(selection(h1));
+  await settings(page); await page.getByRole('button', { name: '管理 Hermes 默认机器人', exact: true }).click();
+  await expect(detail(page)).toHaveAttribute('aria-label', h2.botName + '设置');
+  fx.faults.reject = false;
+  await page.getByRole('button', { name: '重试保存', exact: true }).click();
+  await expect.poll(() => fx.state.config.hermesNotificationTarget).toEqual(selection(h2));
+  expect(fx.state.config.desktopNotificationTarget).toEqual(selection(targets[0]!));
+});

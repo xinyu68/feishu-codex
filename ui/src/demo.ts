@@ -1,3 +1,4 @@
+import { notificationEngines, notificationField, notificationTargetsFor } from './notification-settings';
 import type { AppState, BotProfile, Conversation, DesktopNotificationTarget, Message, Session } from './types';
 
 const cwd = 'D:\\Projects\\feishu-codex';
@@ -69,6 +70,7 @@ export async function demoRequest(route: string, body?: Record<string, unknown>,
         throw new Error('这个机器人还有任务或待处理请求，请完成后再删除。');
       }
       if (state.config.desktopNotificationTarget?.botAppId === bot.appId) state.config.desktopNotificationTarget = null;
+      if (state.config.hermesNotificationTarget?.botAppId === bot.appId) state.config.hermesNotificationTarget = null;
       state.bots = state.bots!.filter(item => item.id !== bot.id);
       state.conversations = state.conversations.filter(item => !owned.includes(item));
       clearPending(bot.id);
@@ -154,8 +156,8 @@ function syncDefaultBot(): void {
   const status = connected ? 'connected' : configured.some(item => item.connection.status === 'connecting') ? 'connecting' : configured.some(item => item.connection.status === 'error') ? 'error' : 'stopped';
   state.connectionSummary = { status, connected, total: configured.length, detail: `${connected} / ${configured.length} 个机器人已连接` };
   state.notificationTargets = privateChats.flatMap(target => {
-    const owner = state.bots!.find(item => item.id === target.botId && item.appId === target.botAppId && item.engine !== 'hermes' && item.hasSecret && item.allowedActors.includes(target.actorId));
-    return owner ? [{ ...target, botName: owner.name }] : [];
+    const owner = state.bots!.find(item => item.id === target.botId && item.appId === target.botAppId && item.hasSecret && item.allowedActors.includes(target.actorId));
+    return owner ? [{ ...target, botName: owner.name, engine: owner.engine ?? 'codex' }] : [];
   });
 }
 
@@ -182,9 +184,13 @@ function changed<T>(result: T): T {
 }
 
 function initializeNotificationTarget(): void {
-  if (state.config.desktopNotificationTarget !== undefined || state.notificationTargets?.length !== 1) return;
-  const { chatId, actorId, botAppId } = state.notificationTargets[0]!;
-  state.config.desktopNotificationTarget = { chatId, actorId, botAppId };
+  for (const engine of notificationEngines) {
+    const field = notificationField(engine);
+    const targets = notificationTargetsFor(state, engine);
+    if (state.config[field] !== undefined || targets.length !== 1) continue;
+    const { chatId, actorId, botAppId } = targets[0]!;
+    state.config[field] = { chatId, actorId, botAppId };
+  }
 }
 
 function clearPending(botId: string): void {
@@ -284,16 +290,18 @@ function saveConfig(body: Record<string, unknown>): unknown {
     if (typeof value !== 'number' || !Number.isInteger(value) || value < 1 || value > 1440) throw new Error('通知时长应为 1–1440 的整数分钟');
     config.desktopNotificationMinMinutes = value;
   }
-  if (body.desktopNotificationTarget !== undefined) {
-    const value = body.desktopNotificationTarget;
-    if (value === null) config.desktopNotificationTarget = null;
+  for (const engine of notificationEngines) {
+    const field = notificationField(engine);
+    if (body[field] === undefined) continue;
+    const value = body[field];
+    if (value === null) config[field] = null;
     else {
       if (typeof value !== 'object' || Array.isArray(value) || Object.keys(value).length !== 3 || Object.keys(value).some(key => !['chatId', 'actorId', 'botAppId'].includes(key))) throw new Error('通知接收位置无效');
       const target = value as Partial<DesktopNotificationTarget>;
-      const match = state.notificationTargets?.find(item => item.chatId === target.chatId && item.actorId === target.actorId && item.botAppId === target.botAppId);
+      const match = notificationTargetsFor(state, engine).find(item => item.chatId === target.chatId && item.actorId === target.actorId && item.botAppId === target.botAppId);
       if (!match) throw new Error('通知接收位置已失效，请重新选择');
       if (match.botId === bot?.id && ((patch.appId !== undefined && patch.appId !== match.botAppId) || (patch.allowedActors !== undefined && !patch.allowedActors.includes(match.actorId)))) throw new Error('通知接收位置已失效，请重新选择');
-      config.desktopNotificationTarget = { chatId: match.chatId, actorId: match.actorId, botAppId: match.botAppId };
+      config[field] = { chatId: match.chatId, actorId: match.actorId, botAppId: match.botAppId };
     }
   }
   if (!bot) { state.config = config; return changed({ config: state.config }); }

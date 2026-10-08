@@ -284,6 +284,7 @@ export class Store {
     if (id === DEFAULT_BOT_ID) Object.assign(patch, { defaultBotRemoved: true, appId: '', appSecret: '', enabled: false,
       botName: '', allowedActors: [], allowedGroups: [], roleInstructions: '', privateRoleInstructions: '', engine: 'codex' });
     if (this.config.desktopNotificationTarget && belongs(this.config.desktopNotificationTarget.chatId)) patch.desktopNotificationTarget = null;
+    if (this.config.hermesNotificationTarget && belongs(this.config.hermesNotificationTarget.chatId)) patch.hermesNotificationTarget = null;
     this.saveConfig(patch);
     this.save();
   }
@@ -492,26 +493,31 @@ export class Store {
     return changed;
   }
   /** Known private recipients remain selectable during a temporary connection outage. */
-  notificationTargets(config = this.config): DesktopNotificationTargetOption[] {
+  notificationTargets(config = this.config, engine: 'codex' | 'hermes' = 'codex'): DesktopNotificationTargetOption[] {
     const bots = new Map(this.bots(config).map(bot => [bot.id, bot]));
     return Object.values(this.state.conversations).flatMap(conversation => {
       const route = parseRoute(conversation.chatId);
       const bot = bots.get(route.botId);
       if (!/^oc_[\w-]+$/.test(route.id) || conversationKey(route.botId, route.id) !== conversation.chatId
         || !/^ou_[\w-]+$/.test(conversation.actorId) || this.isGroup(conversation.chatId, config)
-        || !bot?.appId.trim() || !bot.appSecret.trim() || bot.engine === 'hermes' || !bot.allowedActors.includes(conversation.actorId)) return [];
+        || !bot?.appId.trim() || !bot.appSecret.trim() || (bot.engine ?? 'codex') !== engine || !bot.allowedActors.includes(conversation.actorId)) return [];
       return [{ chatId: conversation.chatId, actorId: conversation.actorId, botAppId: bot.appId, botId: bot.id, botName: bot.name }];
     });
   }
   private initializeNotificationTarget(): boolean {
     // A saved choice, including an explicit clear or a now-invalid recipient,
     // must never be replaced when another robot or authorization is added.
-    if (this.config.desktopNotificationTarget !== undefined) return false;
-    const candidates = this.notificationTargets();
-    if (candidates.length !== 1) return false;
-    const { chatId, actorId, botAppId } = candidates[0]!;
-    this.config.desktopNotificationTarget = { chatId, actorId, botAppId };
-    return true;
+    let changed = false;
+    for (const engine of ['codex', 'hermes'] as const) {
+      const key = engine === 'hermes' ? 'hermesNotificationTarget' : 'desktopNotificationTarget';
+      if (this.config[key] !== undefined) continue;
+      const candidates = this.notificationTargets(this.config, engine);
+      if (candidates.length !== 1) continue;
+      const { chatId, actorId, botAppId } = candidates[0]!;
+      this.config[key] = { chatId, actorId, botAppId };
+      changed = true;
+    }
+    return changed;
   }
 }
 

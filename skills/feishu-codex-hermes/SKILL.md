@@ -7,11 +7,11 @@ description: 在 Hermes 中处理 Feishu Codex 桥接消息、独立机器人角
 
 ## 即时文字消息
 
-用户明确要求现在把一段文字发到自己的飞书时，使用 `feishu_completion` MCP 的 `send_message_to_feishu({text, title?, request_id})`（Hermes 中工具名可能带 `mcp_feishu_completion_` 前缀）。桥接使用应用已配置的默认通知机器人及接收私聊，独立于当前群或机器人会话、自动通知开关；无需等待本轮结束，不自动切换会话。应用须正在运行，默认接收位置须有效。
+用户明确要求现在把一段文字发到自己的飞书时，使用 `feishu_completion` MCP 的 `send_message_to_feishu({text, title?, request_id})`（Hermes 中工具名可能带 `mcp_feishu_completion_` 前缀）。桥接使用应用中设置的 Hermes 默认通知机器人及接收私聊，与 Codex 默认通知位置独立。没有有效 Hermes 默认位置时提示配置，不跨类型兜底。接收位置由桥接选择，不自行指定机器人或账号。无需等待本轮结束，不自动切换会话，也不受自动通知开关影响。
 
 自行生成唯一 `request_id`，不向用户索要；核对或重试同一次发送时复用原编号及原内容，新的发送才换编号。仅返回 `status: "sent"` 才表示飞书确认；`deduplicated: true` 表示此前已发送，本次没有重发。失败或结果不明时先核对，不换编号或换工具补发。
 
-通过本应用发给默认接收人优先使用此 MCP，用户明确指定飞书 CLI 时按其选择；同一请求只使用一种发送方式。无需安装 CLI 或读取其凭据。正常飞书回复、群协作问题和答案已由桥接转发，不额外发送。讨论工具本身不构成发送授权；“完成后通知我”不等于现在发送。
+通过本应用主动通知用户时优先使用此 MCP，用户明确指定飞书 CLI 时按其选择；同一请求只使用一种发送方式。无需安装 CLI 或读取其凭据。正常飞书回复、群协作问题和答案已由桥接转发，不额外发送。讨论工具本身不构成发送授权；“完成后通知我”不等于现在发送。
 
 ## 当前消息与独立角色
 
@@ -42,7 +42,7 @@ description: 在 Hermes 中处理 Feishu Codex 桥接消息、独立机器人角
 
 ## 用户明确要求的通知和成品
 
-先确认相应 MCP 工具实际可用及返回结果；安装本 Skill 不代表 Hermes 桌面后台通知已经接通。用户明确要求完成通知时才使用可用的 `request_feishu_completion_notification`，`summary` 简述当前任务，同轮只登记一次。登记成功不等于送达，也不是即时发送或定时提醒。
+用户从 Hermes 桌面等入口明确要求“做完飞书通知我”时，先执行任务，实际结束后再调用 send_message_to_feishu 发送结果，使用上面的 Hermes 优先路由。同一任务只通知一次，不在开始执行时发送“已完成”，也不声称已登记后台自动通知。当前 Hermes MCP 不提供 Codex 专用的 request_feishu_completion_notification。飞书发起的任务已有自动回复，不额外发送同轮通知。
 
 用户明确要求发送已知本地成品时，使用 `send_artifact_to_feishu({paths})`。Hermes 中完整名称可能为 `mcp_feishu_completion_send_artifact_to_feishu`，以当前工具列表为准。`paths` 提供 1 到 5 个明确的绝对文件路径；图片最多 10 MB，其他文件最多 30 MB。不扫描项目、不自动发送源码改动，只发送用户点名或明确要求交付的成品。
 

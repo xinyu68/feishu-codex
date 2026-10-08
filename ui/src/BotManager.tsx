@@ -6,6 +6,7 @@ import { errorMessage, request } from './api';
 import type { AppState, BotProfile, DesktopNotificationTarget } from './types';
 import type { ConfigAutosave } from './useConfigAutosave';
 import './bot-workspace.css';
+import { notificationEngines, notificationField, notificationEngineLabel, notificationTargetsFor, notificationValue, type NotificationEngine } from './notification-settings';
 
 type Perform = (name: string, operation: () => Promise<unknown>, success?: string) => Promise<void>;
 type Refresh = () => Promise<void>;
@@ -157,21 +158,18 @@ function BotField({ name, label, field, children, hint }: { name: FieldName; lab
   return <div className="bot-field" data-field={name}><label className="field-label"><span>{label}</span>{children}</label>{hint && <p className="bot-field-hint">{hint}</p>}<FieldStatus field={field} /></div>;
 }
 
-export function BotManager({ state, action, perform, refresh, configSave, focusBot }: { state: AppState; action: string; perform: Perform; refresh: Refresh; configSave: ConfigAutosave; focusBot?: { id: string } }) {
+export function BotManager({ state, action, perform, refresh, configSave, focusBot }: { state: AppState; action: string; perform: Perform; refresh: Refresh; configSave: ConfigAutosave; focusBot?: { id?: string; engine?: NotificationEngine } }) {
   const bots = botsFromState(state);
-  const targets = state.notificationTargets || [];
-  const savedTarget = state.config.desktopNotificationTarget;
-  const targetDraft = configSave.draft.desktopNotificationTarget;
-  const target = targetDraft !== undefined ? targetDraft : savedTarget;
-  const savedDefault = savedTarget && targets.find(item => notificationTargetKey(item) === notificationTargetKey(savedTarget));
-  const draftDefault = targetDraft && targets.find(item => notificationTargetKey(item) === notificationTargetKey(targetDraft));
-  const defaultUnavailable = Boolean(target && !targets.some(item => notificationTargetKey(item) === notificationTargetKey(target)));
   const pendingCount = (id: string) => state.pendingActors.filter(item => (item.botId || 'default') === id).length + (state.pendingGroups || []).filter(item => item.botId === id).length;
   const firstUse = !state.conversations.some(item => item.chatId !== 'local-preview');
   const explicitSetup = new URLSearchParams(window.location.search).get('setup') === 'feishu';
   const [selected, setSelected] = useState(() => (explicitSetup ? bots.find(item => item.id === 'default') : firstUse ? bots.find(item => pendingCount(item.id)) || bots.find(item => !configured(item)) || bots.find(item => !item.allowedActors.length) : null)?.id || bots[0]?.id || '');
-  useEffect(() => { if (focusBot) setSelected(focusBot.id); }, [focusBot]);
-  const [adding, setAdding] = useState(false);
+  useEffect(() => {
+    if (!focusBot) return;
+    const id = focusBot.id || bots.find(bot => (bot.engine ?? 'codex') === focusBot.engine)?.id;
+    if (id) setSelected(id);
+  }, [focusBot]);
+  const [adding, setAdding] = useState<NotificationEngine>();
   const [tabs, setTabs] = useState<Record<string, Section>>(() => Object.fromEntries(bots.map(bot => [bot.id, !configured(bot) || (explicitSetup && bot.id === 'default') ? 'connection' : firstUse && (pendingCount(bot.id) || !bot.allowedActors.length) ? 'access' : 'conversation'])));
   const [onboarding, setOnboarding] = useState<Record<string, boolean>>({});
   const [models, setModels] = useState<Model[]>([]);
@@ -185,18 +183,38 @@ export function BotManager({ state, action, perform, refresh, configSave, focusB
   };
   useEffect(() => { void loadModels(); }, []);
   function startAccess(id: string) { setSelected(id); selectTab(id, 'access'); setOnboarding(current => ({ ...current, [id]: true })); }
-  function closeDialog() { setAdding(false); addButton.current?.focus(); }
+  function closeDialog() { setAdding(undefined); addButton.current?.focus(); }
   return <main className="bot-workspace" aria-label="机器人管理">
-    <aside className="bot-sidebar" aria-label="机器人列表"><div className="bot-sidebar-heading"><span className="eyebrow">FEISHU BOTS</span><h1>机器人</h1><p>连接应用，安排对话与协作</p></div>
-      <div className="bot-list">{bots.map(item => <button key={item.id} type="button" className={`bot-list-item ${selectedBot.id === item.id ? 'selected' : ''}`} aria-label={`管理${item.name}`} aria-pressed={selectedBot.id === item.id} onClick={() => setSelected(item.id)}>
-        <span className="bot-list-avatar"><Bot size={18} /></span><span className="bot-list-copy"><strong>{item.name}</strong><span className="bot-list-status"><span className={`status-dot ${item.connection.status === 'connected' ? 'good' : item.connection.status === 'connecting' ? 'busy' : ''}`} />{configured(item) ? labels[item.connection.status] : '待配置'}{savedDefault?.botId === item.id && <span className="bot-default-badge">默认通知</span>}</span>{draftDefault?.botId === item.id && <span className="bot-default-pending">{configSave.feedback.phase === 'saving' ? '保存中…' : '尚未保存'}</span>}{pendingCount(item.id) > 0 && <span className="bot-pending-badge">{pendingCount(item.id)} 项待授权</span>}</span>
-      </button>)}</div>
-      <button ref={addButton} type="button" className="secondary-button bot-add-button" aria-label="添加机器人" title="添加机器人" disabled={Boolean(action)} onClick={() => setAdding(true)}><Plus size={14} />添加机器人</button>
-      <p className="bot-sidebar-note">每个机器人使用独立的飞书应用和访问权限。</p>
-      {defaultUnavailable && <div className="bot-default-warning" role="status"><p>默认通知已失效，请重新设置。</p><button type="button" className="text-button" disabled={configSave.feedback.phase === 'saving'} onClick={() => void configSave.save({ desktopNotificationTarget: null })}>清除失效默认</button></div>}
+    <aside className="bot-sidebar" aria-label="机器人列表">
+      <div className="bot-sidebar-heading"><span className="eyebrow">FEISHU BOTS</span><h1>机器人</h1><p>按 AI 管理连接与通知</p></div>
+      <div className="bot-list-groups">{notificationEngines.map(engine => {
+        const label = notificationEngineLabel(engine);
+        const group = bots.filter(bot => (bot.engine ?? 'codex') === engine);
+        const targets = notificationTargetsFor(state, engine);
+        const savedTarget = state.config[notificationField(engine)];
+        const savedDefault = savedTarget && targets.find(item => notificationTargetKey(item) === notificationTargetKey(savedTarget));
+        const pendingTarget = configSave.draft[notificationField(engine)];
+        const draftDefault = pendingTarget && targets.find(item => notificationTargetKey(item) === notificationTargetKey(pendingTarget));
+        const value = notificationValue(state.config, configSave.draft, engine);
+        const invalid = Boolean(value && !targets.some(item => notificationTargetKey(item) === notificationTargetKey(value)));
+        return <section className={`bot-engine-group ${engine}`} key={engine} aria-label={`${label} 机器人`}>
+          <div className="bot-group-heading"><strong>{label}</strong><span>{group.length}</span><button type="button" className="icon-button" title={`添加 ${label} 机器人`} aria-label={`添加 ${label} 机器人`} disabled={Boolean(action)} onClick={() => setAdding(engine)}><Plus size={13} /></button></div>
+          <div className="bot-list">{group.map(item => <button key={item.id} type="button" className={`bot-list-item ${selectedBot?.id === item.id ? 'selected' : ''}`} aria-label={`管理${item.name}`} aria-pressed={selectedBot?.id === item.id} onClick={() => setSelected(item.id)}>
+            <span className="bot-list-avatar"><Bot size={18} /></span><span className="bot-list-copy"><strong>{item.name}</strong>
+              <span className="bot-list-status"><span className={`status-dot ${item.connection.status === 'connected' ? 'good' : item.connection.status === 'connecting' ? 'busy' : ''}`} />{configured(item) ? labels[item.connection.status] : '待配置'}{savedDefault?.botId === item.id && <span className="bot-default-badge">默认通知</span>}</span>
+              {draftDefault?.botId === item.id && <span className="bot-default-pending">{configSave.feedback.phase === 'saving' ? '保存中…' : '尚未保存'}</span>}
+              {pendingCount(item.id) > 0 && <span className="bot-pending-badge">{pendingCount(item.id)} 项待授权</span>}
+            </span>
+          </button>)}</div>
+          {!group.length && <button type="button" className="bot-group-empty" disabled={Boolean(action)} onClick={() => setAdding(engine)}>添加第一个 {label} 机器人<Plus size={12} /></button>}
+          {invalid && <div className="bot-default-warning" role="status"><p>{label} 默认通知已失效，请重新设置。</p><button type="button" className="text-button" disabled={configSave.feedback.phase === 'saving'} onClick={() => void configSave.save({ [notificationField(engine)]: null })}>清除失效默认</button></div>}
+        </section>;
+      })}</div>
+      <button ref={addButton} type="button" className="secondary-button bot-add-button" aria-label="添加机器人" disabled={Boolean(action)} onClick={() => setAdding('codex')}><Plus size={14} />添加机器人</button>
+      <p className="bot-sidebar-note">Codex 与 Hermes 分别设置默认通知。</p>
     </aside>
     <div className="bot-detail-stack">{bots.map(bot => <BotDetail key={bot.id} state={state} bot={bot} hidden={bot.id !== selectedBot?.id} section={tabs[bot.id] || (configured(bot) ? 'conversation' : 'connection')} changeSection={section => selectTab(bot.id, section)} pending={pendingCount(bot.id)} models={models} modelError={modelError} retryModels={loadModels} busy={Boolean(action)} perform={perform} refresh={refresh} configSave={configSave} onboarding={Boolean(onboarding[bot.id])} startAccess={() => startAccess(bot.id)} removed={() => setSelected(bots.find(item => item.id !== bot.id)?.id || '')} />)}{!bots.length && <section className="bot-empty-state"><span className="bot-empty-icon"><Bot size={27} /></span><h2>还没有机器人</h2><p>点击左侧“添加机器人”，连接你的飞书应用。</p></section>}</div>
-    {adding && <AddBotDialog close={closeDialog} created={id => { closeDialog(); startAccess(id); }} perform={perform} />}
+    {adding && <AddBotDialog initialEngine={adding} close={closeDialog} created={id => { closeDialog(); startAccess(id); }} perform={perform} />}
   </main>;
 }
 
@@ -209,7 +227,8 @@ function BotDetail({ state, bot, hidden, section, changeSection, pending, models
   const tabId = (id: Section) => `bot-${bot.id}-tab-${id}`;
   const panelId = (id: Section) => `bot-${bot.id}-panel-${id}`;
   return <section className="bot-detail" hidden={hidden} aria-label={`${bot.name}设置`}>
-    <header className="bot-detail-heading"><div><h2>{bot.name}</h2><p>{bot.engine === 'hermes' ? '由本机 Hermes 处理对话' : '管理这个机器人的对话方式与使用范围'}</p></div><div className="bot-detail-actions"><span className={`bot-connection-status ${bot.connection.status}`}><span className={`status-dot ${bot.connection.status === 'connected' ? 'good' : bot.connection.status === 'connecting' ? 'busy' : ''}`} />{configured(bot) ? labels[bot.connection.status] : '等待连接飞书'}</span><BotRemoval bot={bot} busy={busy || configSave.feedback.phase === 'saving'} perform={perform} removed={removed} isNotificationTarget={state.config.desktopNotificationTarget?.botAppId === bot.appId} onOpenChange={setRemoving} /></div></header>
+    <header className="bot-detail-heading"><div><div className="bot-detail-name"><h2>{bot.name}</h2><span className={`bot-type-badge ${bot.engine || 'codex'}`} title="创建后不可更换；如需更换，请删除后重新添加。">{notificationEngineLabel(bot.engine || 'codex')}</span></div><p>{bot.engine === 'hermes' ? '由本机 Hermes 处理对话' : '管理这个机器人的对话方式与使用范围'}</p>{bot.engine === 'hermes' && bot.engineStatus?.available === false && <p className="bot-engine-error" role="status">{bot.engineStatus.error || 'Hermes 服务尚未就绪，请检查本机安装和模型配置。'}</p>}</div><div className="bot-detail-actions"><span className={`bot-connection-status ${bot.connection.status}`}><span className={`status-dot ${bot.connection.status === 'connected' ? 'good' : bot.connection.status === 'connecting' ? 'busy' : ''}`} />{configured(bot) ? labels[bot.connection.status] : '等待连接飞书'}</span><BotRemoval bot={bot} busy={busy || configSave.feedback.phase === 'saving'} perform={perform} removed={removed} isNotificationTarget={state.config[notificationField(bot.engine || 'codex')]?.botAppId === bot.appId} onOpenChange={setRemoving} /></div></header>
+    <fieldset className="bot-notification-header" disabled={removing}><DefaultNotificationBot state={state} bot={bot} configSave={configSave} startAccess={() => changeSection('access')} /></fieldset>
     <div className="bot-tabs" role="tablist" aria-label="机器人设置" ref={tabsRef} onKeyDown={event => {
       if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
       event.preventDefault(); const index = sections.findIndex(item => item.id === section);
@@ -217,8 +236,7 @@ function BotDetail({ state, bot, hidden, section, changeSection, pending, models
       changeSection(sections[next].id); tabsRef.current?.querySelectorAll<HTMLButtonElement>('[role="tab"]')[next]?.focus();
     }}>{sections.map(item => <button key={item.id} type="button" role="tab" id={tabId(item.id)} aria-controls={panelId(item.id)} aria-selected={section === item.id} tabIndex={section === item.id ? 0 : -1} onClick={() => changeSection(item.id)}>{item.label}{item.id === 'access' && pending > 0 && <span className="count-badge">{pending}</span>}</button>)}</div>
     <div className="bot-panel-scroll"><fieldset className="bot-settings-fields" disabled={removing}>
-      {bot.engine !== 'hermes' && <DefaultNotificationBot state={state} bot={bot} configSave={configSave} startAccess={() => changeSection('access')} />}
-      <div className="bot-tab-panel" role="tabpanel" id={panelId('conversation')} aria-labelledby={tabId('conversation')} hidden={section !== 'conversation'}><BotEngine bot={bot} /><ConversationSettings bot={bot} models={models} modelError={modelError} retryModels={retryModels} refresh={refresh} /></div>
+      <div className="bot-tab-panel" role="tabpanel" id={panelId('conversation')} aria-labelledby={tabId('conversation')} hidden={section !== 'conversation'}><ConversationSettings bot={bot} models={models} modelError={modelError} retryModels={retryModels} refresh={refresh} /></div>
       <div className="bot-tab-panel" role="tabpanel" id={panelId('access')} aria-labelledby={tabId('access')} hidden={section !== 'access'}><BotAccess state={state} bot={bot} busy={busy} perform={perform} onboarding={onboarding} /></div>
       <div className="bot-tab-panel" role="tabpanel" id={panelId('connection')} aria-labelledby={tabId('connection')} hidden={section !== 'connection'}><BotCredentials bot={bot} refresh={refresh} startAccess={startAccess} /></div>
     </fieldset></div>
@@ -364,9 +382,9 @@ function BotAccess({ state, bot, busy, perform, onboarding }: { state: AppState;
   </div>;
 }
 
-function AddBotDialog({ close, created, perform }: { close: () => void; created: (id: string) => void; perform: Perform }) {
+function AddBotDialog({ initialEngine, close, created, perform }: { initialEngine: NotificationEngine; close: () => void; created: (id: string) => void; perform: Perform }) {
   const [name, setName] = useState('');
-  const [engine, setEngine] = useState<BotEngineName>('codex');
+  const [engine, setEngine] = useState<BotEngineName>(initialEngine);
   const [appId, setAppId] = useState('');
   const [secret, setSecret] = useState('');
   const [saving, setSaving] = useState(false);
@@ -402,17 +420,20 @@ function AddBotDialog({ close, created, perform }: { close: () => void; created:
 }
 
 function DefaultNotificationBot({ state, bot, configSave, startAccess }: { state: AppState; bot: BotProfile; configSave: ConfigAutosave; startAccess: () => void }) {
-  const targets = (state.notificationTargets || []).filter(item => item.botId === bot.id);
+  const engine = bot.engine || 'codex';
+  const label = notificationEngineLabel(engine);
+  const field = notificationField(engine);
+  const targets = notificationTargetsFor(state, engine).filter(item => item.botId === bot.id);
   const unapprovedPrivate = state.conversations.some(item => (item.botId || 'default') === bot.id
     && item.chatType !== 'group' && item.actorId && !bot.allowedActors.includes(item.actorId));
   const needsAuthorization = !bot.allowedActors.length || unapprovedPrivate;
   const setupHint = needsAuthorization
     ? '请在访问权限中允许接收通知的私聊账号。'
     : `账号已授权。请在飞书私聊「${bot.name}」发一条消息，收到后即可设置。`;
-  const hasDraft = configSave.draft.desktopNotificationTarget !== undefined;
-  const target = hasDraft ? configSave.draft.desktopNotificationTarget : state.config.desktopNotificationTarget;
+  const hasDraft = configSave.draft[field] !== undefined;
+  const target = hasDraft ? configSave.draft[field] : state.config[field];
   const selectedTarget = target && targets.find(item => notificationTargetKey(item) === notificationTargetKey(target));
-  const savedTarget = state.config.desktopNotificationTarget;
+  const savedTarget = state.config[field];
   const savedHere = savedTarget && targets.some(item => notificationTargetKey(item) === notificationTargetKey(savedTarget));
   const [choice, setChoice] = useState<string>();
   const chosen = choice ?? (selectedTarget ? notificationTargetKey(selectedTarget) : '');
@@ -425,23 +446,16 @@ function DefaultNotificationBot({ state, bot, configSave, startAccess }: { state
   async function chooseDefault() {
     if (!candidate || saving) return;
     const { chatId, actorId, botAppId } = candidate;
-    if (await configSave.save({ desktopNotificationTarget: { chatId, actorId, botAppId } })) setChoice(undefined);
+    if (await configSave.save({ [field]: { chatId, actorId, botAppId } })) setChoice(undefined);
   }
-  return <section className={`bot-default-notification${isCurrent ? ' is-default' : ''}`} aria-label="默认通知机器人">
-    <div className="bot-default-row"><div className="bot-default-copy"><strong>默认通知机器人</strong><p>已有会话绑定优先；未绑定的完成通知由默认机器人发送。</p></div>
-      <div className="bot-default-actions">{isCurrent && unchanged ? <><span className="bot-default-current"><Check size={12} />已设为默认</span><button type="button" className="text-button" onClick={() => void configSave.save({ desktopNotificationTarget: null })}>取消默认</button></> : <button type="button" className="secondary-button" disabled={saving || !candidate} onClick={() => void chooseDefault()}>{saving ? '保存中…' : isCurrent ? '更新接收人' : '设为默认通知机器人'}</button>}
+  return <section className={`bot-default-notification${isCurrent ? ' is-default' : ''}`} aria-label={`${label} 默认通知机器人`}>
+    <div className="bot-default-row"><div className="bot-default-copy"><strong>{label} 默认通知</strong><p>已有任务绑定优先；本类主动消息使用此设置。</p></div>
+      <div className="bot-default-actions">{isCurrent && unchanged ? <><span className="bot-default-current"><Check size={12} />已设为默认</span><button type="button" className="text-button" onClick={() => void configSave.save({ [field]: null })}>取消默认</button></> : <button type="button" className="secondary-button" disabled={saving || !candidate} onClick={() => void chooseDefault()}>{saving ? '保存中…' : isCurrent ? '更新接收人' : `设为 ${label} 默认通知`}</button>}
       </div>
     </div>
     {targets.length > 1 && <label className="bot-default-recipient"><span>通知接收人</span><Select aria-label="通知接收人" value={targets.some(item => notificationTargetKey(item) === chosen) ? chosen : ''} disabled={saving} onChange={event => setChoice(event.target.value)}><option value="">请选择一个私聊账号</option>{targets.map(item => <option key={notificationTargetKey(item)} value={notificationTargetKey(item)}>私聊账号 · {item.actorId.slice(-6)}</option>)}</Select></label>}
     {!targets.length && <p className="bot-default-hint" role="status">{setupHint}{needsAuthorization && <button type="button" className="text-button" onClick={startAccess}>去授权</button>}</p>}
-    {invalidHere && <p className="bot-default-error">原接收位置已失效，请重新设置。<button type="button" className="text-button" onClick={() => void configSave.save({ desktopNotificationTarget: null })}>取消默认</button></p>}
+    {invalidHere && <p className="bot-default-error">原接收位置已失效，请重新设置。<button type="button" className="text-button" onClick={() => void configSave.save({ [field]: null })}>取消默认</button></p>}
     {hasDraft && (selectedTarget || savedHere || !target) && <p className={`bot-default-feedback ${failed ? 'error' : ''}`} role="status">{failed ? '默认通知设置尚未保存。' : '正在保存默认通知设置…'}{failed && <button type="button" className="text-button" onClick={() => void configSave.retry()}>重试</button>}</p>}
   </section>;
-}
-
-function BotEngine({ bot }: { bot: BotProfile }) {
-  const engine = bot.engine === 'hermes' ? 'Hermes' : 'Codex';
-  return <><div className="bot-engine-row"><div><span className="field-label">处理对话的 AI</span><p>创建后不可更换；如需更换，请删除后重新添加。</p></div><span className="bot-engine-value" aria-label="处理对话的 AI">{engine}</span></div>
-    {bot.engine === 'hermes' && bot.engineStatus?.available === false && <p className="bot-engine-error" role="status">{bot.engineStatus.error || 'Hermes 服务尚未就绪，请检查本机安装和模型配置。'}</p>}
-  </>;
 }

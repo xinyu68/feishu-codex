@@ -3,23 +3,25 @@ import type { Store } from './store.js';
 import type { FeishuTransport } from './types.js';
 import { MESSAGE_SEND_TIMEOUT_MS, MessageSendError, validateMessageRequest, type MessageDelivery, type MessageResult } from './message-request.js';
 
-/** Immediate messages use only the configured private destination, never a thread binding. */
+/** Each engine uses its own pinned private destination; never cross engine boundaries. */
 export class DefaultMessageSender {
   private readonly pending = new Map<string, Promise<MessageResult>>();
   private readonly stop = new AbortController();
   constructor(private readonly store: Store, private readonly transport: FeishuTransport, private readonly timeoutMs = MESSAGE_SEND_TIMEOUT_MS) {}
   async close(): Promise<void> { this.stop.abort(); await Promise.allSettled([...this.pending.values()]); }
   hasPending(): boolean { return this.pending.size > 0; }
-  private destination() {
-    const selected = this.store.config.desktopNotificationTarget;
-    if (!selected) throw new MessageSendError('no_default', '请先在机器人设置中选择默认通知机器人及接收私聊。', 409);
-    const target = this.store.notificationTargets().find(item => item.chatId === selected.chatId && item.actorId === selected.actorId && item.botAppId === selected.botAppId);
-    if (!target) throw new MessageSendError('invalid_default', '默认通知接收位置已失效，请重新选择；消息未发送。', 409);
+  private destination(engine: 'codex' | 'hermes') {
+    const label = engine === 'hermes' ? 'Hermes' : 'Codex';
+    const selected = engine === 'hermes' ? this.store.config.hermesNotificationTarget : this.store.config.desktopNotificationTarget;
+    if (!selected) throw new MessageSendError('no_default', `请先在机器人设置中选择 ${label} 默认通知机器人及接收私聊。`, 409);
+    const target = this.store.notificationTargets(this.store.config, engine).find(item =>
+      item.chatId === selected.chatId && item.actorId === selected.actorId && item.botAppId === selected.botAppId);
+    if (!target) throw new MessageSendError('invalid_default', `${label} 默认通知接收位置已失效，请重新选择；消息未发送。`, 409);
     const bot = this.store.bot(target.botId);
-    if (!bot?.enabled || this.transport.isAvailable?.(target.chatId) === false) throw new MessageSendError('disconnected', '默认通知机器人的飞书连接未就绪，请在应用中检查连接。', 503);
+    if (!bot?.enabled || this.transport.isAvailable?.(target.chatId) === false) throw new MessageSendError('disconnected', `${label} 默认通知机器人的飞书连接未就绪，请在应用中检查连接。`, 503);
     return target;
   }
-  async send(value: unknown, signal?: AbortSignal): Promise<MessageResult> {
+  async send(value: unknown, signal?: AbortSignal, engine: 'codex' | 'hermes' = 'codex'): Promise<MessageResult> {
     const request = validateMessageRequest(value);
     const key = createHash('sha256').update(request.request_id).digest('hex');
     const fingerprint = createHash('sha256').update(JSON.stringify([request.text, request.title ?? ''])).digest('hex');
@@ -32,7 +34,7 @@ export class DefaultMessageSender {
       throw new MessageSendError('uncertain', '这次发送的结果尚未确认，已阻止重复发送。请先核对飞书，不要换编号、换工具补发。', 409);
     }
     if (this.stop.signal.aborted || signal?.aborted) throw new MessageSendError('cancelled', '发送已取消，消息未提交。', 409);
-    const target = this.destination();
+    const target = this.destination(engine);
     const delivery: MessageDelivery = { fingerprint, status: 'sending', at: new Date().toISOString(), botName: target.botName,
       chatId: target.chatId, actorId: target.actorId, botAppId: target.botAppId };
     // Persist the claim before the network call; restart cannot safely retry an unacknowledged send.
@@ -41,7 +43,7 @@ export class DefaultMessageSender {
     const sendSignal = AbortSignal.any([this.stop.signal, AbortSignal.timeout(this.timeoutMs), ...(signal ? [signal] : [])]);
     const canSend = () => {
       if (sendSignal.aborted) return false;
-      try { const current = this.destination(); return current.chatId === target.chatId && current.actorId === target.actorId && current.botAppId === target.botAppId; }
+      try { const current = this.destination(engine); return current.chatId === target.chatId && current.actorId === target.actorId && current.botAppId === target.botAppId; }
       catch { return false; }
     };
     const operation = (async () => {

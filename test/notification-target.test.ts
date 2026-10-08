@@ -20,7 +20,7 @@ async function settle() {
   for (let count = 0; count < 8; count++) await new Promise(resolve => setImmediate(resolve));
 }
 
-function fixture(t: test.TestContext) {
+function fixture(t: test.TestContext, hermesBots = 0) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'notification-target-'));
   t.after(() => { assert.equal(path.dirname(dir), os.tmpdir()); assert.ok(path.basename(dir).startsWith('notification-target-')); fs.rmSync(dir, { recursive: true, force: true }); });
   const store = new Store(dir);
@@ -29,6 +29,10 @@ function fixture(t: test.TestContext) {
   store.saveBot('reviewer', { name: 'Reviewer', appId: appB, appSecret: 'fixture-b', allowedActors: ['ou_b'] });
   Object.assign(store.conversation('oc_a', 'ou_a', dir, 'p2p'), { threadId: 'existing-a' });
   Object.assign(store.conversation(chatB, 'ou_b', dir, 'p2p'), { threadId: 'existing-b' });
+  for (let index = 1; index <= hermesBots; index++) {
+    store.saveBot('hermes-' + index, { engine: 'hermes', appId: 'cli_hermes_' + index, appSecret: 'fixture', enabled: true, name: 'Hermes ' + index, allowedActors: ['ou_h' + index] });
+    store.conversation(conversationKey('hermes-' + index, 'oc_h' + index), 'ou_h' + index, dir, 'p2p').threadId = 'hermes:existing-' + index;
+  }
   let listener: ((event: RuntimeEvent) => void) | undefined;
   const cards: Array<{ botId: string; chatId: string; card: MessageCard }> = [];
   const files: string[] = [];
@@ -51,6 +55,7 @@ function fixture(t: test.TestContext) {
   });
   const transport = new TransportRouter();
   transport.set('default', make('default')); transport.set('reviewer', make('reviewer'));
+  for (let index = 1; index <= hermesBots; index++) transport.set('hermes-' + index, make('hermes-' + index));
   const discovery = { projects: async () => [], threads: async () => [] };
   const bridge = new Bridge(store, runtime, discovery); bridge.transport = transport;
   const emit = (method: string, turnId: string, extra: Record<string, unknown> = {}, threadId = 'desktop-only') => listener?.({
@@ -232,4 +237,50 @@ test('an App-ID change during metadata lookup cannot move a notice to a newly co
   release(); await settle();
   assert.deepEqual(fx.cards, []);
   assert.ok(Object.values(fx.store.state.notifications).every(record => record.status !== 'sent'));
+});
+
+test('unbound Hermes completions prefer the unique Hermes bot and keep Codex notifications on Codex', async t => {
+  const fx = fixture(t, 1); fx.store.saveConfig({ desktopNotificationTarget: targetB });
+  const before = structuredClone(fx.store.state.conversations);
+  fx.complete('h', {}, 'hermes:desktop'); fx.complete('c'); await settle();
+  assert.deepEqual(fx.cards.map(card => card.botId), ['hermes-1', 'reviewer']);
+  assert.deepEqual(fx.store.state.conversations, before);
+  const notice = Object.values(fx.store.state.notifications).find(item => item.threadId === 'hermes:desktop')!;
+  assert.deepEqual(fx.cards[0]!.card.buttons, [{ label: '切换到此会话', command: '/notification ' + notice.id, primary: true }]);
+});
+
+test('a Hermes task binding wins among multiple Hermes bots, while unbound work uses its pinned Hermes default', async t => {
+  for (const binding of ['current', 'historical', 'none']) {
+    const fx = fixture(t, 2); fx.store.saveConfig({ desktopNotificationTarget: targetB });
+    const conversation = fx.store.state.conversations[conversationKey('hermes-2', 'oc_h2')]!;
+    if (binding !== 'none') {
+      conversation.threadId = 'hermes:desktop';
+      if (binding === 'historical') { fx.store.rememberThread(conversation); conversation.threadId = 'hermes:another'; }
+    }
+    fx.complete('h', {}, 'hermes:desktop'); await settle();
+    assert.equal(fx.cards.length, 1, binding);
+    assert.equal(fx.cards[0]!.botId, binding === 'none' ? 'hermes-1' : 'hermes-2', binding);
+    assert.equal(fx.cards[0]!.card.buttons?.[0]?.label, '切换到此会话');
+  }
+});
+
+test('a revoked Hermes task binding never falls back to another authorized bot', async t => {
+  const fx = fixture(t, 2); fx.store.saveConfig({ desktopNotificationTarget: targetB });
+  fx.store.state.conversations[conversationKey('hermes-2', 'oc_h2')]!.threadId = 'hermes:desktop';
+  fx.store.authorize('ou_h2', false, 'hermes-2');
+  fx.complete('h', {}, 'hermes:desktop'); await settle();
+  assert.deepEqual(fx.cards, []);
+});
+test('Hermes completion defaults are independent, explicit and never cross over to Codex', async t => {
+  const fx = fixture(t, 2);
+  const hermesTarget = { chatId: conversationKey('hermes-2', 'oc_h2'), actorId: 'ou_h2', botAppId: 'cli_h2' };
+  const actual = fx.store.notificationTargets(fx.store.config, 'hermes').find(item => item.botId === 'hermes-2')!;
+  fx.store.saveConfig({ desktopNotificationTarget: targetB, hermesNotificationTarget: { ...hermesTarget, botAppId: actual.botAppId } });
+  fx.complete('h1', {}, 'hermes:desktop'); await settle();
+  assert.equal(fx.cards[0]!.botId, 'hermes-2');
+  fx.store.saveConfig({ hermesNotificationTarget: null });
+  fx.complete('h2', {}, 'hermes:desktop'); await settle();
+  assert.equal(fx.cards.length, 1);
+  fx.complete('c1'); await settle();
+  assert.equal(fx.cards[1]!.botId, 'reviewer');
 });

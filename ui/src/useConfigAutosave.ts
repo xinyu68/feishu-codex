@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { ApiError, errorMessage, request } from './api';
 import type { Config } from './types';
 
-export type ConfigPatch = Partial<Pick<Config, 'defaultWorkspace' | 'progress' | 'autoNotifyDesktop' | 'desktopNotificationMode' | 'desktopNotificationMinMinutes' | 'desktopNotificationTarget'>>;
+export type ConfigPatch = Partial<Pick<Config, 'defaultWorkspace' | 'progress' | 'autoNotifyDesktop' | 'desktopNotificationMode' | 'desktopNotificationMinMinutes' | 'desktopNotificationTarget' | 'hermesNotificationTarget'>>;
 type Key = keyof ConfigPatch;
 type Job = { patch: ConfigPatch; revision: number; resolve: (saved: boolean) => void };
 type Feedback = { phase: 'idle' | 'saving' | 'saved' | 'error'; error?: string };

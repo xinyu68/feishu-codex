@@ -145,3 +145,39 @@ test('group, local preview, incomplete credentials, and missing private actor ne
   assert.deepEqual(store.config.desktopNotificationTarget, targetA);
   assert.deepEqual(savedConfig(store).desktopNotificationTarget, targetA);
 });
+
+test('Codex and Hermes independently pin their first authorized private recipient', t => {
+  const store = fixture(t);
+  makeDefaultAvailable(store);
+  const first = { chatId: conversationKey('h1', 'oc_h1'), actorId: 'ou_h1', botAppId: 'cli_h1' };
+  const second = { chatId: conversationKey('h2', 'oc_h2'), actorId: 'ou_h2', botAppId: 'cli_h2' };
+  for (const [id, target] of [['h1', first], ['h2', second]] as const) {
+    store.saveBot(id, { name: id, engine: 'hermes', appId: target.botAppId, appSecret: 'fixture', enabled: true, allowedActors: [target.actorId] });
+    store.conversation(target.chatId, target.actorId, store.dir, 'p2p');
+  }
+  assert.deepEqual(store.config.desktopNotificationTarget, targetA);
+  assert.deepEqual(store.config.hermesNotificationTarget, first);
+  store.saveConfig({ hermesNotificationTarget: second });
+  assert.deepEqual(new Store(store.dir).config.hermesNotificationTarget, second);
+  store.removeBot('h2');
+  assert.equal(store.config.hermesNotificationTarget, null);
+  assert.deepEqual(store.config.desktopNotificationTarget, targetA);
+  assert.equal(new Store(store.dir).config.hermesNotificationTarget, null, 'remaining Hermes bot must not silently become default');
+});
+
+test('clearing, disabling or revoking either engine never changes the other default', t => {
+  const store = fixture(t); makeDefaultAvailable(store);
+  const h = { chatId: conversationKey('h1', 'oc_h1'), actorId: 'ou_h1', botAppId: 'cli_h1' };
+  store.saveBot('h1', { engine: 'hermes', appId: h.botAppId, appSecret: 'fixture', enabled: true, allowedActors: [h.actorId] });
+  store.conversation(h.chatId, h.actorId, store.dir, 'p2p');
+  store.saveBot('h1', { enabled: false });
+  assert.deepEqual(store.config.hermesNotificationTarget, h, 'temporary disconnection preserves selection');
+  store.authorize(h.actorId, false, 'h1');
+  assert.deepEqual(store.config.hermesNotificationTarget, h, 'revoked default stays visibly invalid');
+  store.saveConfig({ desktopNotificationTarget: null });
+  assert.deepEqual(store.config.hermesNotificationTarget, h);
+  store.saveConfig({ hermesNotificationTarget: null });
+  makeProductAvailable(store);
+  assert.equal(store.config.desktopNotificationTarget, null);
+  assert.equal(store.config.hermesNotificationTarget, null);
+});

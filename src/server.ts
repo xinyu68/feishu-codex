@@ -312,7 +312,11 @@ export async function startServer(options: { port?: number; dataDir?: string; co
         const cancel = () => controller.abort();
         response.once('close', cancel);
         if (response.destroyed || request.aborted) cancel();
-        try { return json(response, await messageSender.send(input, controller.signal)); }
+        try {
+          const engine = request.headers['x-feishu-mcp-engine'] ?? 'codex';
+          if (engine !== 'codex' && engine !== 'hermes') throw new UserError('MCP 执行端来源无效。', 400);
+          return json(response, await messageSender.send(input, controller.signal, engine));
+        }
         finally { response.off('close', cancel); }
       }
       if (url.pathname === GROUP_CONSULT_PATH) {
@@ -343,7 +347,8 @@ export async function startServer(options: { port?: number; dataDir?: string; co
             stats: { messagesToday: store.state.dailyMessages[localDay()] ?? 0, totalTurns: store.state.totalTurns },
             conversations: bridge.conversations(), pendingActors: store.state.pendingActors, pendingGroups: store.state.pendingGroups,
             activeWork: bridge.hasActiveWork() || messageSender.hasPending(),
-            notificationTargets: store.notificationTargets(),
+            notificationTargets: (['codex', 'hermes'] as const).flatMap(engine =>
+              store.notificationTargets(store.config, engine).map(target => ({ ...target, engine }))),
             pendingRequests: bridge.pendingRequests(), logs: store.state.logs
           });
         }
@@ -445,12 +450,15 @@ export async function startServer(options: { port?: number; dataDir?: string; co
             if (!patch.appSecret) patch.appSecret = '';
             patch.allowedActors = []; patch.allowedGroups = [];
           }
-          if (patch.desktopNotificationTarget) {
-            const target = patch.desktopNotificationTarget;
-            const matches = (candidate: NonNullable<BridgeConfig['desktopNotificationTarget']>) => candidate.chatId === target.chatId
+          for (const engine of ['codex', 'hermes'] as const) {
+            const key = engine === 'hermes' ? 'hermesNotificationTarget' : 'desktopNotificationTarget';
+            const target = patch[key];
+            if (!target) continue;
+            const matches = (candidate: NonNullable<BridgeConfig[typeof key]>) => candidate.chatId === target.chatId
               && candidate.actorId === target.actorId && candidate.botAppId === target.botAppId;
-            if (!store.notificationTargets().some(matches) || !store.notificationTargets({ ...store.config, ...patch }).some(matches)) {
-              throw new UserError('默认通知接收位置不可用，请选择已配置机器人下仍获授权的飞书私聊。');
+            if (!store.notificationTargets(store.config, engine).some(matches)
+                || !store.notificationTargets({ ...store.config, ...patch }, engine).some(matches)) {
+              throw new UserError(`${engine === 'hermes' ? 'Hermes' : 'Codex'} 默认通知接收位置不可用，请选择同类型机器人下仍获授权的飞书私聊。`);
             }
           }
           if (credentialsChanged && store.config.enabled) await setConnection(false);
@@ -673,9 +681,10 @@ function validateConfig(body: Record<string, unknown>): Partial<BridgeConfig> {
   if (body.roleInstructions !== undefined) result.roleInstructions = validateString(body.roleInstructions, '群聊角色说明', 12_000);
   if (body.privateRoleInstructions !== undefined) result.privateRoleInstructions = validateString(body.privateRoleInstructions, '私聊角色说明', 12_000);
   if (body.includeGroupContext !== undefined) result.includeGroupContext = validateGroupContextSetting(body.includeGroupContext);
-  if (body.desktopNotificationTarget !== undefined) {
-    const value = body.desktopNotificationTarget;
-    if (value === null) result.desktopNotificationTarget = null;
+  for (const key of ['desktopNotificationTarget', 'hermesNotificationTarget'] as const) {
+    if (body[key] === undefined) continue;
+    const value = body[key];
+    if (value === null) result[key] = null;
     else {
       if (!value || typeof value !== 'object' || Array.isArray(value)) throw new UserError('默认通知接收位置格式无效');
       const target = value as Record<string, unknown>;
@@ -685,7 +694,7 @@ function validateConfig(body: Record<string, unknown>): Partial<BridgeConfig> {
       let route: ReturnType<typeof parseRoute>;
       try { route = parseRoute(target.chatId); } catch { throw new UserError('默认通知接收位置格式无效'); }
       if (!/^oc_[\w-]{1,180}$/.test(route.id)) throw new UserError('默认通知接收位置必须是飞书私聊');
-      result.desktopNotificationTarget = { chatId: target.chatId, actorId: target.actorId, botAppId: target.botAppId };
+      result[key] = { chatId: target.chatId, actorId: target.actorId, botAppId: target.botAppId };
     }
   }
   return result;

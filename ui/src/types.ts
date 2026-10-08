@@ -13,9 +13,10 @@ export type Config = {
   defaultWorkspace: string; model: string; effort: string; progress: boolean; autoNotifyDesktop: boolean;
   desktopNotificationMode: 'all' | 'long'; desktopNotificationMinMinutes: number;
   desktopNotificationTarget?: DesktopNotificationTarget | null;
+  hermesNotificationTarget?: DesktopNotificationTarget | null;
 };
 export type DesktopNotificationTarget = { chatId: string; actorId: string; botAppId: string };
-export type NotificationTarget = DesktopNotificationTarget & { botId: string; botName: string };
+export type NotificationTarget = DesktopNotificationTarget & { botId: string; botName: string; engine?: 'codex' | 'hermes' };
 export type PendingRequest = {
   id: string; chatId: string; kind: 'approval' | 'question'; title: string; text: string;
   questions?: { id: string; question: string; options?: { label: string; description?: string }[] }[];

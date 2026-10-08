@@ -75,7 +75,7 @@ export async function runtimeProbe(url, { idle = false, account = false, timeout
         // Inspect the latest accepted turn as well as the summary before shutdown.
         let latest;
         if (result.thread.historyMode === 'paginated') {
-          const page = await rpc('thread/turns/list', { threadId, limit: 1, sortDirection: 'desc', itemsView: 'full' });
+          const page = await rpc('thread/turns/list', { threadId, limit: 1, sortDirection: 'desc', itemsView: 'summary' });
           if (!Array.isArray(page?.data)) throw new Error('无法确认最近任务是否结束。');
           latest = page.data[0];
         } else {

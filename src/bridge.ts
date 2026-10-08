@@ -392,8 +392,9 @@ export class Bridge {
         : unavailable('任务历史绑定的接收位置已失效或授权已撤销，未改投其他位置。');
     }
     if (completion) {
-      const targets = this.store.notificationTargets();
-      const configured = this.store.config.desktopNotificationTarget;
+      const engine = isHermesThread(threadId) ? 'hermes' : 'codex';
+      const targets = this.store.notificationTargets(this.store.config, engine);
+      const configured = engine === 'hermes' ? this.store.config.hermesNotificationTarget : this.store.config.desktopNotificationTarget;
       if (configured === null) return unavailable(`${targets.length > 1 ? '存在多个已授权的飞书私聊，' : ''}尚未设置默认通知接收位置，请在机器人设置中重新选择。`);
       if (configured) {
         const target = targets.find(item => item.chatId === configured.chatId && item.actorId === configured.actorId && item.botAppId === configured.botAppId);
@@ -470,7 +471,7 @@ export class Bridge {
       const messageId = await this.transport.sendCard(notification.chatId, {
         title: labels.title, tone: labels.tone,
         text: `任务：${notification.title}\n项目：${path.basename(notification.cwd)}${notification.sessionTitle && notification.sessionTitle !== notification.title ? `\n会话：${notification.sessionTitle}` : ''}\n状态：${labels.state}${notification.result ? `\n\n${notification.result}` : ''}`,
-        buttons: [{ label: '切换到此会话', command: `/notification ${notification.id}`, primary: true }],
+        buttons: (this.store.botForChat(notification.chatId)?.engine === 'hermes') === isHermesThread(notification.threadId) ? [{ label: '切换到此会话', command: `/notification ${notification.id}`, primary: true }] : undefined,
       });
       this.store.finishDelivery(deliveryKey, 'sent');
       this.store.notification(notification.id, { status: 'sent', outcome, completedAt: new Date().toISOString(), messageId });

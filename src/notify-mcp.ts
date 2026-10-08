@@ -45,7 +45,7 @@ const tools: Array<{ name: string; description: string; inputSchema: Record<stri
 }];
 tools.push({
   name: MESSAGE_TOOL_NAME,
-  description: '用户明确要求现在把一段文字发到自己的飞书时调用；通过应用已配置的默认通知机器人发到指定私聊，立即等待飞书确认，不必结束本轮。自行生成 request_id，同一次发送核对或重试复用原编号。普通飞书回复已自动转发，不调用此工具重复发送；“做完通知我”使用完成通知工具。通过本应用发给默认接收人优先用此工具；用户明确指定飞书 CLI 时遵循其选择，同一发送不得再调用 CLI 或其他工具补发。',
+  description: '用户明确要求现在把一段文字发到自己的飞书时调用；通过应用配置的同类型默认通知机器人发到已授权私聊，Codex 与 Hermes 各自独立，不跨类型兜底，立即等待飞书确认，不必结束本轮。自行生成 request_id，同一次发送核对或重试复用原编号。普通飞书回复已自动转发，不调用此工具重复发送；' + (hermesMode ? '用户要求完成后通知时，先完成任务再调用；不要提前声称已登记。' : '“做完通知我”使用完成通知工具。') + '通过本应用发给对应类型的默认接收人优先用此工具；用户明确指定飞书 CLI 时遵循其选择，同一发送不得再调用 CLI 或其他工具补发。',
   inputSchema: MESSAGE_REQUEST_SCHEMA,
 });
 const hermesTools = new Set([ARTIFACT_TOOL_NAME, GROUP_HANDOFF_TOOL_NAME, GROUP_CONSULT_TOOL_NAME, MESSAGE_TOOL_NAME]);
@@ -89,8 +89,8 @@ input.on('line', line => {
         const pending = { controller: new AbortController(), cancelled: false };
         consultations.set(id, pending);
         try {
-          const sent = await sendMessageToFeishu(message, { signal: pending.controller.signal });
-          if (!pending.cancelled) result(id, { content: [{ type: 'text', text: `${sent.deduplicated ? '此前已发送，本次未重复发送' : '已发送'} · ${sent.botName}的默认通知私聊。` }], structuredContent: sent, isError: false });
+          const sent = await sendMessageToFeishu(message, { signal: pending.controller.signal, engine: hermesMode ? 'hermes' : 'codex' });
+          if (!pending.cancelled) result(id, { content: [{ type: 'text', text: `${sent.deduplicated ? '此前已发送，本次未重复发送' : '已发送'} · ${sent.botName}的通知私聊。` }], structuredContent: sent, isError: false });
         } catch (error) {
           if (!pending.cancelled) result(id, { content: [{ type: 'text', text: error instanceof Error ? error.message : '发送结果未确认，请勿重复发送。' }], isError: true });
         } finally { if (consultations.get(id) === pending) consultations.delete(id); }

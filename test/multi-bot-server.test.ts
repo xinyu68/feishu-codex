@@ -381,7 +381,7 @@ test('notification target API lists only configured authorized private chats and
   const candidates = state.notificationTargets;
   assert.equal(candidates.length, 2);
   assert.deepEqual(candidates.find((item: any) => item.botId === bot.id), {
-    chatId: botChat.chatId, actorId: 'ou_reviewer', botAppId: developerApp, botId: bot.id, botName: bot.name,
+    chatId: botChat.chatId, actorId: 'ou_reviewer', botAppId: developerApp, botId: bot.id, botName: bot.name, engine: 'codex',
   });
   const target = { chatId: botChat.chatId, actorId: botChat.actorId, botAppId: developerApp };
   const starts = [...h.starts];

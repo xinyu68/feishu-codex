@@ -226,3 +226,21 @@ test('ephemeral tasks use live state without requesting unsupported persisted hi
     } finally { await fx.close(); }
   }
 });
+
+test('idle probe uses bounded turn summary when latest turn contains a large payload', async () => {
+  const views = [];
+  const fx = await fixture((message, reply) => {
+    if (message.method === 'initialize') reply({});
+    else if (message.method === 'thread/loaded/list') reply({ data: ['large'], nextCursor: null });
+    else if (message.method === 'thread/read') reply({ thread: { id: 'large', status: { type: 'idle' }, historyMode: 'paginated' } });
+    else if (message.method === 'thread/turns/list') {
+      views.push(message.params.itemsView);
+      reply({ data: [{ id: 'turn', status: 'completed', items: message.params.itemsView === 'full'
+        ? [{ type: 'toolOutput', text: 'x'.repeat(3 * 1024 * 1024) }] : [] }] });
+    }
+  });
+  try {
+    assert.deepEqual(await runtimeProbe(fx.url, { idle: true }), { ready: true, active: 0 });
+    assert.deepEqual(views, ['summary']);
+  } finally { await fx.close(); }
+});

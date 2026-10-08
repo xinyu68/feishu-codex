@@ -13,6 +13,7 @@ export type BridgeConfig = {
   botName?: string; roleInstructions?: string; privateRoleInstructions?: string; allowedGroups?: string[]; bots?: BotProfile[];
   includeGroupContext?: boolean;
   desktopNotificationTarget?: DesktopNotificationTarget | null;
+  hermesNotificationTarget?: DesktopNotificationTarget | null;
   engine?: 'codex' | 'hermes';
   /** The legacy first bot was explicitly removed; do not recreate its empty placeholder. */
   defaultBotRemoved?: boolean;

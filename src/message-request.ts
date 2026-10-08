@@ -22,7 +22,7 @@ export const MESSAGE_REQUEST_SCHEMA = {
 export function validateMessageRequest(value: unknown): MessageRequest {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new MessageSendError('invalid_request', '消息参数必须是对象。');
   const input = value as Record<string, unknown>;
-  if (Object.keys(input).some(key => !['text', 'title', 'request_id'].includes(key))) throw new MessageSendError('invalid_request', '只接受消息正文、标题和请求编号；接收位置由默认通知设置决定。');
+  if (Object.keys(input).some(key => !['text', 'title', 'request_id'].includes(key))) throw new MessageSendError('invalid_request', '只接受消息正文、标题和请求编号；接收位置由执行端来源和通知设置决定。');
   const text = typeof input.text === 'string' ? input.text.trim() : '';
   const title = typeof input.title === 'string' ? input.title.trim() : undefined;
   if (!text || text.length > 6000) throw new MessageSendError('invalid_request', '消息正文须为 1–6000 个字符。');

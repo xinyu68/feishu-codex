@@ -16,19 +16,23 @@ import { conversationKey } from '../src/routing.js';
 import type { CodexRuntime, FeishuSendOptions, FeishuTransport, MessageCard } from '../src/types.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const target = { chatId: conversationKey('notify', 'oc_private_b'), actorId: 'ou_b', botAppId: 'cli_notification_b' };
+const target = { chatId: conversationKey('notify', 'oc_private_b'), actorId: 'ou_b', botAppId: 'cli_notificationb' };
 async function until(check: () => boolean) {
   const deadline = Date.now() + 5000;
   while (!check() && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));
   assert.ok(check(), 'Expected operation did not finish');
 }
-async function fixture(t: test.TestContext) {
+async function fixture(t: test.TestContext, hermesBots = 0) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'feishu-message-mcp-'));
   const seed = new Store(dir);
   seed.saveConfig({ appId: 'cli_chat_a', appSecret: 'a-secret', enabled: true, botName: '当前机器人', allowedActors: ['ou_a'], autoNotifyDesktop: false });
   seed.saveBot('notify', { appId: target.botAppId, appSecret: 'b-secret', enabled: true, name: '默认通知', allowedActors: ['ou_b'] });
   seed.conversation('oc_private_a', 'ou_a', dir, 'p2p').threadId = 'existing-a';
   seed.conversation(target.chatId, target.actorId, dir, 'p2p').threadId = 'existing-b';
+  for (let index = 1; index <= hermesBots; index++) {
+    seed.saveBot('hermes-' + index, { engine: 'hermes', appId: 'cli_hermes' + index, appSecret: 'hermes-secret', enabled: true, name: 'Hermes ' + index, allowedActors: ['ou_h' + index] });
+    seed.conversation(conversationKey('hermes-' + index, 'oc_h' + index), 'ou_h' + index, dir, 'p2p').threadId = 'hermes:existing-' + index;
+  }
   seed.saveConfig({ desktopNotificationTarget: target }); seed.save();
   const cards: Array<{ appId: string; chatId: string; card: MessageCard }> = [];
   let fail = false, hold: Promise<void> | undefined;
@@ -52,7 +56,7 @@ async function fixture(t: test.TestContext) {
     }; } },
   });
   t.after(async () => { await app.close(); assert.equal(path.dirname(dir), os.tmpdir()); assert.ok(path.basename(dir).startsWith('feishu-message-mcp-')); fs.rmSync(dir, { recursive: true, force: true }); });
-  await until(() => connected.size === 2);
+  await until(() => connected.size === 2 + hermesBots);
   const base = `http://127.0.0.1:${app.port}`;
   const message = { text: '中文进度：调查已完成第一步。', title: '阶段结果', request_id: 'message-test-0001' };
   return { app, dir, base, cards, message, options: { port: app.port }, fail: () => { fail = true; }, hold: (promise: Promise<void>) => { hold = promise; } };
@@ -153,7 +157,7 @@ test('timeouts and shutdown promptly cancel pending publication and keep uncerta
 });
 
 test('both real MCP subprocesses immediately return acknowledged sends and report duplicate requests', async t => {
-  const f = await fixture(t);
+  const f = await fixture(t, 1);
   for (const mode of ['codex', 'hermes']) {
     const child = spawn(process.execPath, ['--import', 'tsx', path.join(root, 'src/notify-mcp.ts')], {
       env: { ...process.env, FEISHU_CODEX_MCP_MODE: mode, FEISHU_CODEX_PORT: String(f.app.port) }, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'],
@@ -168,6 +172,7 @@ test('both real MCP subprocesses immediately return acknowledged sends and repor
     assert.ok(replies.find(r => r.id === 'list').result.tools.some((tool: any) => tool.name === 'send_message_to_feishu'));
     assert.equal(replies.find(r => r.id === 'send').result.structuredContent.status, 'sent');
     assert.equal(replies.find(r => r.id === 'send').result.isError, false);
+    assert.equal(replies.find(r => r.id === 'send').result.structuredContent.botName, mode === 'hermes' ? 'Hermes 1' : '默认通知');
     send({ id: 'again', method: 'tools/call', params: { name: 'send_message_to_feishu', arguments: { ...f.message, request_id: `message-${mode}-0001` } } });
     await until(() => replies.length === 3);
     assert.equal(replies.find(r => r.id === 'again').result.structuredContent.deduplicated, true);
@@ -187,4 +192,98 @@ test('invalid messages do not make network calls and connection redirects cannot
   assert.equal(requests, 0);
   await assert.rejects(sendMessageToFeishu({ text: 'hi', request_id: 'request-0001' }, options), /消息未提交/);
   assert.equal(requests, 1);
+});
+
+test('Hermes notifications prefer their own bot without changing the global Codex default or bindings', async t => {
+  const f = await fixture(t, 1);
+  const before = structuredClone(f.app.store.state.conversations);
+  const result = await sendMessageToFeishu(f.message, { ...f.options, engine: 'hermes' });
+  assert.equal(result.botName, 'Hermes 1');
+  assert.equal(f.cards[0]!.appId, 'cli_hermes1');
+  assert.equal(f.cards[0]!.chatId, 'oc_h1');
+  assert.deepEqual(f.app.store.config.desktopNotificationTarget, target);
+  assert.deepEqual(f.app.store.state.conversations, before);
+  const duplicate = await sendMessageToFeishu(f.message, f.options);
+  assert.equal(duplicate.deduplicated, true);
+  assert.equal(duplicate.botName, 'Hermes 1');
+  assert.equal(f.cards.length, 1, 'changing the caller cannot repeat or redirect the same request');
+});
+
+test('Hermes uses its own explicit default among multiple bots, and never the Codex default', async t => {
+  const f = await fixture(t, 2);
+  const chosen = { chatId: conversationKey('hermes-2', 'oc_h2'), actorId: 'ou_h2', botAppId: 'cli_hermes2' };
+  f.app.store.saveConfig({ hermesNotificationTarget: chosen });
+  const result = await sendMessageToFeishu(f.message, { ...f.options, engine: 'hermes' });
+  assert.equal(result.botName, 'Hermes 2');
+  assert.equal(f.cards[0]!.appId, chosen.botAppId);
+  assert.deepEqual(f.app.store.config.desktopNotificationTarget, target);
+});
+
+test('Hermes missing or explicitly cleared defaults never fall back to Codex', async t => {
+  for (const count of [0, 1, 2]) {
+    const f = await fixture(t, count);
+    f.app.store.saveConfig({ hermesNotificationTarget: null });
+    await assert.rejects(sendMessageToFeishu(f.message, { ...f.options, engine: 'hermes' }), /Hermes 默认通知/);
+    assert.deepEqual(f.cards, []);
+  }
+  const f = await fixture(t, 1);
+  f.app.store.saveConfig({ desktopNotificationTarget: null });
+  assert.equal((await sendMessageToFeishu(f.message, { ...f.options, engine: 'hermes' })).botName, 'Hermes 1');
+  await assert.rejects(sendMessageToFeishu({ ...f.message, request_id: 'another-0001' }, f.options), /Codex 默认通知/);
+});
+
+test('unavailable Hermes defaults fail without changing destination before or after claim', async t => {
+  for (const change of ['disabled', 'revoked', 'group']) {
+    const f = await fixture(t, 1);
+    const id = conversationKey('hermes-1', 'oc_h1');
+    if (change === 'disabled') f.app.store.saveBot('hermes-1', { enabled: false });
+    if (change === 'revoked') f.app.store.saveBot('hermes-1', { allowedActors: [] });
+    if (change === 'group') f.app.store.state.conversations[id]!.chatType = 'group';
+    await assert.rejects(sendMessageToFeishu(f.message, { ...f.options, engine: 'hermes' }), /Hermes 默认通知/);
+    assert.deepEqual(f.cards, []);
+  }
+  const f = await fixture(t, 1);
+  let release!: () => void; f.hold(new Promise(resolve => { release = resolve; }));
+  const sending = sendMessageToFeishu(f.message, { ...f.options, engine: 'hermes' });
+  await until(() => Object.keys(f.app.store.state.messageSends).length === 1);
+  f.app.store.saveBot('hermes-1', { allowedActors: [] });
+  release();
+  await assert.rejects(sending, /未确认/);
+  assert.deepEqual(f.cards, [], 'a claimed Hermes message must never be rerouted to Codex');
+});
+
+test('management API validates each default against its own engine and saves both atomically', async t => {
+  const f = await fixture(t, 2);
+  const state = await fetch(f.base + '/api/state').then(r => r.json()) as any;
+  assert.equal(state.notificationTargets.filter((item: any) => item.engine === 'hermes').length, 2);
+  const chosen = { chatId: conversationKey('hermes-2', 'oc_h2'), actorId: 'ou_h2', botAppId: 'cli_hermes2' };
+  const save = (body: unknown) => fetch(f.base + '/api/config', { method: 'PUT',
+    headers: { 'Content-Type': 'application/json', 'X-Bridge-Token': state.csrfToken }, body: JSON.stringify(body) });
+  assert.equal((await save({ hermesNotificationTarget: chosen })).status, 200);
+  assert.deepEqual(f.app.store.config.hermesNotificationTarget, chosen);
+  for (const patch of [
+    { hermesNotificationTarget: target },
+    { desktopNotificationTarget: chosen },
+    { desktopNotificationTarget: null, hermesNotificationTarget: { ...chosen, actorId: 'ou_unknown' } },
+    { hermesNotificationTarget: { ...chosen, extra: true } },
+  ]) {
+    assert.equal((await save(patch)).status, 400);
+    assert.deepEqual(f.app.store.config.desktopNotificationTarget, target);
+    assert.deepEqual(f.app.store.config.hermesNotificationTarget, chosen);
+  }
+  assert.equal((await save({ desktopNotificationTarget: null })).status, 200);
+  assert.deepEqual(f.app.store.config.hermesNotificationTarget, chosen);
+  assert.equal((await save({ hermesNotificationTarget: null })).status, 200);
+  assert.equal(new Store(f.app.store.dir).config.hermesNotificationTarget, null);
+});
+
+test('MCP source hints cannot inject an arbitrary recipient or an unsupported engine', async t => {
+  const f = await fixture(t, 1);
+  const { token } = await fetch(f.base + MESSAGE_CONNECTION_PATH).then(r => r.json()) as { token: string };
+  const response = await fetch(f.base + MESSAGE_SEND_PATH, { method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Feishu-Mcp-Token': token, 'X-Feishu-Mcp-Engine': 'other' },
+    body: JSON.stringify(f.message) });
+  assert.equal(response.status, 400);
+  await assert.rejects(sendMessageToFeishu({ ...f.message, engine: 'hermes' }, f.options), /只接受/);
+  assert.deepEqual(f.cards, []);
 });
