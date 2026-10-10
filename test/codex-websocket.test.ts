@@ -76,7 +76,7 @@ async function fixture(codexHome?: string, options: Partial<CodexClientOptions> 
       notify('turn/completed', { threadId, turn });
       notify('thread/status/changed', { threadId, status: { type: 'idle' } });
     },
-    client: new CodexClient({ websocketUrl: url, requestTimeoutMs: 2_000, idleTimeoutMs: 5_000, codexHome, ...options }),
+    client: new CodexClient({ websocketUrl: url, requestTimeoutMs: 2_000, idleTimeoutMs: 5_000, reconnectDelaysMs: [5, 10], codexHome, ...options }),
     async cleanup() {
       await fx.client.close();
       for (const socket of server.clients) socket.terminate();
@@ -383,15 +383,19 @@ test('definitively rejected ended turn may start once, changed active turn may n
   }finally{await fx.cleanup();}
  }
 });
-test('lost mutation response is uncertain with no replay or interruption',async()=>{
- const fx=await fixture();const states:string[]=[];
- fx.onStart=(socket,message)=>{fx.begin('thread',String(message.params!.clientUserMessageId));socket.terminate();};
+test('lost start acknowledgement recovers the exact client receipt without replay or interruption', async () => {
+ const fx=await fixture(); const states:string[]=[]; let turn!:Turn;
+ fx.onStart=(socket,message)=>{turn=fx.begin('thread',String(message.params!.clientUserMessageId));socket.terminate();};
+ fx.onResume=()=>{if(turn)setTimeout(()=>fx.complete('thread',turn,'recovered receipt'),40);return false;};
  try{
-  await assert.rejects(fx.client.run({cwd:process.cwd(),threadId:'thread',prompt:'a',onSubmitted:event=>states.push(event.status)}),/本机 Codex 连接已断开/);
-  assert.deepEqual(states,['submitting','uncertain']);assert.equal(fx.received.filter(row=>row.message.method==='turn/start').length,1);
+  const result=await fx.client.run({cwd:process.cwd(),threadId:'thread',prompt:'a',onSubmitted:event=>states.push(event.status)});
+  assert.equal(result.text,'recovered receipt'); assert.equal(result.turnId,turn.id);
+  assert.deepEqual(states,['submitting','uncertain','submitted']);
+  assert.equal(fx.received.filter(row=>row.message.method==='turn/start').length,1);
   assert.equal(fx.received.some(row=>row.message.method==='turn/interrupt'),false);
  }finally{await fx.cleanup();}
 });
+
 test('accepted start survives an empty rollout snapshot and retains approval ownership',async()=>{
  const fx=await fixture();const states:string[]=[];let approvals=0;let reads=0;
  fx.onRead=(socket,message)=>{reads++;fx.send(socket,{id:message.id,error:{code:-32000,message:'failed to read thread: thread-store internal error: failed to read session metadata rollout.jsonl: rollout at rollout.jsonl is empty'}});return true;};
@@ -549,7 +553,7 @@ test('shared URL is credential-free loopback only',()=>{
 });
 
 test('notification publisher stays pinned when a watcher joins and resets once on socket handover', async () => {
- const fx=await fixture();const started=deferred();let turn!:Turn;
+ const fx=await fixture(undefined, { reconnectDelaysMs: [] });const started=deferred();let turn!:Turn;
  fx.onStart=(socket,message)=>{turn=fx.begin('thread',String(message.params!.clientUserMessageId),'handover');fx.reply(socket,message,{turn});started.resolve();};
  const events:Array<{method:string;text?:string}>=[];
  fx.client.subscribe(event=>events.push({method:event.method,text:typeof event.params?.delta==='string'?event.params.delta:undefined}));
@@ -850,4 +854,71 @@ test('new shared channel threads avoid duplicate rules while preserving explicit
       }
     } finally { await fx.cleanup(); }
   });
+});
+
+
+test('transport loss before submission reconnects, rechecks the gate and submits once', async t => {
+ for (const phase of ['resume', 'state', 'initialize'] as const) await t.test(phase, async () => {
+  const fx=await fixture(); let dropped=false; let guarded=0;
+  if(phase==='initialize')fx.server.once('connection',socket=>socket.terminate());
+  if(phase==='resume')fx.onResume=socket=>{if(!dropped){dropped=true;socket.terminate();return true;}return false;};
+  if(phase==='state')fx.onRead=socket=>{if(!dropped){dropped=true;socket.terminate();return true;}return false;};
+  try {
+   assert.equal((await fx.client.run({cwd:process.cwd(),threadId:'thread',prompt:'once',onBeforeSubmit:()=>{guarded++;}})).text,'own final answer');
+   assert.equal(guarded,1);
+   assert.equal(fx.received.filter(row=>row.message.method==='turn/start').length,1);
+  }finally{await fx.cleanup();}
+ });
+});
+
+test('an accepted turn completed while disconnected is read back without replaying the prompt', async () => {
+ const fx=await fixture(); let turn!:Turn;
+ fx.onStart=async(socket,message)=>{
+  turn=fx.begin('thread',String(message.params!.clientUserMessageId),'original');
+  fx.reply(socket,message,{turn}); await pause(20); socket.terminate();
+  fx.complete('thread',turn,'completed offline');
+  // A newer turn must not be mistaken for the receipt belonging to this run.
+  const foreign=fx.begin('thread','other-client','unrelated');fx.complete('thread',foreign,'wrong answer');
+ };
+ try{
+  const result=await fx.client.run({cwd:process.cwd(),threadId:'thread',prompt:'once'});
+  assert.deepEqual(result,{threadId:'thread',turnId:'original',text:'completed offline'});
+  assert.equal(fx.received.filter(row=>row.message.method==='turn/start').length,1);
+ }finally{await fx.cleanup();}
+});
+
+test('a lost steer acknowledgement never treats a native turn as proof of message receipt', async () => {
+ const fx=await fixture(); const turn=fx.begin('thread','native','existing');const states:string[]=[];
+ fx.onSteer=socket=>{socket.terminate();fx.complete('thread',turn,'native answer');};
+ try{
+  await assert.rejects(fx.client.run({cwd:process.cwd(),threadId:'thread',prompt:'change',onSubmitted:event=>states.push(event.status)}),/无法确认原消息/);
+  assert.deepEqual(states,['submitting','uncertain']);
+  assert.deepEqual(fx.received.filter(row=>['turn/start','turn/steer','turn/interrupt'].includes(row.message.method??'')).map(row=>row.message.method),['turn/steer']);
+ }finally{await fx.cleanup();}
+});
+
+test('reconnect attempts are bounded and stop cancels backoff without late submission', async t => {
+ for(const cancel of [false,true])await t.test(cancel?'stop during backoff':'exhaustion',async()=>{
+  const fx=await fixture(undefined,{reconnectDelaysMs:cancel?[500]:[5,10]});let resumes=0;const dropped=deferred();
+  fx.onResume=socket=>{resumes++;socket.terminate();dropped.resolve();return true;};
+  try{
+   const pending=fx.client.run({cwd:process.cwd(),threadId:'thread',prompt:'never'});
+   const rejected=assert.rejects(pending,cancel?/已停止/:/连接已断开/);
+   if(cancel){await dropped.promise;await pause(25);await fx.client.stop('thread');}
+   await rejected;
+   assert.equal(resumes,cancel?1:3);
+   assert.equal(fx.received.some(row=>['turn/start','turn/steer'].includes(row.message.method??'')),false);
+  }finally{await fx.cleanup();}
+ });
+});
+
+test('recovery of a confirmed start keeps its approval ownership', async () => {
+ const fx=await fixture();let turn!:Turn;let approvals=0;
+ fx.onStart=async(socket,message)=>{turn=fx.begin('thread',String(message.params!.clientUserMessageId),'owned');fx.reply(socket,message,{turn});await pause(15);socket.terminate();};
+ fx.onResume=(socket)=>{if(turn)setTimeout(()=>{fx.send(socket,{id:'recovered-approval',method:'item/commandExecution/requestApproval',params:{threadId:'thread',turnId:turn.id,command:'test'}});},30);return false;};
+ try{
+  const pending=fx.client.run({cwd:process.cwd(),threadId:'thread',prompt:'once',onRequest:async()=>{approvals++;setTimeout(()=>fx.complete('thread',turn,'approved'),10);return{decision:'accept'};}});
+  assert.equal((await pending).text,'approved');assert.equal(approvals,1);
+  assert.equal(fx.received.filter(row=>row.message.method==='turn/start').length,1);
+ }finally{await fx.cleanup();}
 });

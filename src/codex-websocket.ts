@@ -6,6 +6,10 @@ export const IGNORE_SERVER_REQUEST = Symbol('ignore-unowned-server-request');
 export class CodexRpcError extends Error {
   constructor(message: string, readonly code?: number) { super(message); }
 }
+/** Only transport failures permit reconnecting; RPC rejections keep their original semantics. */
+export class CodexTransportError extends Error {
+  constructor(message: string, cause?: unknown) { super(message, { cause }); }
+}
 export interface CodexConnection {
   readonly shared: boolean;
   readonly exited: Promise<void>;
@@ -48,15 +52,15 @@ export class WebsocketCodexConnection implements CodexConnection {
     this.socket = new WebSocket(validateCodexWebsocketUrl(url), { handshakeTimeout: requestTimeoutMs, perMessageDeflate: false, maxPayload: 32 * 1024 * 1024 });
     this.opened = new Promise((resolve, reject) => {
       this.socket.once('open', resolve);
-      this.socket.once('error', () => reject(new Error('无法连接 Codex 服务，请在 Feishu Codex 中重试连接。')));
-      this.socket.once('close', () => reject(new Error('本机 Codex 连接已关闭')));
+      this.socket.once('error', error => reject(new CodexTransportError('无法连接 Codex 服务，请在 Feishu Codex 中重试连接。', error)));
+      this.socket.once('close', () => reject(new CodexTransportError('本机 Codex 连接已关闭')));
     });
     void this.opened.catch(() => undefined);
     this.exited = new Promise(resolve => this.socket.once('close', () => {
-      this.fail(new Error('本机 Codex 连接已断开。本轮不会自动重发，请检查会话记录后再决定是否重试。'));
+      this.fail(new CodexTransportError('本机 Codex 连接已断开。本轮不会自动重发，请检查会话记录后再决定是否重试。'));
       resolve();
     }));
-    this.socket.on('error', () => this.fail(new Error('Codex 连接失败，本轮消息不会自动重发；请检查会话记录。')));
+    this.socket.on('error', error => this.fail(new CodexTransportError('Codex 连接失败，本轮消息不会自动重发；请检查会话记录。', error)));
     this.socket.on('message', data => {
       let message: RpcMessage;
       try { message = JSON.parse(data.toString()) as RpcMessage; } catch { return; }
@@ -88,16 +92,16 @@ export class WebsocketCodexConnection implements CodexConnection {
   }
 
   request(method: string, params: RpcParams, timeoutMs = this.requestTimeoutMs): Promise<unknown> {
-    if (this.closed) return Promise.reject(new Error('本机 Codex 连接已关闭'));
+    if (this.closed) return Promise.reject(new CodexTransportError('本机 Codex 连接已关闭'));
     const id = ++this.sequence;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
-        reject(new Error(`本机 Codex 请求超时：${method}。未自动重发，请检查会话记录。`));
+        reject(new CodexTransportError(`本机 Codex 请求超时：${method}。未自动重发，请检查会话记录。`));
       }, timeoutMs);
       this.pending.set(id, { resolve, reject, timer });
       try { this.write({ id, method, params }); }
-      catch (error) { clearTimeout(timer); this.pending.delete(id); reject(error instanceof Error ? error : new Error(String(error))); }
+      catch (error) { clearTimeout(timer); this.pending.delete(id); reject(new CodexTransportError('Codex 消息写入连接失败。', error)); }
     });
   }
 

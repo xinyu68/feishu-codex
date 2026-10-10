@@ -8,7 +8,7 @@ import { randomUUID } from 'node:crypto';
 import { CHANNEL_INSTRUCTIONS, channelContextParameters } from './channel-context.js';
 import { readTurnTiming } from './turn-timing.js';
 import { isThreadInitializationRace, isThreadWriterConflict, THREAD_WRITER_MESSAGE } from './codex-errors.js';
-import { CodexRpcError, IGNORE_SERVER_REQUEST, WebsocketCodexConnection, validateCodexWebsocketUrl, type CodexConnection } from './codex-websocket.js';
+import { CodexTransportError, CodexRpcError, IGNORE_SERVER_REQUEST, WebsocketCodexConnection, validateCodexWebsocketUrl, type CodexConnection } from './codex-websocket.js';
 import { consultationAborted, consultationInstructions, declineConsultationRequest } from './runtime-consult.js';
 import { GROUP_CONSULT_MCP_TIMEOUT_SECONDS, GROUP_CONSULT_TOOL_NAME } from './group-consult-request.js';
 import type { CodexRunInput, CodexRuntime, CodexUsage, HistoryMessage, ModelInfo, RuntimeAnswer, RuntimeRequest, RuntimeConsultInput, RuntimeEvent, UsageLimit, UsageWindow } from './types.js';
@@ -21,6 +21,8 @@ export type CodexClientOptions = {
   codexHome?: string;
   websocketUrl?: string;
   requestTimeoutMs?: number;
+  /** Bounded transport recovery backoff; injectable for protocol tests. */
+  reconnectDelaysMs?: readonly number[];
   idleTimeoutMs?: number;
   /** A passive watcher must obey the same desktop ownership gate as a writer. */
   canWatch?: () => Promise<boolean>;
@@ -56,6 +58,7 @@ export class CodexClient implements CodexRuntime {
   private closed = false;
   private modelsCache?: { value: ModelInfo[]; until: number };
   private sharedRuns = new Set<SharedRun>();
+  private sharedRecoveries = new Set<SharedRecovery>();
   private submitLocks = new Map<string, Promise<void>>();
   private listeners = new Set<(event: RuntimeEvent) => void>();
   private publishers = new Map<string, CodexConnection>();
@@ -305,13 +308,31 @@ export class CodexClient implements CodexRuntime {
   }
 
   private async runShared(input: CodexRunInput): Promise<{ threadId: string; turnId: string; text: string; images?: string[] }> {
+    const recovery: SharedRecovery = { threadId: input.threadId, clientId: randomUUID(), stopped: false, attempted: false, acknowledged: false, mode: 'start', cancel: new AbortController() };
+    this.sharedRecoveries.add(recovery);
+    const delays = this.options.reconnectDelaysMs ?? [500, 1_000, 2_000, 4_000, 8_000];
+    try {
+      for (let attempt = 0; ; attempt++) {
+        if (recovery.stopped || this.closed) throw new Error('已停止当前任务');
+        try { return await this.runSharedAttempt(input, recovery); }
+        catch (error) {
+          if (recovery.stopped || this.closed) throw new Error('已停止当前任务');
+          if (!(error instanceof CodexTransportError) || recovery.creatingThread || delays[attempt] === undefined) throw error;
+          recovery.failure = error;
+          await waitForSharedReconnect(delays[attempt]!, recovery.cancel.signal);
+        }
+      }
+    } finally { this.sharedRecoveries.delete(recovery); }
+  }
+
+  private async runSharedAttempt(input: CodexRunInput, recovery: SharedRecovery): Promise<{ threadId: string; turnId: string; text: string; images?: string[] }> {
     const connection = this.connect(input.cwd);
     const tracker = new TurnTracker(input, this.options.idleTimeoutMs ?? 15 * 60_000, true);
     let resolveOwnership!: () => void;
     const ownershipReady = new Promise<void>(resolve => { resolveOwnership = resolve; });
-    const run: SharedRun = { connection, tracker, threadId: input.threadId, stopped: false, ownsTurn: false, clientId: randomUUID(), ownershipReady, resolveOwnership };
+    const run: SharedRun = { connection, tracker, threadId: recovery.threadId, stopped: false, ownsTurn: false, clientId: recovery.clientId, ownershipReady, resolveOwnership };
     this.sharedRuns.add(run);
-    let currentMode: 'start' | 'steer' = 'start';
+    let currentMode: 'start' | 'steer' = recovery.mode;
     let mutationPending = false;
     const checkingInterruptions = new Set<string>();
     const observeTurn = (method: string, params: RecordValue) => {
@@ -356,7 +377,8 @@ export class CodexClient implements CodexRuntime {
       await connection.initialize();
       const channelContext = channelContextParameters(connection.initialized, input.channel !== undefined);
       const compactChannelHeader = Boolean(channelContext.additionalContext);
-      const response = input.threadId
+      recovery.creatingThread = !recovery.threadId;
+      const response = recovery.threadId
         ? await (async () => {
           // thread/start can return before the new rollout is readable by a
           // second connection. Retry only this read, never turn/start or steer.
@@ -364,8 +386,8 @@ export class CodexClient implements CodexRuntime {
             if (run.stopped) throw new Error('已停止当前任务');
             try {
               return record(await connection.request('thread/resume', {
-                threadId: input.threadId, excludeTurns: true,
-                ...threadInstructionOverrides(input, compactChannelHeader),
+                threadId: recovery.threadId, excludeTurns: true,
+                ...(!recovery.attempted ? threadInstructionOverrides(input, compactChannelHeader) : {}),
               }));
             } catch (error) {
               if (!(error instanceof CodexRpcError) || !isThreadInitializationRace(error.message)) throw error;
@@ -384,8 +406,36 @@ export class CodexClient implements CodexRuntime {
       if (!threadId) throw new Error('Codex 没有返回会话编号');
       run.threadId = threadId;
       tracker.threadId = threadId;
-      input.onThread?.(threadId);
-      const generatedBefore = await generatedImageSnapshot(this.options.codexHome, threadId);
+      if (!recovery.bound) { input.onThread?.(threadId); recovery.bound = true; }
+      recovery.threadId = threadId;
+      recovery.creatingThread = false;
+      const generatedBefore = recovery.generatedBefore ??= await generatedImageSnapshot(this.options.codexHome, threadId);
+      if (recovery.attempted) {
+        // Reconnect only to the receipt's exact turn. Never repeat a start or steer,
+        // or adopt another client's latest turn based on time or matching text.
+        const turns = await readRecentSharedTurns(connection, threadId);
+        const received = recovery.acknowledged
+          ? turns.find(turn => string(turn.id) === recovery.turnId)
+          : recovery.mode === 'start' ? turns.find(turn => array(turn.items).some(value => {
+              const item = record(value);
+              return item.type === 'userMessage' && item.clientId === recovery.clientId;
+            })) : undefined;
+        if (!received || !string(received.id)) throw new Error(
+          (recovery.failure?.message ?? 'Codex 连接已断开。') + ' 无法确认原消息的接收状态，不会自动重发，请查看会话记录。');
+        run.turnId = recovery.turnId = string(received.id);
+        run.ownsTurn = recovery.mode === 'start';
+        run.resolveOwnership();
+        tracker.setTurn(run.turnId);
+        if (!recovery.acknowledged) input.onSubmitted?.({ threadId, turnId: run.turnId, mode: recovery.mode, status: 'submitted' });
+        recovery.acknowledged = true;
+        if (['completed', 'failed', 'interrupted'].includes(string(received.status))) observeTurn('turn/completed', { threadId, turn: received });
+        else for (const item of array(received.items).map(record)) {
+          if (item.type === 'mcpToolCall' && item.status === 'inProgress') tracker.notification('item/started', { threadId, turnId: run.turnId, item });
+        }
+        const text = await tracker.result;
+        const images = await newGeneratedImages(this.options.codexHome, threadId, generatedBefore);
+        return images.length ? { threadId, turnId: run.turnId, text, images } : { threadId, turnId: run.turnId, text };
+      }
       run.submitting = this.serializeSubmission(threadId, async () => {
         if (run.stopped) throw new Error('已停止当前任务');
         // A newly created thread has no turn or persisted rollout yet.
@@ -403,6 +453,9 @@ export class CodexClient implements CodexRuntime {
           const expectedTurnId = string(turn?.id);
           input.onSubmitted?.({ threadId, turnId: expectedTurnId || undefined, mode: currentMode, status: 'submitting' });
           mutationPending = true;
+          recovery.attempted = true;
+          recovery.mode = currentMode;
+          recovery.acknowledged = false;
           const result = record(await connection.request(turn ? 'turn/steer' : 'turn/start', turn
             ? { threadId, expectedTurnId, input: content, ...channelContext }
             : { threadId, cwd: input.cwd, input: content, ...channelContext, approvalPolicy: 'never', sandboxPolicy: { type: 'dangerFullAccess' }, clientUserMessageId: run.clientId,
@@ -414,7 +467,8 @@ export class CodexClient implements CodexRuntime {
             input.onSubmitted?.({ threadId, mode: currentMode, status: 'uncertain' });
             throw new Error('消息可能已被 Codex 接收，但未返回任务编号；不会自动重发，请检查会话记录。');
           }
-          run.turnId = turnId;
+          run.turnId = recovery.turnId = turnId;
+          recovery.acknowledged = true;
           // A successful turn/start response identifies a turn created by this
           // run even when the returned snapshot has not been populated yet.
           // Steering joins an existing native turn and must never claim it.
@@ -431,6 +485,7 @@ export class CodexClient implements CodexRuntime {
           // disconnected sockets and arbitrary RPC failures never replay a prompt.
           if (current && error instanceof CodexRpcError && /no active turn|not active|turn.*(?:completed|finished)|expected.*turn.*(?:mismatch|does not match)/i.test(error.message)) {
             mutationPending = false;
+            recovery.attempted = false;
             input.onSubmitted?.({ threadId, turnId: string(current.id), mode: 'steer', status: 'rejected' });
             current = await currentSharedTurn(connection, threadId);
             if (current) throw new Error('当前任务已经变化，补充消息未发送，请检查会话后重试。');
@@ -476,6 +531,7 @@ export class CodexClient implements CodexRuntime {
 
   async stop(threadId: string): Promise<void> {
     if (this.options.websocketUrl) {
+      for (const recovery of this.sharedRecoveries) if (recovery.threadId === threadId) { recovery.stopped = true; recovery.cancel.abort(); }
       const matching = [...this.sharedRuns].filter(run => run.threadId === threadId);
       for (const run of matching) run.stopped = true;
       await Promise.allSettled(matching.map(run => run.submitting));
@@ -586,6 +642,7 @@ export class CodexClient implements CodexRuntime {
 
   async close(): Promise<void> {
     this.closed = true;
+    for (const recovery of this.sharedRecoveries) { recovery.stopped = true; recovery.cancel.abort(); }
     if (this.loadedWatchTimer) clearInterval(this.loadedWatchTimer);
     for (const watcher of this.watchers.values()) if (watcher.retry) clearTimeout(watcher.retry);
     this.watchers.clear();
@@ -735,6 +792,21 @@ type ActiveRun = {
   connection: CodexConnection; threadId?: string; turnId?: string; stopRequested: boolean;
   cancel: AbortController; submitted: boolean; starting?: Promise<string>; stopping?: Promise<void>;
 };
+
+type SharedRecovery = {
+  threadId?: string; turnId?: string; clientId: string; stopped: boolean; attempted: boolean;
+  acknowledged: boolean; mode: 'start' | 'steer'; cancel: AbortController; failure?: Error;
+  creatingThread?: boolean; bound?: boolean; generatedBefore?: Map<string, GeneratedImageStamp>;
+};
+
+function waitForSharedReconnect(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const cancel = () => { clearTimeout(timer); signal.removeEventListener('abort', cancel); reject(new Error('已停止当前任务')); };
+    const timer = setTimeout(() => { signal.removeEventListener('abort', cancel); resolve(); }, ms);
+    signal.addEventListener('abort', cancel, { once: true });
+    if (signal.aborted) cancel();
+  });
+}
 
 type SharedRun = {
   connection: CodexConnection; tracker: TurnTracker; threadId?: string; turnId?: string;
