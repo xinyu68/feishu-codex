@@ -53,9 +53,11 @@ class InspectorWorker {
   constructor(script) {
     this.script = script;
     this.pending = new Map();
+    this.queue = [];
+    this.active = null;
     this.stderr = '';
     this.failed = false;
-    this.child = spawn(powershell, ['-NoLogo', '-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', script, '-Server'], {
+    this.child = spawn(powershell, ['-NoLogo', '-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', script, '-Server', '-ProgressOutput'], {
       windowsHide: true, env: canonicalEnvironment(process.env), stdio: ['pipe', 'pipe', 'pipe'],
     });
     this.child.unref();
@@ -78,9 +80,12 @@ class InspectorWorker {
     catch { this.fail(new Error('Windows 检查进程返回了无效数据。')); return; }
     const request = this.pending.get(String(response.id));
     if (!request) return;
+    if (response.stage) { request.stage = response.stage; return; }
     this.pending.delete(String(response.id)); clearTimeout(request.timer);
+    this.active = null;
     if (response.ok && response.result) request.resolve(response.result);
     else request.reject(new Error(response.error || 'Windows 检查失败。'));
+    this.pump();
   }
 
   fail(error) {
@@ -88,7 +93,7 @@ class InspectorWorker {
     this.failed = true;
     if (inspectorWorkers.get(this.script) === this) inspectorWorkers.delete(this.script);
     for (const request of this.pending.values()) { clearTimeout(request.timer); request.reject(error); }
-    this.pending.clear(); this.lines.close();
+    this.pending.clear(); this.queue = []; this.active = null; this.lines.close();
     if (this.child.exitCode === null && this.child.signalCode === null) this.child.kill();
   }
 
@@ -97,23 +102,34 @@ class InspectorWorker {
     if (this.failed) throw new Error('Windows 检查进程不可用。');
     const id = String(++inspectorRequestId);
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => this.fail(new Error('Windows 检查超时。')), timeout);
-      this.pending.set(id, { resolve, reject, timer });
-      this.child.stdin.write(`${JSON.stringify({ id, ports: ports.join(','), processIds: processIds.join(',') })}\n`, error => {
-        if (error) this.fail(error);
-      });
+      this.pending.set(id, { resolve, reject, timeout, stage: 'startup', payload: { id, ports: ports.join(','), processIds: processIds.join(',') } });
+      this.queue.push(id);
+      this.pump();
     });
+  }
+
+  pump() {
+    if (this.failed || this.active || !this.queue.length) return;
+    const id = this.queue.shift(), request = this.pending.get(id);
+    this.active = id;
+    // The PowerShell worker is serial. A queued check must receive its own
+    // timeout instead of consuming its deadline behind another inspection.
+    request.timer = setTimeout(() => {
+      const stage = { startup: '启动检测', processes: '进程身份', connections: '端口连接', binaries: '运行文件' }[request.stage] || request.stage;
+      this.fail(new Error(`Windows 检查超时（${stage}）。请稍后重试，未停止 Codex 或服务。`));
+    }, request.timeout);
+    this.child.stdin.write(`${JSON.stringify(request.payload)}\n`, error => { if (error) this.fail(error); });
   }
 
   close() { this.fail(new Error('Windows 检查进程已关闭。')); }
 }
 
-export async function inspectWindows(root, ports, processIds = []) {
+export async function inspectWindows(root, ports, processIds = [], { timeout = 20_000 } = {}) {
   const ids = processIds.filter(value => Number.isInteger(value) && value > 0);
   const script = path.join(root, 'scripts', 'desktop-inspect.ps1');
   let worker = inspectorWorkers.get(script);
   if (!worker || worker.failed) { worker = new InspectorWorker(script); inspectorWorkers.set(script, worker); }
-  return worker.request(ports, ids);
+  return worker.request(ports, ids, timeout);
 }
 
 export function closeWindowsInspectors() {

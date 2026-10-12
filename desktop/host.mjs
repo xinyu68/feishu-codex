@@ -400,7 +400,18 @@ export async function startHost(options = {}) {
       await log('用户确认后已关闭独立 Codex 及其任务后台，正在连接飞书。');
       stopping = false;
       return await openCodex({ accountVerified: true });
-    } finally { stopping = false; await checkWrite(); await publish(); }
+    } finally {
+      stopping = false;
+      try { await checkWrite(); await publish(); }
+      catch (error) {
+        // Preserve the switch error if Windows is still settling. The next
+        // heartbeat will refresh topology; never leave writes enabled from a
+        // stale snapshot and never restart/kill a desktop to recover a check.
+        desktop = { mode: 'unknown', pids: [], reason: '暂时无法确认 Codex 状态，正在重新检查；可稍后重试连接。' };
+        await publish();
+        await log(`切换后状态复核失败，将自动重新检查：${error.message}`);
+      }
+    }
   }
 
   async function shutdown({ closeDesktop = false, uninstall = false } = {}) {

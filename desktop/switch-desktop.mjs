@@ -10,7 +10,8 @@ export function independentDesktop(snapshot, sharedPort, launched) {
   return { pid: root.pid, exe: root.exe, startedAt: root.startedAt };
 }
 
-export async function stopIndependentDesktop({ inspect, expected, sharedPort, launched, requestClose, terminate }) {
+export async function stopIndependentDesktop({ inspect, expected, sharedPort, launched, requestClose, terminate,
+  settleMs = 3_000, now = () => performance.now(), sleep = ms => new Promise(resolve => setTimeout(resolve, ms)) }) {
   const before = await inspect();
   const root = independentDesktop(before, sharedPort, launched);
   if (!sameProcess(expected, root)) throw new Error('Codex 已重新打开或运行方式已变化，请重新点击“连接飞书”并确认。');
@@ -31,8 +32,18 @@ export async function stopIndependentDesktop({ inspect, expected, sharedPort, la
   await requestClose(root);
   await terminate(root);
   for (const backend of backends) await terminate({ pid: backend.pid, exe: backend.exe, startedAt: backend.startedAt });
-  const after = await inspect();
-  if (after.unknownDesktop || after.desktopRoots.length || after.processes.some(item => backends.some(backend => sameProcess(backend, item)))) {
-    throw new Error('Codex 尚未完全退出或有新窗口打开，请重试连接。');
+  const deadline = now() + settleMs;
+  for (;;) {
+    const after = await inspect();
+    if (after.unknownDesktop) throw new Error('暂时无法确认 Codex 是否已退出，请重试连接；未启动第二个窗口。');
+    if (after.desktopRoots.some(item => !sameProcess(expected, item))) {
+      throw new Error('检测到新打开的 Codex，请重新点击“连接飞书”并确认；未关闭新窗口。');
+    }
+    const remaining = after.desktopRoots.length || after.processes.some(item => backends.some(backend => sameProcess(backend, item)));
+    if (!remaining) return;
+    if (now() >= deadline) throw new Error('Codex 尚未完全退出，请稍后重试连接；未启动第二个窗口。');
+    // Windows can briefly retain terminated processes. Recheck their captured
+    // identities without sending another close/kill request to a reused PID.
+    await sleep(Math.min(200, Math.max(0, deadline - now())));
   }
 }

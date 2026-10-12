@@ -5,12 +5,64 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
+import net from 'node:net';
 import { fileURLToPath } from 'node:url';
 import { canonicalEnvironment } from '../desktop/lifecycle.mjs';
 import { captureProcessTree, closeWindowVerified, closeWindowsInspectors, inspectWindows, powershell, runWindowlessScript, stopVerified } from '../desktop/windows.mjs';
 
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 after(closeWindowsInspectors);
+
+test('native TCP inspection retains listener and established ownership in both address families', { skip: process.platform !== 'win32', timeout: 25_000 }, async () => {
+  for (const address of ['127.0.0.1', '::1']) {
+    const sockets = [];
+    const server = net.createServer(socket => sockets.push(socket));
+    let client;
+    try {
+      await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, address, resolve); });
+      const port = server.address().port;
+      client = net.connect({ host: address, port });
+      await once(client, 'connect');
+      const snapshot = await inspectWindows(root, [port], [process.pid]);
+      const listener = snapshot.connections.find(row => row.state === 'Listen' && row.localPort === port && row.pid === process.pid);
+      assert.equal(listener?.localAddress, address);
+      assert.ok(snapshot.connections.some(row => row.remotePort === port && row.pid === process.pid && row.state === 'Established'));
+      assert.ok(snapshot.connections.every(row => row.localPort === port || row.remotePort === port));
+    } finally {
+      client?.destroy(); for (const socket of sockets) socket.destroy();
+      await new Promise(resolve => server.close(resolve));
+    }
+  }
+});
+
+test('queued Windows checks get individual deadlines and timed out workers recover', { skip: process.platform !== 'win32', timeout: 30_000 }, async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'feishu-inspector-queue-'));
+  const script = path.join(directory, 'scripts/desktop-inspect.ps1');
+  await fs.mkdir(path.dirname(script));
+  const fixture = delay => `param([switch]$Server, [switch]$ProgressOutput)
+while ($null -ne ($line = [Console]::In.ReadLine())) {
+  $r = $line | ConvertFrom-Json
+  [Console]::Out.WriteLine((@{id=$r.id;stage='processes'} | ConvertTo-Json -Compress))
+  [Console]::Out.Flush()
+  Start-Sleep -Milliseconds ${delay}
+  [Console]::Out.WriteLine((@{id=$r.id;ok=$true;result=@{processes=@();connections=@()}} | ConvertTo-Json -Depth 5 -Compress))
+  [Console]::Out.Flush()
+}`;
+  try {
+    // Warm up the worker separately so startup load cannot affect this check.
+    await fs.writeFile(script, fixture(1100));
+    await inspectWindows(directory, [18792]);
+    await Promise.all(Array.from({ length: 4 }, () => inspectWindows(directory, [18792], [], { timeout: 2500 })));
+    closeWindowsInspectors();
+    await fs.writeFile(script, fixture(10000));
+    await assert.rejects(inspectWindows(directory, [18792], [], { timeout: 3000 }), /Windows 检查超时.*进程身份/);
+    await fs.writeFile(script, fixture(0));
+    assert.ok((await inspectWindows(directory, [18792])).connections);
+  } finally {
+    closeWindowsInspectors();
+    await fs.unlink(script); await fs.rmdir(path.dirname(script)); await fs.rmdir(directory);
+  }
+});
 
 test('a verified exited service with a lingering Windows listener can finish cleanup without touching another process', { skip: process.platform !== 'win32', timeout: 40_000 }, async () => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'feishu-lingering-port-test-'));

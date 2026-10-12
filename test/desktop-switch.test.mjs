@@ -47,7 +47,38 @@ test('unknown and shared desktops are never selected for independent termination
 test('an unexpected window during termination prevents a successful switch', async () => {
   const f = fixture(); const stop = f.options.terminate;
   f.options.terminate = async identity => { await stop(identity); if (identity.pid === 12) f.replace([{ ...root, startedAt: 'new' }, shared]); };
-  await assert.rejects(stopIndependentDesktop(f.options), /有新窗口打开/);
+  await assert.rejects(stopIndependentDesktop(f.options), /新打开的 Codex/);
+});
+
+test('a briefly retained exited identity is rechecked without terminating it twice', async () => {
+  const f = fixture();
+  const inspect = f.options.inspect;
+  let reads = 0, time = 0;
+  f.options.inspect = async () => {
+    const snapshot = await inspect();
+    if (++reads === 2) return { ...snapshot, processes: [root, backend, shared], desktopRoots: [root] };
+    return snapshot;
+  };
+  await stopIndependentDesktop({ ...f.options, now: () => time, sleep: async ms => { time += ms; } });
+  assert.equal(reads, 3);
+  assert.deepEqual(f.calls, ['close:10', 'stop:10', 'stop:12']);
+});
+
+test('exit settling is bounded and a new desktop is never stopped during recovery', async () => {
+  const f = fixture();
+  let time = 0;
+  f.options.terminate = async identity => { f.calls.push(`stop:${identity.pid}`); };
+  await assert.rejects(stopIndependentDesktop({ ...f.options, settleMs: 500, now: () => time, sleep: async ms => { time += ms; } }), /尚未完全退出/);
+  assert.equal(time, 500);
+  assert.deepEqual(f.calls, ['close:10', 'stop:10', 'stop:12']);
+  const g = fixture();
+  let reads = 0;
+  const inspect = g.options.inspect;
+  g.options.inspect = async () => ++reads === 3
+    ? { processes: [{ ...root, startedAt: 'new' }, shared], desktopRoots: [{ ...root, startedAt: 'new' }], connections: [], unknownDesktop: false }
+    : reads === 2 ? { processes: [backend, shared], desktopRoots: [], connections: [], unknownDesktop: false } : inspect();
+  await assert.rejects(stopIndependentDesktop({ ...g.options, sleep: async () => {} }), /未关闭新窗口/);
+  assert.deepEqual(g.calls, ['close:10', 'stop:10', 'stop:12']);
 });
 
 test('Windows switch removes only its isolated desktop and orphaned backend processes', { skip: process.platform !== 'win32', timeout: 30_000 }, async () => {
