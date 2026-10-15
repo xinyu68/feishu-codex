@@ -1,4 +1,4 @@
-import type { CodexRuntime, CodexRunInput, RuntimeConsultInput, RuntimeEvent } from './types.js';
+import type { CodexRuntime, CodexRunInput, DesktopRuntimeRequest, RuntimeAnswer, RuntimeConsultInput, RuntimeEvent } from './types.js';
 
 export const isHermesThread = (threadId: string): boolean => threadId.startsWith('hermes:');
 
@@ -24,6 +24,9 @@ export class RuntimeRouter implements CodexRuntime {
     return () => { for (const stop of unsubscribe) stop(); };
   }
   async watchLoaded() { await this.codex.watchLoaded?.(); }
+  subscribeDesktopRequests(listener: (request: DesktopRuntimeRequest) => Promise<RuntimeAnswer | undefined>) {
+    return this.codex.subscribeDesktopRequests?.(listener) ?? (() => {});
+  }
   async watch(id: string) { await this.forThread(id).watch?.(id); }
   async unwatch(id: string) { await this.forThread(id).unwatch?.(id); }
   stop(id: string) { return this.forThread(id).stop(id); }

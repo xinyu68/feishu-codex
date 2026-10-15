@@ -10,6 +10,8 @@ export type BridgeConfig = {
   appId: string; appSecret: string; enabled: boolean; allowedActors: string[];
   defaultWorkspace: string; model: string; effort: string; progress: boolean; autoNotifyDesktop: boolean;
   desktopNotificationMode: 'all' | 'long'; desktopNotificationMinMinutes: number;
+  notifyDesktopRequests?: boolean;
+  notifyConnectionIssues?: boolean;
   botName?: string; roleInstructions?: string; privateRoleInstructions?: string; allowedGroups?: string[]; bots?: BotProfile[];
   includeGroupContext?: boolean;
   desktopNotificationTarget?: DesktopNotificationTarget | null;
@@ -68,6 +70,8 @@ export type RuntimeRequest = {
   questions?: CodexQuestion[];
 };
 export type RuntimeAnswer = { decision?: 'accept' | 'decline'; answers?: Record<string, { answers: string[] }> };
+export type RuntimeRequestContext = { signal: AbortSignal; cancel: (reason?: string) => void };
+export type DesktopRuntimeRequest = RuntimeRequestContext & { threadId: string; turnId?: string; request: RuntimeRequest };
 export type CodexRunInput = {
   cwd: string; threadId?: string; prompt: string; images?: string[]; model?: string; effort?: string;
   roleInstructions?: string;
@@ -78,7 +82,7 @@ export type CodexRunInput = {
   onThread?: (id: string) => void;
   /** Completed Codex commentary only; transport acknowledgements are not task progress. */
   onProgress?: (text: string) => void;
-  onRequest?: (request: RuntimeRequest) => Promise<RuntimeAnswer>;
+  onRequest?: (request: RuntimeRequest, context?: RuntimeRequestContext) => Promise<RuntimeAnswer>;
   onSubmitted?: (event: { threadId: string; turnId?: string; mode: 'start' | 'steer'; status: 'submitting' | 'submitted' | 'uncertain' | 'rejected' }) => void;
   onBeforeSubmit?: () => void | Promise<void>;
   /** Resolve incremental background inside the runtime submission lock. */
@@ -117,6 +121,7 @@ export interface CodexRuntime {
   /** A separate delegated task session; never resumes an ordinary chat. */
   consult?(input: RuntimeConsultInput): Promise<{ threadId: string; text: string }>;
   subscribe?(listener: (event: RuntimeEvent) => void): () => void;
+  subscribeDesktopRequests?(listener: (request: DesktopRuntimeRequest) => Promise<RuntimeAnswer | undefined>): () => void;
   watch?(threadId: string): Promise<void>;
   watchLoaded?(): Promise<void>;
   unwatch?(threadId: string): Promise<void>;

@@ -6,6 +6,7 @@ import type { ArtifactDelivery, BotProfile, BridgeConfig, ChatMessage, Completio
 import { conversationKey, DEFAULT_BOT_ID, parseRoute } from './routing.js';
 import { normalizeGroupWorkspace, planGroupContext, type GroupContextPlan } from './group-context.js';
 import type { MessageDelivery } from './message-request.js';
+import type { ConnectionIncident } from './connection-alerts.js';
 
 type PendingActor = { actorId: string; chatId: string; botId?: string; lastSeenAt: string };
 type PendingGroup = { botId: string; chatId: string; actorId: string; lastSeenAt: string; title?: string };
@@ -15,6 +16,7 @@ type GroupActorIdentity = {
   messageIds: string[]; updatedAt: string;
 };
 type SavedState = {
+  connectionIncident?: ConnectionIncident;
   version: 1; conversations: Record<string, Conversation>; history: Record<string, ChatMessage[]>;
   pendingActors: PendingActor[]; seen: Record<string, number>; logs: LogEntry[];
   totalTurns: number; dailyMessages: Record<string, number>;
@@ -47,7 +49,8 @@ export class Store {
     this.config = readJson(path.join(dir, 'config.json'), {
       appId: '', appSecret: '', enabled: false, allowedActors: [],
       defaultWorkspace: process.cwd(), model: '', effort: '', progress: true, autoNotifyDesktop: true,
-      desktopNotificationMode: 'long', desktopNotificationMinMinutes: 1, includeGroupContext: true, privateRoleInstructions: ''
+      desktopNotificationMode: 'long', desktopNotificationMinMinutes: 1, includeGroupContext: true, privateRoleInstructions: '',
+      notifyDesktopRequests: true, notifyConnectionIssues: true
     } satisfies BridgeConfig);
     this.state = readJson(path.join(dir, 'state.json'), {
       version: 1, conversations: {}, history: {}, pendingActors: [], seen: {},

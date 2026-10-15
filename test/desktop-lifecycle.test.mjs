@@ -105,7 +105,7 @@ test('runtime quit probe reads every loaded task without resuming or sending pro
     else if (message.method === 'thread/read') reply({ thread: { id: message.params.threadId, status: { type: message.params.threadId === 'one' ? 'active' : 'idle' }, turns: [] } });
     else assert.fail(`unexpected write method ${message.method}`);
   });
-  try { assert.deepEqual(await runtimeProbe(fx.url, { idle: true }), { ready: true, active: 1 }); assert.equal(methods.filter(method => method === 'thread/read').length, 3); }
+  try { assert.deepEqual(await runtimeProbe(fx.url, { idle: true }), { ready: true, active: 1 }); assert.equal(methods.filter(method => method === 'thread/read').length, 4); }
   finally { await fx.close(); }
 });
 
@@ -149,8 +149,8 @@ test('summary idle with an accepted in-progress turn is never safe to shut down'
       methods.push(message.method);
       if (message.method === 'initialize') reply({});
       else if (message.method === 'thread/loaded/list') reply({ data: ['one'], nextCursor: null });
-      else if (message.method === 'thread/turns/list') reply({ data: [{ id: 'turn', status: 'inProgress' }] });
-      else reply({ thread: { id: 'one', status: { type: 'idle' }, historyMode: paginated ? 'paginated' : 'default', turns: [{ id: 'turn', status: 'inProgress' }] } });
+      else if (message.method === 'thread/turns/list') reply({ data: [{ id: 'turn', status: 'inProgress', startedAt: Math.floor(Date.now() / 1000) }] });
+      else reply({ thread: { id: 'one', status: { type: 'idle' }, historyMode: paginated ? 'paginated' : 'default', turns: [{ id: 'turn', status: 'inProgress', startedAt: Math.floor(Date.now() / 1000) }] } });
     });
     try {
       assert.deepEqual(await runtimeProbe(fx.url, { idle: true }), { ready: true, active: 1 });
@@ -173,7 +173,7 @@ test('old in-progress history does not block an idle live thread', async () => {
           turns: [{ id: 'old', status: 'inProgress', startedAt: Math.floor(Date.now() / 1000) - 600 }] } });
       }
     });
-    try { assert.deepEqual(await runtimeProbe(fx.url, { idle: true }), { ready: true, active: 0 }); assert.equal(reads, paginated ? 2 : 3); }
+    try { assert.deepEqual(await runtimeProbe(fx.url, { idle: true }), { ready: true, active: 0 }); assert.equal(reads, paginated ? 2 : 4); }
     finally { await fx.close(); }
   }
 });

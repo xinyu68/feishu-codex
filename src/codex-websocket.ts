@@ -1,4 +1,5 @@
 import WebSocket from 'ws';
+import type { RuntimeRequestContext } from './types.js';
 
 export type RpcParams = Record<string, unknown>;
 export type RpcMessage = { id?: string | number; method?: string; params?: RpcParams; result?: unknown; error?: { message?: string; code?: number } };
@@ -17,7 +18,7 @@ export interface CodexConnection {
   initialized: RpcParams;
   onNotification?: (method: string, params: RpcParams) => void;
   onFailure?: (error: Error) => void;
-  onRequest?: (method: string, params: RpcParams) => Promise<unknown>;
+  onRequest?: (method: string, params: RpcParams, context?: RuntimeRequestContext & { id: string | number }) => Promise<unknown>;
   initialize(): Promise<void>;
   request(method: string, params: RpcParams, timeoutMs?: number): Promise<unknown>;
   close(): Promise<void>;
@@ -40,13 +41,14 @@ export class WebsocketCodexConnection implements CodexConnection {
   initialized: RpcParams = {};
   onNotification?: (method: string, params: RpcParams) => void;
   onFailure?: (error: Error) => void;
-  onRequest?: (method: string, params: RpcParams) => Promise<unknown>;
+  onRequest?: CodexConnection['onRequest'];
   private readonly socket: WebSocket;
   private readonly opened: Promise<void>;
   private closed = false;
   private closing?: Promise<void>;
   private sequence = 0;
   private readonly pending = new Map<number, { resolve: (value: unknown) => void; reject: (error: Error) => void; timer: NodeJS.Timeout }>();
+  private readonly serverRequests = new Map<string, { controller: AbortController; params: RpcParams }>();
 
   constructor(url: string, private readonly requestTimeoutMs = 45_000) {
     this.socket = new WebSocket(validateCodexWebsocketUrl(url), { handshakeTimeout: requestTimeoutMs, perMessageDeflate: false, maxPayload: 32 * 1024 * 1024 });
@@ -66,6 +68,14 @@ export class WebsocketCodexConnection implements CodexConnection {
       try { message = JSON.parse(data.toString()) as RpcMessage; } catch { return; }
       if (!message || typeof message !== 'object') return;
       if (typeof message.method === 'string') {
+        if (message.method === 'serverRequest/resolved') {
+          const id = message.params?.requestId;
+          const entry = this.serverRequests.get(`${typeof id}:${String(id)}`);
+          if (entry && entry.params.threadId === message.params?.threadId) entry.controller.abort('已在其他入口处理或任务已结束');
+        } else if (message.method === 'turn/completed') {
+          for (const entry of this.serverRequests.values()) if (entry.params.threadId === message.params?.threadId
+            && (!entry.params.turnId || entry.params.turnId === asRecord(message.params?.turn).id)) entry.controller.abort('任务已结束，请求已失效');
+        }
         if (message.id !== undefined) void this.serverRequest(message);
         else this.onNotification?.(message.method, asRecord(message.params));
         return;
@@ -128,21 +138,28 @@ export class WebsocketCodexConnection implements CodexConnection {
   private fail(error: Error): void {
     if (this.closed) return;
     this.closed = true;
+    for (const entry of this.serverRequests.values()) entry.controller.abort('连接已中断，请在 Codex 中确认');
+    this.serverRequests.clear();
     for (const pending of this.pending.values()) { clearTimeout(pending.timer); pending.reject(error); }
     this.pending.clear();
     this.onFailure?.(error);
   }
 
   private async serverRequest(message: RpcMessage): Promise<void> {
+    const key = `${typeof message.id}:${String(message.id)}`;
+    if (this.serverRequests.has(key)) return;
+    const controller = new AbortController();
+    this.serverRequests.set(key, { controller, params: asRecord(message.params) });
     try {
       // Unrelated requests can be broadcast to other subscribed clients. Do not approve,
       // decline or send errors for them; only the run that owns the turn may answer.
       const result = message.method === 'currentTime/read' ? { currentTimeAt: Math.floor(Date.now() / 1_000) }
-        : this.onRequest ? await this.onRequest(message.method!, asRecord(message.params)) : IGNORE_SERVER_REQUEST;
-      if (!this.closed && result !== IGNORE_SERVER_REQUEST) this.write({ id: message.id, result });
+        : this.onRequest ? await this.onRequest(message.method!, asRecord(message.params), { id: message.id!, signal: controller.signal,
+          cancel: reason => controller.abort(reason || '请求已失效') }) : IGNORE_SERVER_REQUEST;
+      if (!this.closed && !controller.signal.aborted && result !== IGNORE_SERVER_REQUEST) this.write({ id: message.id, result });
     } catch (error) {
-      if (!this.closed && this.socket.readyState === WebSocket.OPEN) this.write({ id: message.id, error: { code: -32603, message: error instanceof Error ? error.message : String(error) } });
-    }
+      if (!this.closed && !controller.signal.aborted && this.socket.readyState === WebSocket.OPEN) this.write({ id: message.id, error: { code: -32603, message: error instanceof Error ? error.message : String(error) } });
+    } finally { this.serverRequests.delete(key); }
   }
 }
 

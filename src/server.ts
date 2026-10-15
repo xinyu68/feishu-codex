@@ -81,6 +81,9 @@ export async function startServer(options: { port?: number; dataDir?: string; co
   const hostHeartbeat = gateFile ? setInterval(() => {
     const { updatedAt: _updated, ...status } = readDesktopRuntimeStatus(gateFile);
     const current = JSON.stringify(status);
+    if (status.state === 'ready') bridge.reportConnectionState(false);
+    else if (status.state !== 'stopping' && status.desktop?.mode !== 'independent') bridge.reportConnectionState(true);
+    void bridge.flushConnectionAlerts().catch(error => store.log('warn', `连接提示检查失败：${errorText(error)}`));
     if (current !== previousHostStatus) { previousHostStatus = current; publish({ type: 'runtime' }); }
   }, 3000) : undefined;
   hostHeartbeat?.unref();
@@ -352,6 +355,10 @@ export async function startServer(options: { port?: number; dataDir?: string; co
             pendingRequests: bridge.pendingRequests(), logs: store.state.logs
           });
         }
+        if (request.method === 'GET' && url.pathname === '/api/idle-state') {
+          const state = bridge.shutdownState();
+          return json(response, { ...state, csrfToken, activeWork: state.activeWork || messageSender.hasPending() });
+        }
         if (request.method === 'GET' && url.pathname === '/api/runtime-status') return json(response, readDesktopRuntimeStatus(gateFile));
         if (request.method === 'GET' && url.pathname === '/api/events') {
           if (subscribers.size >= 16) throw new UserError('打开的管理窗口过多，请关闭多余窗口后重试。', 429);
@@ -535,7 +542,7 @@ export async function startServer(options: { port?: number; dataDir?: string; co
           return json(response, { accepted: true, messageId }, 202);
         }
         if (request.method === 'POST' && url.pathname === '/api/shutdown') {
-          if (bridge.hasActiveWork()) throw new UserError('仍有任务正在处理，请先完成或停止后再退出。', 409);
+          if (body.confirmed !== true && bridge.hasActiveWork()) throw new UserError('仍有任务正在处理，请先完成或停止后再退出。', 409);
           json(response, { ok: true });
           setTimeout(() => { void close().finally(() => { if (isMain()) process.exit(0); }); }, 100);
           return;
@@ -662,6 +669,10 @@ function validateConfig(body: Record<string, unknown>): Partial<BridgeConfig> {
   if (body.autoNotifyDesktop !== undefined) {
     if (typeof body.autoNotifyDesktop !== 'boolean') throw new UserError('桌面任务通知设置无效');
     result.autoNotifyDesktop = body.autoNotifyDesktop;
+  }
+  for (const key of ['notifyDesktopRequests', 'notifyConnectionIssues'] as const) if (body[key] !== undefined) {
+    if (typeof body[key] !== 'boolean') throw new UserError('审批或连接提示设置无效');
+    result[key] = body[key];
   }
   if (body.desktopNotificationMode !== undefined) {
     if (body.desktopNotificationMode !== 'all' && body.desktopNotificationMode !== 'long') throw new UserError('桌面通知范围无效');

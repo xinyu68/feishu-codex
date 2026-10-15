@@ -11,7 +11,7 @@ import { isThreadInitializationRace, isThreadWriterConflict, THREAD_WRITER_MESSA
 import { CodexTransportError, CodexRpcError, IGNORE_SERVER_REQUEST, WebsocketCodexConnection, validateCodexWebsocketUrl, type CodexConnection } from './codex-websocket.js';
 import { consultationAborted, consultationInstructions, declineConsultationRequest } from './runtime-consult.js';
 import { GROUP_CONSULT_MCP_TIMEOUT_SECONDS, GROUP_CONSULT_TOOL_NAME } from './group-consult-request.js';
-import type { CodexRunInput, CodexRuntime, CodexUsage, HistoryMessage, ModelInfo, RuntimeAnswer, RuntimeRequest, RuntimeConsultInput, RuntimeEvent, UsageLimit, UsageWindow } from './types.js';
+import type { CodexRunInput, CodexRuntime, CodexUsage, DesktopRuntimeRequest, HistoryMessage, ModelInfo, RuntimeAnswer, RuntimeRequest, RuntimeRequestContext, RuntimeConsultInput, RuntimeEvent, UsageLimit, UsageWindow } from './types.js';
 
 type RecordValue = Record<string, unknown>;
 type Wire = { id?: string | number; method?: string; params?: RecordValue; result?: unknown; error?: { message?: string; code?: number } };
@@ -53,6 +53,37 @@ function threadInstructionOverrides(input: CodexRunInput, channelContextProvided
 
 /** Each turn owns a connection; only standalone mode also owns its app-server process. */
 export class CodexClient implements CodexRuntime {
+  private readonly desktopRequestListeners = new Set<(request: DesktopRuntimeRequest) => Promise<RuntimeAnswer | undefined>>();
+  private readonly desktopRequestClaims = new Set<string>();
+
+  subscribeDesktopRequests(listener: (request: DesktopRuntimeRequest) => Promise<RuntimeAnswer | undefined>): () => void {
+    this.desktopRequestListeners.add(listener);
+    return () => { this.desktopRequestListeners.delete(listener); };
+  }
+
+  private async observedRequest(threadId: string, method: string, params: RecordValue,
+    context?: RuntimeRequestContext & { id: string | number }): Promise<unknown> {
+    if (!context || context.signal.aborted || params.threadId !== threadId || !this.desktopRequestListeners.size
+      || !/^item\/(?:commandExecution|fileChange|permissions)\/requestApproval$|^item\/tool\/requestUserInput$/.test(method)) return IGNORE_SERVER_REQUEST;
+    if (this.options.canWatch && !await this.options.canWatch()) return IGNORE_SERVER_REQUEST;
+    const runs = [...this.sharedRuns].filter(run => run.threadId === threadId);
+    await Promise.all(runs.map(run => run.ownershipReady));
+    if (context.signal.aborted || runs.some(run => run.turnId === params.turnId && (run.ownsTurn || method === 'item/tool/requestUserInput'))) return IGNORE_SERVER_REQUEST;
+    const key = `${threadId}:${typeof context.id}:${String(context.id)}`;
+    if (this.desktopRequestClaims.has(key)) return IGNORE_SERVER_REQUEST;
+    this.desktopRequestClaims.add(key);
+    try {
+      const listener = this.desktopRequestListeners.values().next().value!;
+      return await handleRuntimeRequest({ cwd: '', prompt: '', onRequest: async request => {
+        const answer = await listener({ ...context, threadId, turnId: string(params.turnId) || undefined, request });
+        if (!answer) throw IGNORE_SERVER_REQUEST;
+        return answer;
+      } }, method, params, context);
+    } catch (error) {
+      if (error !== IGNORE_SERVER_REQUEST && !context.signal.aborted) this.emit('interaction/error', { threadId, error: '飞书审批暂不可用，请在 Codex 桌面处理。' });
+      return IGNORE_SERVER_REQUEST;
+    } finally { this.desktopRequestClaims.delete(key); }
+  }
   private readonly connections = new Set<CodexConnection>();
   private readonly active = new Map<string, ActiveRun>();
   private closed = false;
@@ -115,6 +146,7 @@ export class CodexClient implements CodexRuntime {
         entry.connection = connection;
         entry.subscribed = false;
         connection.onNotification = (method, params) => { if (string(params.threadId) === threadId) this.publishFrom(connection, method, params); };
+        connection.onRequest = (method, params, context) => this.observedRequest(threadId, method, params, context);
         connection.onFailure = error => {
           // Closing a failed initialization attempt is deliberate. Only an
           // established watcher should publish a loss or schedule reconnection.
@@ -149,6 +181,7 @@ export class CodexClient implements CodexRuntime {
           }
           entry.subscribed = true;
           entry.established = true;
+          this.emit('connection/restored', { threadId });
           this.emit('thread/status/changed', { threadId, status: record(response.thread).status });
           return;
         } catch (error) {
@@ -366,12 +399,12 @@ export class CodexClient implements CodexRuntime {
       observeTurn(method, params);
     };
     connection.onFailure = error => tracker.fail(error);
-    connection.onRequest = async (method, params) => {
+    connection.onRequest = async (method, params, context) => {
       if (string(params.threadId) !== run.threadId || !string(params.turnId)) return IGNORE_SERVER_REQUEST;
       await run.ownershipReady;
       const owner = [...this.sharedRuns].find(item => item.threadId === run.threadId && item.turnId === string(params.turnId) && (item.ownsTurn || method === 'item/tool/requestUserInput'));
       if (owner !== run) return IGNORE_SERVER_REQUEST;
-      return handleRuntimeRequest(input, method, params);
+      return handleRuntimeRequest(input, method, params, context);
     };
     try {
       await connection.initialize();
@@ -1065,12 +1098,12 @@ class TurnTracker {
   }
 }
 
-async function handleRuntimeRequest(input: CodexRunInput, method: string, params: RecordValue): Promise<unknown> {
+async function handleRuntimeRequest(input: CodexRunInput, method: string, params: RecordValue, context?: RuntimeRequestContext): Promise<unknown> {
   if (method === 'currentTime/read') return { currentTimeAt: Math.floor(Date.now() / 1_000) };
   const id = randomUUID();
   const ask = async (request: Omit<RuntimeRequest, 'id'>): Promise<RuntimeAnswer> => {
     if (!input.onRequest) throw new Error('当前入口无法处理 Codex 的交互请求');
-    return input.onRequest({ id, ...request });
+    return input.onRequest({ id, ...request }, context);
   };
   if (method === 'item/tool/requestUserInput') {
     const questions = array(params.questions).map(value => {

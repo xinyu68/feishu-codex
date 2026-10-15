@@ -70,6 +70,20 @@ test('state and config responses mask credentials while reporting the injected r
   assert.match(response.headers.get('content-security-policy') ?? '', /frame-ancestors 'self'/);
 });
 
+test('confirmed shutdown bypasses busy task checks but still requires the management token', async t => {
+  const h = await fixture(t);
+  h.app.bridge.hasActiveWork = () => true;
+  const blocked = await h.request('/api/shutdown', {});
+  assert.equal(blocked.status, 409);
+  const unauthenticated = await fetch(`${h.base}/api/shutdown`, { method: 'POST',
+    headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ confirmed: true }) });
+  assert.equal(unauthenticated.status, 403);
+  const confirmed = await h.request('/api/shutdown', { confirmed: true });
+  assert.equal(confirmed.status, 200);
+  // Close before fixture cleanup so the scheduled close cannot outlive its data.
+  await h.app.close();
+});
+
 test('mutations reject missing or stale CSRF tokens and non-JSON payloads', async t => {
   const h = await fixture(t);
   const missing = await fetch(`${h.base}/api/config`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ progress: false }) });

@@ -14,8 +14,9 @@ import type { GroupHandoffCandidate, GroupHandoffResult } from './group-handoff.
 import { GROUP_HANDOFF_TOOL_NAME, validateGroupHandoffRequest } from './group-handoff-request.js';
 import { GroupConsultations, GroupConsultError } from './group-consult.js';
 import { GroupConsultReply, cleanConsultationText } from './group-consult-reply.js';
+import { ConnectionAlerts } from './connection-alerts.js';
 import { isThreadInitializationRace, isThreadWriterConflict, THREAD_WRITER_MESSAGE } from './codex-errors.js';
-import type { ArtifactDeliveryResult, CodexRuntime, InboundMessage, FeishuTransport, FeishuSendOptions, MessageCard, RuntimeRequest, RuntimeAnswer, Project, ThreadSummary, ChatMessage, Conversation, BridgeEvent, CompletionNotification, RuntimeEvent } from './types.js';
+import type { ArtifactDeliveryResult, CodexRuntime, DesktopRuntimeRequest, InboundMessage, FeishuTransport, FeishuSendOptions, MessageCard, RuntimeRequest, RuntimeAnswer, Project, ThreadSummary, ChatMessage, Conversation, BridgeEvent, CompletionNotification, RuntimeEvent } from './types.js';
 
 type Work = { message: InboundMessage; target: Conversation; resolve: () => void };
 type Queue = { active: boolean; cancelled: boolean; threadId?: string; items: Work[]; current?: Promise<void>; currentMessage?: InboundMessage; currentTarget?: Conversation; workspaceCancel?: () => void };
@@ -23,6 +24,8 @@ type PendingRequest = RuntimeRequest & {
   chatId: string; actorId: string; createdAt: string; messageId?: string; localOnly?: boolean; operationId?: string;
   resolve: (answer: RuntimeAnswer) => void; timer: ReturnType<typeof setTimeout>;
   valid?: () => boolean;
+  desktop?: boolean;
+  cancel?: () => void;
 };
 type Discover = { projects: () => Promise<Project[]>; threads: (cwd: string) => Promise<ThreadSummary[]>; assertCanWrite?: () => void | Promise<void> };
 const STREAM_MAX_THREADS = 32;
@@ -107,7 +110,29 @@ export class Bridge {
   private groupHumanHeads = new Map<string, { chatId: string; actorId: string; generation: number; messageId: string }>();
   private unsubscribeRuntime?: () => void;
   private unsubscribeStore?: () => void;
+  private unsubscribeDesktopRequests?: () => void;
+  private connectionAlerts: ConnectionAlerts;
   constructor(readonly store: Store, readonly codex: CodexRuntime, private discovery: Discover) {
+    this.connectionAlerts = new ConnectionAlerts({
+      get: () => store.state.connectionIncident,
+      save: value => { store.state.connectionIncident = value; store.save(); },
+      enabled: () => !this.closing && store.config.notifyConnectionIssues !== false,
+      onError: error => console.warn(`连接提醒暂未完成：${errorText(error)}`),
+      send: async (recovered, incident) => {
+        const recipient = this.notificationRecipient('', undefined, true, true);
+        if (!recipient || !this.transport || this.transport.isAvailable?.(recipient.chatId) === false) return 'unavailable';
+        const seconds = Math.max(1, Math.round(((incident.recoveredAt ?? Date.now()) - incident.lostAt) / 1000));
+        const key = `codex-connection:${incident.lostAt}:${recovered ? 'restored' : 'lost'}`;
+        if (!store.claimDelivery(key)) return 'uncertain';
+        try {
+          await this.transport.sendCard(recipient.chatId, { title: recovered ? 'Codex 连接已恢复' : 'Codex 连接异常',
+            text: recovered ? `本机连接曾中断约 ${seconds} 秒，现已恢复。未自动重发任务，请核对原会话结果。`
+              : '暂时无法连接本机 Codex，正在尝试恢复。任务状态尚未确认，未自动重发指令。', tone: recovered ? 'green' : 'orange' });
+          store.finishDelivery(key, 'sent'); return 'sent';
+        } catch (error) { store.finishDelivery(key, 'uncertain'); store.log('warn', `连接提示送达未确认，未自动重发：${errorText(error)}`); return 'uncertain'; }
+      }
+    });
+    this.unsubscribeDesktopRequests = codex.subscribeDesktopRequests?.(request => this.desktopRequest(request));
     this.automaticNotificationsEnabled = store.config.autoNotifyDesktop === true;
     this.unsubscribeStore = store.subscribe(() => {
       if (store.config.autoNotifyDesktop && !this.automaticNotificationsEnabled) this.automaticNotificationsSince = Date.now();
@@ -121,11 +146,16 @@ export class Bridge {
         this.finishRequests(flight.message.chatId, '发起账号或群聊授权已撤销', flight.message.id);
         if (flight.target.threadId) void codex.stop(flight.target.threadId).catch(() => {});
       }
-      for (const request of this.requests.values()) if (!store.isAuthorized(request.chatId, request.actorId)) this.resolveRequest(request, { decision: 'decline', answers: {} }, '账号或群聊授权已撤销');
+      for (const request of this.requests.values()) if (!store.isAuthorized(request.chatId, request.actorId)
+        || (request.desktop && store.config.notifyDesktopRequests === false)) {
+        if (request.desktop) request.cancel?.();
+        else this.resolveRequest(request, { decision: 'decline', answers: {} }, '账号或群聊授权已撤销');
+      }
       this.consultations.cancelInvalid();
       this.emit({ type: 'state' });
     });
     this.unsubscribeRuntime = codex.subscribe?.(event => {
+      if (event.threadId && ['connection/lost', 'connection/restored'].includes(event.method)) this.connectionAlerts.observe('codex', event.method === 'connection/lost');
       this.observeGroupHandoffRequest(event);
       this.observeNotificationEvent(event);
       let delta: BridgeEvent['delta'];
@@ -190,6 +220,7 @@ export class Bridge {
     for (const threadId of threads) await this.codex.watch?.(threadId).catch(() => undefined);
   }
   async deliverPendingNotifications(): Promise<void> {
+    await this.connectionAlerts.flush();
     for (const notification of Object.values(this.store.state.notifications).filter(item => item.status === 'registered')) {
       const status = await this.codex.turnStatus?.(notification.threadId, notification.turnId).catch(() => 'unknown' as const);
       if (status && ['completed', 'failed', 'interrupted'].includes(status)) await this.deliverCompletionNotification(notification, status as 'completed' | 'failed' | 'interrupted');
@@ -365,9 +396,9 @@ export class Bridge {
     this.store.log('info', `已登记桌面任务完成通知 · ${path.basename(cwd)} · ${threadId.slice(0, 8)}`);
     return notification;
   }
-  private notificationRecipient(threadId: string, operation?: { chatId: string; actorId: string }, completion = false): Conversation | undefined {
+  private notificationRecipient(threadId: string, operation?: { chatId: string; actorId: string }, completion = false, quiet = false): Conversation | undefined {
     const unavailable = (reason: string): undefined => {
-      this.store.log('warn', `${completion ? '飞书完成通知' : '飞书成品'}未发送：${reason} · ${threadId.slice(0, 8)}`);
+      if (!quiet) this.store.log('warn', `${completion ? '飞书完成通知' : '飞书成品'}未发送：${reason} · ${threadId.slice(0, 8)}`);
       return undefined;
     };
     const conversations = Object.values(this.store.state.conversations)
@@ -593,7 +624,16 @@ export class Bridge {
     })).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
   }
   pendingRequests() {
-    return [...this.requests.values()].map(({ resolve, timer, valid, ...item }) => item);
+    return [...this.requests.values()].map(({ resolve, timer, valid, cancel, ...item }) => item);
+  }
+  shutdownState() {
+    // Native tasks are checked separately by the host. A cached desktop busy
+    // flag is not an additional source of truth for the bridge's own workload.
+    const owned = (chatId: string) => Boolean(this.queues.get(chatId)?.active
+      || [...this.flights.values()].some(flight => flight.message.chatId === chatId));
+    return { activeWork: this.consultations.hasActiveWork() || this.relayTasks.size > 0 || this.notificationEvents.size > 0
+      || this.flights.size > 0 || [...this.queues.values()].some(queue => queue.active),
+      conversations: this.conversations().map(item => ({ ...item, busy: owned(item.chatId) })), pendingRequests: this.pendingRequests() };
   }
   async history(chatId: string): Promise<{ messages: ChatMessage[]; source: string; threadId?: string }> {
     const conversation = this.store.state.conversations[chatId];
@@ -942,7 +982,7 @@ export class Bridge {
           pendingProgress = text.slice(0, 2500);
           useProgress(true)?.update(pendingProgress);
         },
-        onRequest: (request) => this.requestUser(message, request)
+        onRequest: (request, context) => this.requestUser(message, request, context ? { signal: context.signal, valid: () => !context.signal.aborted } : undefined)
       });
       useProgress(false, result.threadId, result.turnId)?.freeze();
       conversation.threadId = result.threadId;
@@ -1245,19 +1285,41 @@ export class Bridge {
   private finishRequests(chatId: string, title: string, operationId?: string) {
     for (const request of this.requests.values()) if (request.chatId === chatId && (!operationId || request.operationId === operationId)) this.resolveRequest(request, { decision: 'decline', answers: {} }, title);
   }
-  private async requestUser(message: InboundMessage, raw: RuntimeRequest, options?: { signal: AbortSignal; valid: () => boolean }): Promise<RuntimeAnswer> {
+  private async desktopRequest(event: DesktopRuntimeRequest): Promise<RuntimeAnswer | undefined> {
+    if (this.closing || this.store.config.notifyDesktopRequests === false || event.signal.aborted
+      || this.isBridgeTurn(event.threadId, event.turnId ?? '')) return;
+    const recipient = this.notificationRecipient(event.threadId, undefined, true);
+    if (!recipient || !this.transport || this.transport.isAvailable?.(recipient.chatId) === false) return;
+    const info = await this.codex.threadInfo?.(event.threadId).catch(() => undefined);
+    if (!info || info.isUserThread === false || event.signal.aborted || !this.desktopRequestsEnabled()
+      || !this.store.isAuthorized(recipient.chatId, recipient.actorId)) return;
+    return this.requestUser({ id: `desktop:${event.request.id}`, chatId: recipient.chatId, actorId: recipient.actorId, text: '' },
+      { ...event.request, title: event.request.kind === 'approval' ? 'Codex 桌面需要审批' : 'Codex 桌面需要补充信息',
+        text: `项目：${path.basename(info.cwd)}\n会话：${info.title}\n\n${event.request.text}` },
+      { signal: event.signal, desktop: true, cancel: () => event.cancel('请求已失效，可在 Codex 桌面继续处理'),
+        valid: () => !event.signal.aborted && this.store.config.notifyDesktopRequests !== false && this.store.isAuthorized(recipient.chatId, recipient.actorId) });
+  }
+  reportConnectionState(lost: boolean): void { this.connectionAlerts.observe('codex', lost); }
+  flushConnectionAlerts(): Promise<void> { return this.connectionAlerts.flush(); }
+  private desktopRequestsEnabled(): boolean { return this.store.config.notifyDesktopRequests !== false; }
+
+  private async requestUser(message: InboundMessage, raw: RuntimeRequest, options?: { signal: AbortSignal; valid: () => boolean; desktop?: boolean; cancel?: () => void }): Promise<RuntimeAnswer> {
     if (options?.signal.aborted || (options && !options.valid()) || !this.store.isAuthorized(message.chatId, message.actorId)
-      || (message.handoff && !this.relayIsLive(this.groupRelays.get(message.handoff.chainId), true))) return { decision: 'decline', answers: {} };
+      || (message.handoff && !this.relayIsLive(this.groupRelays.get(message.handoff.chainId), true))) {
+      if (options?.desktop) options.cancel?.();
+      return { decision: 'decline', answers: {} };
+    }
     const id = crypto.randomUUID();
     const cancelled = () => {
       const pending = this.requests.get(id);
-      if (pending) this.resolveRequest(pending, { decision: 'decline', answers: {} }, '任务已停止');
+      if (pending) this.resolveRequest(pending, { decision: 'decline', answers: {} }, typeof options?.signal.reason === 'string' ? options.signal.reason : '任务已停止');
     };
     return new Promise<RuntimeAnswer>((resolve) => {
       const request: PendingRequest = {
         ...raw, id, chatId: message.chatId, actorId: message.actorId, operationId: message.id, localOnly: message.localOnly, createdAt: new Date().toISOString(), resolve,
         valid: options ? () => !options.signal.aborted && options.valid() : undefined,
-        timer: setTimeout(() => this.resolveRequest(request, { decision: 'decline', answers: {} }, '请求已超时'), 10 * 60_000)
+        desktop: options?.desktop, cancel: options?.cancel,
+        timer: setTimeout(() => options?.desktop ? options.cancel?.() : this.resolveRequest(request, { decision: 'decline', answers: {} }, '请求已超时'), 10 * 60_000)
       };
       this.requests.set(id, request);
       options?.signal.addEventListener('abort', cancelled, { once: true });
@@ -1797,7 +1859,7 @@ export class Bridge {
     const closingConsultations = this.consultations.close();
     for (const chain of this.groupRelays.values()) chain.cancelled = true;
     for (const flight of this.flights.values()) { flight.queue.cancelled = true; flight.queue.workspaceCancel?.(); }
-    this.unsubscribeRuntime?.(); this.unsubscribeStore?.();
+    this.unsubscribeRuntime?.(); this.unsubscribeStore?.(); this.unsubscribeDesktopRequests?.(); this.connectionAlerts.close();
     await Promise.allSettled([...this.notificationEvents.values()]);
     for (const chatId of this.queues.keys()) await this.stop(chatId).catch(() => {});
     await this.codex.close();

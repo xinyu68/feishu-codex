@@ -12,6 +12,7 @@ export type Config = {
   appId: string; hasSecret: boolean; enabled: boolean; allowedActors: string[];
   defaultWorkspace: string; model: string; effort: string; progress: boolean; autoNotifyDesktop: boolean;
   desktopNotificationMode: 'all' | 'long'; desktopNotificationMinMinutes: number;
+  notifyDesktopRequests?: boolean; notifyConnectionIssues?: boolean;
   desktopNotificationTarget?: DesktopNotificationTarget | null;
   hermesNotificationTarget?: DesktopNotificationTarget | null;
 };

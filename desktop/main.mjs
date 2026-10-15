@@ -10,6 +10,7 @@ import { LaunchCoordinator, LaunchPreferences, validatePreferences } from './lau
 import { changeLoginStartup, loginStartupEnabled } from './login-startup.mjs';
 import { restoreInstallation } from './installation.mjs';
 import { UpdateCoordinator } from './update-coordinator.mjs';
+import { quitWithConfirmation } from './quit-confirmation.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const productRoot = app.isPackaged ? path.join(process.resourcesPath, 'product') : path.dirname(here);
@@ -213,21 +214,36 @@ async function performQuit({ forUpdate = false } = {}) {
     const deployment = await readJson(path.join(dataDir, 'desktop', 'deployment.json'));
     if (hostStarted || (deployment?.state === 'active' && samePath(deployment.productRoot, productRoot))) {
       try {
-        try { await control('shutdown', 90_000); }
-        catch (error) {
-          if (error.code !== 'SHARED_CODEX_RUNNING') throw error;
-          const answer = await dialog.showMessageBox(window, { type: 'question', title: '退出 Feishu Codex',
-            message: '同时退出 Codex？', detail: '将关闭本应用打开的 Codex，并停止飞书消息服务。若仍有任务正在运行，会保留服务并提示你。',
-            buttons: ['退出应用和 Codex', '取消'], defaultId: 1, cancelId: 1, noLink: true });
-          if (answer.response !== 0) return { ok: false, cancelled: true };
-          await control('shutdownAll', 120_000);
+        if (!forUpdate) {
+          const result = await quitWithConfirmation({
+            assess: () => control('prepareQuit', 12_000),
+            confirm: async assessment => {
+              const answer = await dialog.showMessageBox(window, { type: 'warning', title: '退出全部服务',
+                message: '确认退出 Feishu Codex 和关联的 Codex？',
+                detail: `${assessment.detail}\n\n退出将停止飞书消息服务，并中断仍在运行的任务。已执行的操作不会撤销，下次打开不会自动重发任务。`,
+                buttons: ['仍然退出', '取消'], defaultId: 1, cancelId: 1, noLink: true });
+              return answer.response === 0;
+            },
+            shutdown: () => control('shutdownConfirmed', 120_000, { confirmed: true }),
+          });
+          if (result.cancelled) return result;
+        } else {
+          try { await control('shutdown', 90_000); }
+          catch (error) {
+            if (error.code !== 'SHARED_CODEX_RUNNING') throw error;
+            const answer = await dialog.showMessageBox(window, { type: 'question', title: '退出 Feishu Codex',
+              message: '同时退出 Codex？', detail: '将关闭本应用打开的 Codex，并停止飞书消息服务。若仍有任务正在运行，会保留服务并提示你。',
+              buttons: ['退出应用和 Codex', '取消'], defaultId: 1, cancelId: 1, noLink: true });
+            if (answer.response !== 0) return { ok: false, cancelled: true };
+            await control('shutdownAll', 120_000);
+          }
         }
       }
       catch (error) {
         const presence = await ownedHostPresence();
         if (presence.host !== 'dead') throw error;
         if (hostStarted && Date.now() - hostStartRequestedAt < 8_000) throw new Error('本机服务正在启动，请等待就绪后再退出。');
-        if (presence.children !== 'dead') throw new Error('本机服务连接已中断，但 Codex 或飞书仍在运行。请先重试连接，再安全退出；不会强行终止可能正在运行的任务。');
+        if (presence.children !== 'dead') throw new Error('本机服务连接已中断，暂时无法核对剩余服务的进程归属。请重试连接后退出。');
       }
     }
     quitting = true;

@@ -8,19 +8,21 @@ import { fileURLToPath } from 'node:url';
 import WebSocket from 'ws';
 import { atomicJson, captureProcessTree, closeWindowVerified, inspectWindows, readJson, runPowerShell, stopVerified } from './windows.mjs';
 import { canonicalEnvironment, canRetireReusedIdentity, desktopMode, matchesEntry, RestartBudget, samePath, sameProcess, writePermission } from './lifecycle.mjs';
-import { assertDesktopExitState, checkIdleServices, closeSharedDesktop, desktopExitPlan, serviceExitIdentity, waitForChildExit } from './shutdown.mjs';
+import { assertDesktopExitState, checkIdleServices, closeSharedDesktop, desktopExitPlan, finishConfirmedServices, serviceExitIdentity, waitForChildExit } from './shutdown.mjs';
 import { recoverRuntimeEndpoint } from './runtime-endpoint.mjs';
 import { independentDesktop, stopIndependentDesktop } from './switch-desktop.mjs';
 import { defaultCodexHome, installBundledSkill, managedSkillOwner } from './bundled-skill.mjs';
 import { waitForLaunchAccount } from './launch-account.mjs';
+import { inspectTask } from './runtime-task-state.mjs';
 
-export async function runtimeProbe(url, { idle = false, account = false, timeout = 5_000 } = {}) {
+export async function runtimeProbe(url, { idle = false, account = false, details = false, timeout = 5_000 } = {}) {
   const socket = new WebSocket(url, { handshakeTimeout: timeout, maxPayload: 2 * 1024 * 1024 });
   const pending = new Map();
   let seq = 0;
   let timer;
   let rejectOpen;
   let stage = 'WebSocket';
+  const generations = new Map();
   const fail = error => { rejectOpen?.(error); for (const request of pending.values()) request.reject(error); pending.clear(); };
   const rpc = (method, params) => new Promise((resolve, reject) => {
     stage = method;
@@ -32,6 +34,10 @@ export async function runtimeProbe(url, { idle = false, account = false, timeout
   socket.on('message', data => {
     try {
       const value = JSON.parse(data.toString()); const request = pending.get(value.id);
+      if (value.method === 'turn/started' && value.params?.threadId) {
+        const id = value.params.threadId;
+        generations.set(id, (generations.get(id) || 0) + 1);
+      }
       if (!request || value.method) return;
       pending.delete(value.id);
       if (value.error || !Object.hasOwn(value, 'result')) request.reject(new Error('Codex 暂时无法确认连接状态。'));
@@ -56,50 +62,11 @@ export async function runtimeProbe(url, { idle = false, account = false, timeout
         if (cursor && seen.has(cursor)) throw new Error('任务列表分页异常。');
         if (cursor) seen.add(cursor);
       } while (cursor);
-      let active = 0;
-      for (const threadId of ids) {
-        const result = await rpc('thread/read', { threadId, includeTurns: false });
-        const status = result?.thread?.status?.type;
-        if (result?.thread?.id !== threadId || !['active', 'idle', 'notLoaded'].includes(status)) throw new Error('无法确认任务是否已结束。');
-        if (status === 'active') { active++; continue; }
-        if (result.thread.ephemeral === true) {
-          // Ephemeral threads reject both history APIs. Recheck their live
-          // status instead of treating the lack of persisted turns as failure.
-          const current = await rpc('thread/read', { threadId, includeTurns: false });
-          const currentStatus = current?.thread?.status?.type;
-          if (current?.thread?.id !== threadId || current.thread.ephemeral !== true || !['active', 'idle', 'notLoaded'].includes(currentStatus)) throw new Error('无法确认临时任务是否已结束。');
-          if (currentStatus === 'active') active++;
-          continue;
-        }
-        // Native turn/start may return before the summary status becomes active.
-        // Inspect the latest accepted turn as well as the summary before shutdown.
-        let latest;
-        if (result.thread.historyMode === 'paginated') {
-          const page = await rpc('thread/turns/list', { threadId, limit: 1, sortDirection: 'desc', itemsView: 'summary' });
-          if (!Array.isArray(page?.data)) throw new Error('无法确认最近任务是否结束。');
-          latest = page.data[0];
-        } else {
-          const full = await rpc('thread/read', { threadId, includeTurns: true });
-          if (full?.thread?.id !== threadId || !Array.isArray(full.thread.turns)) throw new Error('无法读取最近任务状态。');
-          latest = full.thread.turns.at(-1);
-        }
-        if (latest && !['inProgress', 'completed', 'failed', 'interrupted'].includes(latest.status)) throw new Error('最近任务状态无法确认。');
-        if (latest?.status === 'inProgress') {
-          // Persisted history can retain an in-progress turn after the live
-          // thread has become idle. Keep a grace period for newly accepted
-          // turns, whose summary may briefly lag behind the turn record.
-          const startedAt = latest.startedAt;
-          if (!Number.isSafeInteger(startedAt) || startedAt > Date.now() / 1000 - 60) {
-            active++;
-            continue;
-          }
-          const refreshed = await rpc('thread/read', { threadId, includeTurns: false });
-          const refreshedStatus = refreshed?.thread?.status?.type;
-          if (refreshed?.thread?.id !== threadId || !['active', 'idle', 'notLoaded'].includes(refreshedStatus)) throw new Error('无法再次确认任务是否已经结束。');
-          if (refreshedStatus === 'active') active++;
-        }
-      }
-      return { ready: true, active };
+      const tasks = [];
+      for (const threadId of ids) tasks.push(await inspectTask(rpc, threadId, { generation: id => generations.get(id) || 0 }));
+      for (const task of tasks) if (generations.get(task.id)) { task.active = true; task.reason = '刚刚收到任务开始事件'; }
+      const active = tasks.filter(task => task.active).length;
+      return { ready: true, active, ...(details ? { tasks: tasks.filter(task => task.active) } : {}) };
     })(), new Promise((_, reject) => { timer = setTimeout(() => reject(Object.assign(new Error(
       stage === 'account/read' ? 'Codex 登录状态读取超时，请稍后重试。' : `Codex 未及时响应（${stage}）。`
     ), { code: 'RUNTIME_PROBE_TIMEOUT', stage })), timeout); })]);
@@ -414,7 +381,26 @@ export async function startHost(options = {}) {
     }
   }
 
-  async function shutdown({ closeDesktop = false, uninstall = false } = {}) {
+  async function prepareQuit() {
+    const current = await inspectFresh();
+    const plan = desktopExitPlan(current, Number(ws.port), launchedDesktop);
+    let warning = '';
+    try {
+      await checkIdleServices({
+        runtime: components.runtime.identity && current.processes.some(item => sameProcess(components.runtime.identity, item))
+          ? () => probe(wsUrl, { idle: true, details: true, timeout: 4000 }) : undefined,
+        bridge: components.bridge.identity && current.processes.some(item => sameProcess(components.bridge.identity, item)) ? async () => {
+          const response = await fetch(`http://127.0.0.1:${bridgePort}/api/idle-state`, { signal: AbortSignal.timeout(4000) });
+          if (!response.ok) throw new Error('暂时无法确认飞书任务状态。');
+          return response.json();
+        } : undefined,
+      });
+    } catch (error) { warning = error.message.replace(/，请[^。\n]*。/g, '。'); }
+    return { needsConfirmation: Boolean(plan.desktopIdentity || warning),
+      detail: warning ? `当前任务信息：\n${warning}` : plan.desktopIdentity ? '将同时关闭本应用打开的 Codex。' : '' };
+  }
+
+  async function shutdown({ closeDesktop = false, uninstall = false, confirmed = false } = {}) {
     const started = performance.now();
     const timings = {};
     const timed = async (name, operation) => {
@@ -429,14 +415,53 @@ export async function startHost(options = {}) {
     // Pause bridge submissions before inspecting tasks or closing the desktop.
     stopping = true; await publish();
     try {
+      if (confirmed) {
+        // Capture before graceful cleanup can orphan children. Identity checks
+        // still apply; active/unknown task state is deliberately not consulted.
+        const captured = await Promise.all(['bridge', 'runtime', 'relay'].map(async name => {
+          const identity = serviceExitIdentity(snapshot, components[name].identity);
+          return identity ? { name, identity: await captureProcessTree(root, dataDir, identity) } : null;
+        }));
+        if (desktopIdentity) await closeSharedDesktop({ inspect: () => inspectFresh(), initialSnapshot: snapshot,
+          sharedPort: Number(ws.port), launched: desktopIdentity, assertIdle: async () => {},
+          captureTree: identity => captureProcessTree(root, dataDir, identity),
+          requestClose: async identity => { try { await closeWindowVerified(root, dataDir, identity); }
+            catch (error) { await log(`正常关闭 Codex 未完成，将复核身份后结束进程：${error.message}`); } },
+          terminate: identity => stopVerified(root, dataDir, identity) });
+        assertDesktopExitState(await inspectFresh(), Number(ws.port), launchedDesktop, preservedDesktops);
+        await finishConfirmedServices({
+          graceful: async () => {
+            if (!captured.some(item => item?.name === 'bridge')) return;
+            const controller = new AbortController();
+            const timeout = setTimeout(() => controller.abort(), 3500);
+            try {
+              const response = await fetch(`http://127.0.0.1:${bridgePort}/api/state`, { signal: controller.signal });
+              if (!response.ok) return;
+              const state = await response.json();
+              if (!state.csrfToken) return;
+              await fetch(`http://127.0.0.1:${bridgePort}/api/shutdown`, { method: 'POST', signal: controller.signal,
+                headers: { 'Content-Type': 'application/json', 'X-Bridge-Token': state.csrfToken }, body: JSON.stringify({ confirmed: true }) });
+              // Give the owned bridge and Hermes worker time to release normally.
+              const bridge = components.bridge;
+              if (bridge.child) await waitForChildExit(bridge.child, 3500);
+            } finally { clearTimeout(timeout); }
+          },
+          release: captured.filter(Boolean).map(item => () => stopVerified(root, dataDir, item.identity, definition(item.name).port)),
+        });
+        clearInterval(interval);
+        for (const component of Object.values(components)) component.state = 'stopped';
+        await publish(); await log('用户已确认退出全部服务；任务状态未阻止退出。');
+        setTimeout(() => { server.close(); server.closeAllConnections(); (options.exit || process.exit)(0); }, 150);
+        return { ok: true, closedDesktop: desktopIdentity };
+      }
       const assertIdle = async current => {
         const runtimeExists = components.runtime.identity && current.processes.some(candidate => sameProcess(components.runtime.identity, candidate));
         const bridgeExists = components.bridge.identity && current.processes.some(candidate => sameProcess(components.bridge.identity, candidate));
         if (!runtimeExists && desktopIdentity) throw new Error('无法确认 Codex 的任务状态，请恢复连接后再退出。');
         return checkIdleServices({
-          runtime: runtimeExists ? () => probe(wsUrl, { idle: true, timeout: 20_000 }) : undefined,
+          runtime: runtimeExists ? () => probe(wsUrl, { idle: true, details: true, timeout: 20_000 }) : undefined,
           bridge: bridgeExists ? async () => {
-            const response = await fetch(`http://127.0.0.1:${bridgePort}/api/state`, { signal: AbortSignal.timeout(5_000) });
+            const response = await fetch(`http://127.0.0.1:${bridgePort}/api/idle-state`, { signal: AbortSignal.timeout(5_000) });
             if (!response.ok) throw new Error('无法确认飞书任务状态，请稍后重试退出。');
             return response.json();
           } : undefined,
@@ -476,7 +501,7 @@ export async function startHost(options = {}) {
       if (components.runtime.identity && current.processes.some(candidate => sameProcess(components.runtime.identity, candidate))) {
         // The bridge is now stopped, so no accepted Feishu/UI submission can
         // cross this final idle barrier before the runtime is stopped.
-        const final = await timed('finalTaskCheck', () => probe(wsUrl, { idle: true, timeout: 20_000 }));
+        const final = await timed('finalTaskCheck', () => probe(wsUrl, { idle: true, details: true, timeout: 20_000 }));
         if (final.active) throw new Error('检测到刚刚开始的任务，已保留连接服务，请稍后重试退出。');
       }
       // Both processes have independent verified identities. Neither accepts
@@ -512,6 +537,11 @@ export async function startHost(options = {}) {
         if (action === 'prepareSwitch') return prepareSwitch();
         if (action === 'switchToShared') return switchToShared(expectedDesktop, confirmed);
         if (action === 'retry') { for (const item of Object.values(components)) item.budget.reset(); return tick(); }
+        if (action === 'prepareQuit') return prepareQuit();
+        if (action === 'shutdownConfirmed') {
+          if (confirmed !== true) throw new Error('请先确认退出全部服务。');
+          return shutdown({ closeDesktop: true, confirmed: true });
+        }
         if (action === 'shutdown') return shutdown();
         if (action === 'shutdownAll') return shutdown({ closeDesktop: true, uninstall: uninstall === true });
         throw new Error('未知桌面操作。');

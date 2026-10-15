@@ -37,7 +37,10 @@ export async function checkIdleServices({ runtime, bridge }) {
   for (const result of results) if (result.status === 'rejected') throw result.reason;
   const [codex, feishu] = results.map(result => result.value);
   if (runtime && (codex?.ready !== true || !Number.isSafeInteger(codex.active) || codex.active < 0)) throw new Error('无法确认 Codex 的任务状态，请恢复连接后再退出。');
-  if (codex?.active) throw new Error('还有 Codex 任务正在运行，请等任务完成，或先在 Codex 中停止任务，再退出应用。');
+  if (codex?.active) {
+    const tasks = Array.isArray(codex.tasks) ? codex.tasks.slice(0, 5).map(task => `${task.title} · ${task.reason}`).join('\n') : '';
+    throw new Error(`还有 Codex 任务正在运行或等待处理，请完成或停止后再退出。${tasks ? `\n\n${tasks}` : ''}`);
+  }
   if (bridge && (typeof feishu?.activeWork !== 'boolean' || !Array.isArray(feishu.conversations) || !Array.isArray(feishu.pendingRequests))) throw new Error('无法确认飞书任务状态，请稍后重试退出。');
   if (feishu?.activeWork || feishu?.conversations.some(conversation => conversation.busy) || feishu?.pendingRequests.length) throw new Error('飞书还有正在处理的消息，请稍后退出。');
   return feishu;
@@ -54,6 +57,18 @@ export async function waitForChildExit(child, timeout = 6000) {
     // A child can have exited just before its event listener was attached.
     if (child.exitCode !== null || child.signalCode !== null) done(true);
   });
+}
+
+/** Give graceful cleanup a bounded window, then release only captured owned trees. */
+export async function finishConfirmedServices({ graceful, release, graceMs = 4000 }) {
+  let timer;
+  try {
+    await Promise.race([Promise.resolve().then(graceful).catch(() => {}),
+      new Promise(resolve => { timer = setTimeout(resolve, graceMs); })]);
+  } finally { clearTimeout(timer); }
+  const outcomes = await Promise.allSettled(release.map(operation => Promise.resolve().then(operation)));
+  const failure = outcomes.find(result => result.status === 'rejected');
+  if (failure) throw failure.reason;
 }
 
 export function desktopExitPlan(snapshot, sharedPort, launched) {

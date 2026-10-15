@@ -132,3 +132,7 @@ select.app-select { appearance:auto; }
 .notification-target-summary .text-button { display:flex;align-items:center;gap:2px;white-space:nowrap;font-size:11px;padding:0; }
 .about-actions{display:flex;align-items:center;gap:8px;flex:0 0 auto}.about-actions .primary-button,.about-actions .secondary-button{white-space:nowrap}
 .about-section>div{min-width:0}.about-section p{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+.notification-more{margin-top:12px;color:#70829c;font-size:11px}.notification-more summary{cursor:pointer;width:fit-content}.desktop-interaction-preferences{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:12px}.desktop-interaction-preferences .toggle-row{align-items:flex-start;gap:12px}.desktop-interaction-preferences small{line-height:1.6}
+@media(max-height:720px){.defaults-settings .settings-title{margin-bottom:14px}.defaults-settings .settings-section{margin-bottom:10px;padding-bottom:10px}.defaults-settings .desktop-notification-preference{margin-top:10px}.defaults-settings .notification-more{margin-top:8px}}
+@media(max-width:760px){.desktop-interaction-preferences{grid-template-columns:1fr}}

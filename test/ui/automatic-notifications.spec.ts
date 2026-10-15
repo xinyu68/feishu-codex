@@ -1,5 +1,26 @@
 import { test, expect } from '@playwright/test';
 
+test('desktop request and connection reminders autosave independently of completion notifications', async ({ page }) => {
+  const base='http://127.0.0.1:8796';
+  const initial=await (await page.request.get(`${base}/api/state`)).json();
+  const headers={'X-Bridge-Token':initial.csrfToken};
+  await page.request.put(`${base}/api/config`,{headers,data:{autoNotifyDesktop:false,notifyDesktopRequests:true,notifyConnectionIssues:true}});
+  try {
+    await page.goto(base);
+    await page.getByRole('button',{name:'设置',exact:true}).click();
+    await page.getByRole('button',{name:'对话与通知',exact:true}).click();
+    await page.locator('summary').filter({hasText:'审批与连接提醒'}).click();
+    const requests=page.getByRole('checkbox',{name:'桌面需要审批时发送到飞书',exact:true});
+    const issues=page.getByRole('checkbox',{name:'连接异常时通知飞书',exact:true});
+    await expect(requests).toBeChecked();await expect(issues).toBeChecked();
+    await requests.uncheck();await expect(page.locator('.settings-save-status')).toHaveText('已保存');
+    let state=await (await page.request.get(`${base}/api/state`)).json();
+    expect(state.config.notifyDesktopRequests).toBe(false);expect(state.config.notifyConnectionIssues).toBe(true);expect(state.config.autoNotifyDesktop).toBe(false);
+    await issues.uncheck();await expect(page.locator('.settings-save-status')).toHaveText('已保存');
+    state=await (await page.request.get(`${base}/api/state`)).json();expect(state.config.notifyConnectionIssues).toBe(false);
+  } finally {await page.request.put(`${base}/api/config`,{headers,data:{autoNotifyDesktop:initial.config.autoNotifyDesktop,notifyDesktopRequests:initial.config.notifyDesktopRequests??true,notifyConnectionIssues:initial.config.notifyConnectionIssues??true}});}
+});
+
 test('desktop completion notification preference starts off and persists through the real settings API', async ({ page }) => {
   const base = 'http://127.0.0.1:8796';
   const state = await (await page.request.get(`${base}/api/state`)).json();

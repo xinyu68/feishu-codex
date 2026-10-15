@@ -33,6 +33,32 @@ function deferred<T = void>() {
   return { promise, resolve };
 }
 
+test('a passive watcher forwards a desktop request and answers its original RPC once', async () => {
+ const fx=await fixture(); const answer=deferred(); let observed=0;
+ fx.client.subscribeDesktopRequests(async event=>{observed++; assert.equal(event.threadId,'desktop');await answer.promise;return {decision:'accept'};});
+ try {
+  await fx.client.watch('desktop');
+  for(const socket of fx.server.clients) fx.send(socket,{id:0,method:'item/commandExecution/requestApproval',params:{threadId:'desktop',turnId:'native',command:'test'}});
+  for(let n=0;n<50&&!observed;n++)await pause(2);assert.equal(observed,1);
+  answer.resolve();for(let n=0;n<50&&!fx.responses.length;n++)await pause(2);
+  assert.deepEqual(fx.responses.filter(message=>message.id===0).map(message=>message.result),[{decision:'accept'}]);
+  assert.equal(fx.received.some(row=>row.message.method==='turn/start'||row.message.method==='turn/steer'),false);
+ }finally{answer.resolve();await fx.cleanup();}
+});
+
+test('desktop resolution aborts a watcher prompt and suppresses its late response', async () => {
+ const fx=await fixture();const answer=deferred();let signal:AbortSignal|undefined;
+ fx.client.subscribeDesktopRequests(async event=>{signal=event.signal;await answer.promise;return {decision:'accept'};});
+ try {
+  await fx.client.watch('desktop');
+  for(const socket of fx.server.clients)fx.send(socket,{id:'approval',method:'item/permissions/requestApproval',params:{threadId:'desktop',turnId:'native',permissions:{network:{enabled:true}}}});
+  for(let n=0;n<50&&!signal;n++)await pause(2);assert.ok(signal);
+  fx.notify('serverRequest/resolved',{threadId:'desktop',requestId:'approval'});
+  for(let n=0;n<50&&!signal.aborted;n++)await pause(2);assert.equal(signal.aborted,true);
+  answer.resolve();await pause(10);assert.equal(fx.responses.some(message=>message.id==='approval'),false);
+ }finally{answer.resolve();await fx.cleanup();}
+});
+
 async function fixture(codexHome?: string, options: Partial<CodexClientOptions> = {}) {
   const server = new WebSocketServer({ host: '127.0.0.1', port: 0 });
   await once(server, 'listening');
