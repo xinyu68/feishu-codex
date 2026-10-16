@@ -1,4 +1,12 @@
-import { desktopMode, sameProcess } from './lifecycle.mjs';
+import path from 'node:path';
+import { desktopMode, samePath, sameProcess } from './lifecycle.mjs';
+
+export function applicationExecutables(productRoot) {
+  const root = path.resolve(productRoot);
+  return path.basename(root).toLowerCase() === 'product' && path.basename(path.dirname(root)).toLowerCase() === 'resources'
+    ? [path.join(root, '..', '..', 'Feishu Codex.exe')]
+    : [path.join(root, 'node_modules', 'electron', 'dist', 'electron.exe')];
+}
 
 export function independentDesktop(snapshot, sharedPort, launched) {
   const mode = desktopMode(snapshot, sharedPort, launched);
@@ -11,6 +19,7 @@ export function independentDesktop(snapshot, sharedPort, launched) {
 }
 
 export async function stopIndependentDesktop({ inspect, expected, sharedPort, launched, requestClose, terminate,
+  preserveExecutables = [],
   settleMs = 3_000, now = () => performance.now(), sleep = ms => new Promise(resolve => setTimeout(resolve, ms)) }) {
   const before = await inspect();
   const root = independentDesktop(before, sharedPort, launched);
@@ -20,7 +29,9 @@ export async function stopIndependentDesktop({ inspect, expected, sharedPort, la
   do {
     changed = false;
     for (const item of before.processes) {
-      if (tree.has(item.parentPid) && !tree.has(item.pid)) { tree.add(item.pid); changed = true; }
+      if (tree.has(item.parentPid) && !tree.has(item.pid) && !preserveExecutables.some(exe => samePath(exe, item.exe))) {
+        tree.add(item.pid); changed = true;
+      }
     }
   } while (changed);
   const backends = before.processes.filter(item => tree.has(item.pid)
@@ -30,8 +41,9 @@ export async function stopIndependentDesktop({ inspect, expected, sharedPort, la
   // Capture their identities before closing the window, since children can
   // outlive their original parent and must never be selected by name alone.
   await requestClose(root);
-  await terminate(root);
-  for (const backend of backends) await terminate({ pid: backend.pid, exe: backend.exe, startedAt: backend.startedAt });
+  const protectedIdentity = identity => preserveExecutables.length ? { ...identity, preserveExecutables } : identity;
+  await terminate(protectedIdentity(root));
+  for (const backend of backends) await terminate(protectedIdentity({ pid: backend.pid, exe: backend.exe, startedAt: backend.startedAt }));
   const deadline = now() + settleMs;
   for (;;) {
     const after = await inspect();

@@ -5,9 +5,9 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { independentDesktop, stopIndependentDesktop } from '../desktop/switch-desktop.mjs';
+import { applicationExecutables, independentDesktop, stopIndependentDesktop } from '../desktop/switch-desktop.mjs';
 import { canonicalEnvironment } from '../desktop/lifecycle.mjs';
-import { closeWindowVerified, closeWindowsInspectors, inspectWindows, stopVerified } from '../desktop/windows.mjs';
+import { captureProcessTree, closeWindowVerified, closeWindowsInspectors, inspectWindows, stopVerified } from '../desktop/windows.mjs';
 
 after(closeWindowsInspectors);
 
@@ -28,6 +28,27 @@ test('explicit switch ends independent desktop and its task backend while retain
   const f = fixture(); await stopIndependentDesktop(f.options);
   assert.deepEqual(f.calls, ['close:10', 'stop:10', 'stop:12']);
   assert.deepEqual(f.processes(), [shared]);
+});
+
+test('switch protection covers packaged and development application entry points', () => {
+  assert.deepEqual(applicationExecutables(path.join('E:/software/Feishu Codex', 'resources', 'product')),
+    [path.resolve('E:/software/Feishu Codex/Feishu Codex.exe')]);
+  assert.deepEqual(applicationExecutables(path.resolve('development')),
+    [path.resolve('development/node_modules/electron/dist/electron.exe')]);
+});
+
+test('a nested Feishu application and its backend are excluded from independent task selection', async () => {
+  const f = fixture();
+  const app = { pid: 40, parentPid: backend.pid, exe: 'C:\\Feishu Codex\\Feishu Codex.exe', startedAt: 'app' };
+  const appBackend = { ...backend, pid: 41, parentPid: app.pid, startedAt: 'application-backend' };
+  f.replace([root, backend, shared, app, appBackend]);
+  const identities = [];
+  const stop = f.options.terminate;
+  f.options.terminate = async identity => { identities.push(identity); await stop(identity); };
+  await stopIndependentDesktop({ ...f.options, preserveExecutables: [app.exe] });
+  assert.deepEqual(f.calls, ['close:10', 'stop:10', 'stop:12']);
+  assert.deepEqual(f.processes(), [shared, app, appBackend]);
+  assert.ok(identities.every(identity => identity.preserveExecutables[0] === app.exe));
 });
 test('a backend orphaned by normal desktop close is still stopped by its captured identity', async () => {
   const f = fixture(); f.options.requestClose = async () => f.replace([backend, shared]);
@@ -111,6 +132,54 @@ test('Windows switch removes only its isolated desktop and orphaned backend proc
     if (child.exitCode === null) child.kill();
     if (backendIdentity) await stopVerified(project, directory, backendIdentity).catch(() => {});
     if (path.dirname(directory) !== os.tmpdir() || !path.basename(directory).startsWith('feishu-switch-test-')) throw new Error('Unexpected fixture path');
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+});
+
+for (const legacy of [false, true]) test(`Windows switch preserves a nested application and captured helpers (${legacy ? 'older host without metadata' : 'explicit protection'})`, { skip: process.platform !== 'win32', timeout: 60_000 }, async () => {
+  const project = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+  const directory = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'feishu-switch-preserve-')));
+  const backendExe = path.join(directory, 'codex.exe'), appExe = path.join(directory, 'Feishu Codex.exe');
+  await fs.copyFile(process.execPath, backendExe); await fs.copyFile(process.execPath, appExe);
+  let parentExe = process.execPath, stopRoot = project;
+  if (legacy) {
+    parentExe = path.join(directory, 'ChatGPT.exe'); await fs.copyFile(process.execPath, parentExe);
+    stopRoot = path.join(directory, 'resources/product');
+    await fs.mkdir(path.join(stopRoot, 'scripts'), { recursive: true });
+    for (const file of ['desktop-stop-owned.ps1', 'desktop-process-tree.ps1']) await fs.copyFile(path.join(project, 'scripts', file), path.join(stopRoot, 'scripts', file));
+  }
+  const appCode = `const {spawn}=require('node:child_process');const w=spawn(${JSON.stringify(process.execPath)},['-e','setInterval(()=>{},1000)'],{windowsHide:true,stdio:'ignore'});w.once('spawn',()=>console.log(JSON.stringify({appPid:process.pid,workerPid:w.pid})));setInterval(()=>{},1000);`;
+  // The application is a GUI process in production. Give this console-based
+  // stand-in its own console, while retaining the same parent/child topology.
+  const backendCode = `const {spawn}=require('node:child_process');const c=spawn(${JSON.stringify(appExe)},['-e',${JSON.stringify(appCode)}],{windowsHide:true,detached:true,stdio:['ignore','pipe','ignore']});c.stdout.on('data',b=>console.log(JSON.stringify({...JSON.parse(b.toString()),backendPid:process.pid})));setInterval(()=>{},1000);`;
+  const parentCode = `const {spawn}=require('node:child_process');const c=spawn(${JSON.stringify(backendExe)},['-e',${JSON.stringify(backendCode)},'--','app-server'],{windowsHide:true,stdio:['ignore','pipe','ignore']});c.stdout.pipe(process.stdout);setInterval(()=>{},1000);`;
+  const child = spawn(parentExe, ['-e', parentCode], { windowsHide: true, env: canonicalEnvironment(process.env), stdio: ['ignore', 'pipe', 'pipe'] });
+  let appIdentity;
+  try {
+    const pids = await new Promise((resolve, reject) => {
+      let output = ''; const timer = setTimeout(() => reject(Error('nested application fixture not ready')), 10_000);
+      child.once('error', error => { clearTimeout(timer); reject(error); });
+      child.stdout.on('data', value => { output += value; if (output.includes('\n')) { clearTimeout(timer); resolve(JSON.parse(output.trim())); } });
+    });
+    const ids = [child.pid, pids.backendPid, pids.appPid, pids.workerPid];
+    const inspect = async () => { const s = await inspectWindows(project, [18792], ids); return { ...s, unknownDesktop: false, desktopRoots: s.processes.filter(p => p.pid === child.pid) }; };
+    const before = await inspect(); const desktop = before.desktopRoots[0];
+    appIdentity = before.processes.find(p => p.pid === pids.appPid);
+    assert.ok(desktop?.startedAt && appIdentity?.startedAt);
+    assert.equal(appIdentity.parentPid, pids.backendPid, 'the protected app must actually be nested below the old Codex backend');
+    const captured = await captureProcessTree(project, directory, desktop);
+    assert.ok(captured.tree.some(p => p.pid === pids.appPid));
+    await stopIndependentDesktop({ inspect, expected: desktop, sharedPort: 18791, ...(legacy ? {} : { preserveExecutables: [appExe] }), requestClose: async () => {},
+      terminate: identity => stopVerified(stopRoot, directory, identity.pid === desktop.pid ? { ...captured, ...identity } : identity) });
+    const after = await inspect();
+    assert.ok(!after.processes.some(p => p.pid === child.pid || p.pid === pids.backendPid));
+    assert.ok(after.processes.some(p => p.pid === pids.appPid), 'application must remain alive');
+    assert.ok(after.processes.some(p => p.pid === pids.workerPid), 'application descendants must remain alive');
+  } finally {
+    if (appIdentity) await stopVerified(project, directory, appIdentity).catch(() => {});
+    if (child.exitCode === null) child.kill();
+    assert.equal(path.dirname(directory), await fs.realpath(os.tmpdir()));
+    assert.ok(path.basename(directory).startsWith('feishu-switch-preserve-'));
     await fs.rm(directory, { recursive: true, force: true });
   }
 });

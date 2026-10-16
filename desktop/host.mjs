@@ -10,7 +10,7 @@ import { atomicJson, captureProcessTree, closeWindowVerified, inspectWindows, re
 import { canonicalEnvironment, canRetireReusedIdentity, desktopMode, matchesEntry, RestartBudget, samePath, sameProcess, writePermission } from './lifecycle.mjs';
 import { assertDesktopExitState, checkIdleServices, closeSharedDesktop, desktopExitPlan, finishConfirmedServices, serviceExitIdentity, waitForChildExit } from './shutdown.mjs';
 import { recoverRuntimeEndpoint } from './runtime-endpoint.mjs';
-import { independentDesktop, stopIndependentDesktop } from './switch-desktop.mjs';
+import { applicationExecutables, independentDesktop, stopIndependentDesktop } from './switch-desktop.mjs';
 import { defaultCodexHome, installBundledSkill, managedSkillOwner } from './bundled-skill.mjs';
 import { waitForLaunchAccount } from './launch-account.mjs';
 import { inspectTask } from './runtime-task-state.mjs';
@@ -363,6 +363,7 @@ export async function startHost(options = {}) {
     stopping = true; await publish();
     try {
       await stopIndependentDesktop({ inspect: () => inspectFresh(), expected: expectedDesktop, sharedPort: Number(ws.port), launched: launchedDesktop,
+        preserveExecutables: applicationExecutables(root),
         requestClose: identity => closeWindowVerified(root, dataDir, identity), terminate: identity => stopVerified(root, dataDir, identity) });
       await log('用户确认后已关闭独立 Codex 及其任务后台，正在连接飞书。');
       stopping = false;

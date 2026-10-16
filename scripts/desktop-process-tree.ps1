@@ -18,9 +18,35 @@ function Test-ProcessIdentity($Identity, $Process) {
     return $actual -and $actual.exe -ieq $Identity.exe -and $actual.startedAt -eq $Identity.startedAt
 }
 
-function Get-OwnedProcessTree($Identity, $Snapshot = $null) {
+function Get-PreservedProcessIds($Snapshot, $PreserveExecutables) {
+    $found = @{}
+    if (-not @($PreserveExecutables).Count) { return $found }
+    foreach ($candidate in $Snapshot) {
+        $exe = [string]$candidate.ExecutablePath
+        if (-not $exe -and @($PreserveExecutables | Where-Object { [IO.Path]::GetFileName($_) -ieq $candidate.Name }).Count) {
+            $record = Get-ProcessIdentity $candidate
+            if ($record) { $exe = $record.exe }
+        }
+        if ($exe -and @($PreserveExecutables | Where-Object { $_ -ieq $exe }).Count) { $found[[int]$candidate.ProcessId] = $candidate }
+    }
+    do {
+        $changed = $false
+        foreach ($candidate in $Snapshot) {
+            $parent = $found[[int]$candidate.ParentProcessId]
+            if (-not $parent -or $found.ContainsKey([int]$candidate.ProcessId)) { continue }
+            if ($candidate.CreationDate.ToUniversalTime() -lt $parent.CreationDate.ToUniversalTime()) { continue }
+            $found[[int]$candidate.ProcessId] = $candidate
+            $changed = $true
+        }
+    } while ($changed)
+    return $found
+}
+
+function Get-OwnedProcessTree($Identity, $Snapshot = $null, $PreserveExecutables = @(), $PreservedIds = $null) {
     if ($Identity.pid -le 0 -or -not $Identity.exe -or -not $Identity.startedAt) { throw '进程身份记录不完整。' }
     $all = if ($null -ne $Snapshot) { @($Snapshot) } else { @(Get-CimInstance Win32_Process -ErrorAction Stop) }
+    $preserved = if ($null -ne $PreservedIds) { $PreservedIds } else { Get-PreservedProcessIds $all $PreserveExecutables }
+    if ($preserved.ContainsKey([int]$Identity.pid)) { return }
     $root = $all | Where-Object ProcessId -eq $Identity.pid
     if (-not $root) { return }
     if (-not (Test-ProcessIdentity $Identity $root)) { throw '进程身份已发生变化，没有停止任何服务。' }
@@ -30,7 +56,7 @@ function Get-OwnedProcessTree($Identity, $Snapshot = $null) {
         $changed = $false
         foreach ($candidate in $all) {
             $parent = $found[[int]$candidate.ParentProcessId]
-            if (-not $parent -or $found.ContainsKey([int]$candidate.ProcessId)) { continue }
+            if (-not $parent -or $found.ContainsKey([int]$candidate.ProcessId) -or $preserved.ContainsKey([int]$candidate.ProcessId)) { continue }
             if ($candidate.CreationDate.ToUniversalTime() -lt [DateTimeOffset]::Parse($parent.startedAt).UtcDateTime) { continue }
             $record = Get-ProcessIdentity $candidate
             if ($record) { $found[$record.pid] = $record; $changed = $true }
@@ -39,7 +65,7 @@ function Get-OwnedProcessTree($Identity, $Snapshot = $null) {
     $found.Values | Sort-Object { [DateTimeOffset]::Parse($_.startedAt) }
 }
 
-function Stop-OwnedProcessTree($Identities) {
+function Stop-OwnedProcessTree($Identities, $PreserveExecutables = @()) {
     $known = @{}
     foreach ($identity in @($Identities)) { $known[[int]$identity.pid] = $identity }
     if (-not $known.Count) { return }
@@ -47,12 +73,14 @@ function Stop-OwnedProcessTree($Identities) {
     do {
         $live = @()
         $snapshot = @(Get-CimInstance Win32_Process -ErrorAction Stop)
+        $preserved = Get-PreservedProcessIds $snapshot $PreserveExecutables
+        foreach ($pidToPreserve in @($preserved.Keys)) { $known.Remove($pidToPreserve) }
         $expanded = @{}
         foreach ($identity in @($known.Values)) {
             if ($expanded.ContainsKey([int]$identity.pid)) { continue }
             $candidate = $snapshot | Where-Object ProcessId -eq $identity.pid
             if (-not (Test-ProcessIdentity $identity $candidate)) { continue }
-            foreach ($child in @(Get-OwnedProcessTree $identity $snapshot)) { $known[$child.pid] = $child; $expanded[$child.pid] = $true }
+            foreach ($child in @(Get-OwnedProcessTree $identity $snapshot $PreserveExecutables $preserved)) { $known[$child.pid] = $child; $expanded[$child.pid] = $true }
         }
         $pending = @()
         try {
