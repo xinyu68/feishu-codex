@@ -439,6 +439,7 @@ test('accepted start survives an empty rollout snapshot and retains approval own
   assert.equal(fx.received.some(row=>row.message.method==='turn/steer'),false);
   assert.equal(reads,5);
   assert.equal(approvals,1);
+  for(let attempt=0;attempt<50&&!fx.responses.some(message=>message.id==='approval');attempt++)await pause(2);
   assert.deepEqual(fx.responses.find(message=>message.id==='approval')?.result,{decision:'accept'});
  }finally{await fx.cleanup();}
 });
