@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 
 const MAX_FRAME_BYTES = 8 * 1024 * 1024;
 const PIPE_DIRECTORY = '\\\\.\\pipe\\';
-const APP_PIPE_PATTERN = /^codex-browser-use-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const APP_PIPE_PATTERN = /^codex-(?:app-tools|browser-use)-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export interface DesktopToolsRelayOptions {
   preferredPipePath?: string;

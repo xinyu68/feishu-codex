@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
+import fs from 'node:fs/promises';
 import { startDesktopToolsRelay } from '../src/desktop-tools-relay.js';
 
 const endpoint = () => process.platform === 'win32'
@@ -19,8 +20,8 @@ function frame(value: unknown) {
 }
 const size = (buffer: Buffer) => os.endianness() === 'LE' ? buffer.readUInt32LE(0) : buffer.readUInt32BE(0);
 
-async function fakeDesktop(options: { valid?: boolean; malformed?: boolean; silent?: boolean; split?: boolean } = {}) {
-  const pipe = endpoint();
+async function fakeDesktop(options: { valid?: boolean; malformed?: boolean; silent?: boolean; split?: boolean; pipe?: string } = {}) {
+  const pipe = options.pipe ?? endpoint();
   const requests: any[] = [];
   const sockets = new Set<net.Socket>();
   const server = net.createServer(socket => {
@@ -154,4 +155,16 @@ test('coalesces parallel discovery and probes each candidate once', async t => {
   assert.deepEqual(results, [null, null]);
   assert.equal(scans, 1);
   assert.ok(candidates.every(value => value.requests.length === 1));
+});
+
+test('automatic Windows discovery supports current app-tools and legacy browser-use pipes', { skip: process.platform !== 'win32' }, async t => {
+  for (const prefix of ['codex-app-tools', 'codex-browser-use']) {
+    const name = `${prefix}-${randomUUID()}`;
+    const desktop = await fakeDesktop({ pipe: `\\\\.\\pipe\\${name}` }); t.after(desktop.close);
+    const scan = t.mock.method(fs, 'readdir', async () => [name] as any);
+    const relay = await startDesktopToolsRelay(endpoint(), { preferredPipePath: '' }); t.after(() => relay.close());
+    assert.deepEqual((await exchange(relay.path, call())).result.echoed, call());
+    assert.ok(desktop.requests.some(request => request.method === 'tools/list'));
+    scan.mock.restore();
+  }
 });
