@@ -24,6 +24,8 @@ export type CodexClientOptions = {
   /** Bounded transport recovery backoff; injectable for protocol tests. */
   reconnectDelaysMs?: readonly number[];
   idleTimeoutMs?: number;
+  /** Poll cadence for desktop-loaded threads; injectable for protocol tests. */
+  loadedWatchIntervalMs?: number;
   /** A passive watcher must obey the same desktop ownership gate as a writer. */
   canWatch?: () => Promise<boolean>;
   /** Consultation threads are persisted but must never be watched as desktop work. */
@@ -94,6 +96,8 @@ export class CodexClient implements CodexRuntime {
   private listeners = new Set<(event: RuntimeEvent) => void>();
   private publishers = new Map<string, CodexConnection>();
   private watchers = new Map<string, { connection?: CodexConnection; connecting?: Promise<void>; retry?: NodeJS.Timeout; subscribed?: boolean; established?: boolean }>();
+  private explicitWatchThreads = new Set<string>();
+  private loadedWatchThreads = new Set<string>();
   private loadedWatchTimer?: NodeJS.Timeout;
   private loadedWatchBusy = false;
   private observedLoaded = new Set<string>();
@@ -126,8 +130,13 @@ export class CodexClient implements CodexRuntime {
   }
 
   async watch(threadId: string): Promise<void> {
+    this.explicitWatchThreads.add(threadId);
+    return this.ensureWatch(threadId);
+  }
+
+  private async ensureWatch(threadId: string): Promise<void> {
     if (!this.options.websocketUrl || this.closed || this.consultationThreads.has(threadId) || this.options.isConsultationThread?.(threadId)) return;
-    if (this.options.canWatch && !await this.options.canWatch()) { await this.unwatch(threadId); return; }
+    if (this.options.canWatch && !await this.options.canWatch()) { await this.releaseWatch(threadId); return; }
     let watcher = this.watchers.get(threadId);
     if (!watcher) { watcher = {}; this.watchers.set(threadId, watcher); }
     if (watcher.connecting) return watcher.connecting;
@@ -136,7 +145,7 @@ export class CodexClient implements CodexRuntime {
     const entry = watcher;
     const scheduleReconnect = () => {
       if (this.closed || this.watchers.get(threadId) !== entry || entry.retry) return;
-      entry.retry = setTimeout(() => { entry.retry = undefined; void this.watch(threadId).catch(() => {}); }, WATCH_RECONNECT_DELAY_MS);
+      entry.retry = setTimeout(() => { entry.retry = undefined; void this.ensureWatch(threadId).catch(() => {}); }, WATCH_RECONNECT_DELAY_MS);
       entry.retry.unref();
     };
     entry.connecting = (async () => {
@@ -209,6 +218,12 @@ export class CodexClient implements CodexRuntime {
   }
 
   async unwatch(threadId: string): Promise<void> {
+    this.explicitWatchThreads.delete(threadId);
+    if (this.loadedWatchThreads.has(threadId)) return;
+    await this.releaseWatch(threadId);
+  }
+
+  private async releaseWatch(threadId: string): Promise<void> {
     const watcher = this.watchers.get(threadId);
     if (!watcher) return;
     this.watchers.delete(threadId);
@@ -232,11 +247,19 @@ export class CodexClient implements CodexRuntime {
           } while (cursor);
           return result;
         });
+        const loaded = new Set(ids.filter(threadId => !this.consultationThreads.has(threadId) && !this.options.isConsultationThread?.(threadId)));
+        for (const threadId of [...this.loadedWatchThreads]) {
+          if (loaded.has(threadId)) continue;
+          this.loadedWatchThreads.delete(threadId);
+          this.observedLoaded.delete(threadId);
+          if (!this.explicitWatchThreads.has(threadId)) await this.releaseWatch(threadId);
+        }
         for (const threadId of ids) {
           if (this.consultationThreads.has(threadId) || this.options.isConsultationThread?.(threadId)) continue;
+          this.loadedWatchThreads.add(threadId);
           const firstSeen = !this.observedLoaded.has(threadId);
           this.observedLoaded.add(threadId);
-          await this.watch(threadId).catch(() => undefined);
+          await this.ensureWatch(threadId).catch(() => undefined);
           if (this.consultationThreads.has(threadId) || this.options.isConsultationThread?.(threadId)) continue;
           if (!firstSeen) continue;
           await this.withConnection(async connection => {
@@ -249,7 +272,7 @@ export class CodexClient implements CodexRuntime {
     await poll();
     // The shared runtime may be restarting; a failed background read must not
     // become an unhandled rejection that takes down the Feishu bridge too.
-    this.loadedWatchTimer = setInterval(() => { void poll().catch(() => {}); }, 2_000);
+    this.loadedWatchTimer = setInterval(() => { void poll().catch(() => {}); }, this.options.loadedWatchIntervalMs ?? 2_000);
     this.loadedWatchTimer.unref();
   }
 
@@ -677,6 +700,8 @@ export class CodexClient implements CodexRuntime {
     this.closed = true;
     for (const recovery of this.sharedRecoveries) { recovery.stopped = true; recovery.cancel.abort(); }
     if (this.loadedWatchTimer) clearInterval(this.loadedWatchTimer);
+    this.explicitWatchThreads.clear();
+    this.loadedWatchThreads.clear();
     for (const watcher of this.watchers.values()) if (watcher.retry) clearTimeout(watcher.retry);
     this.watchers.clear();
     // Detaching the product must never interrupt a native desktop task.

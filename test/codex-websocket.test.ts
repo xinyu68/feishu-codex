@@ -611,6 +611,29 @@ test('background loaded-thread polling survives an unavailable runtime and retri
  } finally { await fx.cleanup(); }
 });
 
+test('background loaded-thread polling releases unloaded watchers and reconnects them when reloaded', async () => {
+ const fx=await fixture(undefined,{loadedWatchIntervalMs:20});let loaded=['stale'];let watcher!:WebSocket;let resumes=0;
+ const first=deferred(),second=deferred();fx.status.set('stale','idle');
+ fx.onLoaded=(socket,message)=>fx.reply(socket,message,{data:loaded,nextCursor:null});
+ fx.onResume=(socket,message)=>{if(message.params?.threadId==='stale'){resumes++;if(resumes===1){watcher=socket;first.resolve();}else second.resolve();}return false;};
+ try{
+  await fx.client.watchLoaded();await first.promise;const closed=once(watcher,'close');loaded=[];await closed;
+  assert.equal(resumes,1);
+  loaded=['stale'];await second.promise;assert.equal(resumes,2);
+ }finally{await fx.cleanup();}
+});
+
+test('an explicitly requested watcher survives loaded-thread pruning', async () => {
+ const fx=await fixture(undefined,{loadedWatchIntervalMs:20});let loaded=['pinned'];let watcher!:WebSocket;let resumes=0;
+ fx.status.set('pinned','idle');
+ fx.onLoaded=(socket,message)=>fx.reply(socket,message,{data:loaded,nextCursor:null});
+ fx.onResume=(socket,message)=>{if(message.params?.threadId==='pinned'){resumes++;watcher=socket;}return false;};
+ try{
+  await fx.client.watch('pinned');await fx.client.watchLoaded();loaded=[];await pause(80);
+  assert.equal(resumes,1);assert.equal(watcher.readyState,WebSocket.OPEN);
+ }finally{await fx.cleanup();}
+});
+
 test('history watcher never resumes an unloaded thread or acquires its writer lock', async () => {
  const fx = await fixture(); fx.status.set('history-only', 'notLoaded');
  try {
