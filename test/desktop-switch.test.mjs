@@ -146,7 +146,7 @@ for (const legacy of [false, true]) test(`Windows switch preserves a nested appl
     parentExe = path.join(directory, 'ChatGPT.exe'); await fs.copyFile(process.execPath, parentExe);
     stopRoot = path.join(directory, 'resources/product');
     await fs.mkdir(path.join(stopRoot, 'scripts'), { recursive: true });
-    for (const file of ['desktop-stop-owned.ps1', 'desktop-process-tree.ps1']) await fs.copyFile(path.join(project, 'scripts', file), path.join(stopRoot, 'scripts', file));
+    for (const file of ['desktop-stop-owned.ps1', 'desktop-process-tree.ps1', 'desktop-tcp-snapshot.ps1']) await fs.copyFile(path.join(project, 'scripts', file), path.join(stopRoot, 'scripts', file));
   }
   const appCode = `const {spawn}=require('node:child_process');const w=spawn(${JSON.stringify(process.execPath)},['-e','setInterval(()=>{},1000)'],{windowsHide:true,stdio:'ignore'});w.once('spawn',()=>console.log(JSON.stringify({appPid:process.pid,workerPid:w.pid})));setInterval(()=>{},1000);`;
   // The application is a GUI process in production. Give this console-based

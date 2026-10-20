@@ -154,6 +154,7 @@ export async function startHost(options = {}) {
   const stablePipe = savedRuntime.desktopToolsPipe || '\\\\.\\pipe\\feishu-codex-desktop-tools';
   const components = Object.fromEntries(['relay', 'runtime', 'bridge'].map(name => [name, { name, state: 'stopped', budget: new RestartBudget(), identity: null, child: null, error: '', stableAt: 0 }]));
   let stopping = false, busy = null, launchedDesktop = await readJson(path.join(directory, 'desktop-identity.json'));
+  let exitFailure = '';
   let desktop = desktopMode(snapshot, Number(ws.port), launchedDesktop);
   let publicState;
 
@@ -177,6 +178,7 @@ export async function startHost(options = {}) {
     publicState = { version: 1, appVersion: '0.2.10', pid: process.pid, state: stopping ? 'stopping' : gate.canWrite ? 'ready' : 'paused', ...gate,
       runtime: plain(components.runtime), bridge: plain(components.bridge), relay: plain(components.relay), desktop,
       bridgeUrl: `http://127.0.0.1:${bridgePort}`, updatedAt: new Date().toISOString() };
+    if (exitFailure) Object.assign(publicState, { state: 'error', reason: `退出未完成，服务自动重启已暂停。可再次退出，或点击“重试连接”恢复服务。${exitFailure}` });
     if (persist) await persistState(publicState);
     return publicState;
   }
@@ -408,29 +410,33 @@ export async function startHost(options = {}) {
       const start = performance.now();
       try { return await operation(); } finally { timings[name] = Math.round(performance.now() - start); }
     };
-    snapshot = await timed('inspect', () => inspectFresh());
-    desktop = desktopMode(snapshot, Number(ws.port), launchedDesktop);
-    if (Object.values(components).some(item => item.child?.pid && item.child.exitCode === null && !item.identity)) throw new Error('仍在确认刚启动的服务身份，请稍后退出。');
-    const { desktopIdentity, preservedDesktops } = desktopExitPlan(snapshot, Number(ws.port), launchedDesktop);
-    if (desktopIdentity && !closeDesktop) throw Object.assign(new Error('本应用打开的 Codex 仍在运行，可以与 Feishu Codex 一起退出。'), { code: 'SHARED_CODEX_RUNNING' });
-    // Pause bridge submissions before inspecting tasks or closing the desktop.
-    stopping = true; await publish();
+    const wasStopping = stopping;
+    // The user's confirmed exit intent survives partial cleanup failures. Never
+    // resurrect a service that this exit request has already stopped.
+    if (confirmed) { stopping = true; exitFailure = ''; await publish(); }
     try {
+      snapshot = await timed('inspect', () => inspectFresh());
+      desktop = desktopMode(snapshot, Number(ws.port), launchedDesktop);
+      if (Object.values(components).some(item => item.child?.pid && item.child.exitCode === null && !item.identity)) throw new Error('仍在确认刚启动的服务身份，请稍后退出。');
+      const { desktopIdentity, preservedDesktops } = desktopExitPlan(snapshot, Number(ws.port), launchedDesktop);
+      if (desktopIdentity && !closeDesktop) throw Object.assign(new Error('本应用打开的 Codex 仍在运行，可以与 Feishu Codex 一起退出。'), { code: 'SHARED_CODEX_RUNNING' });
+      // Pause bridge submissions before inspecting tasks or closing the desktop.
+      stopping = true; await publish();
       if (confirmed) {
         // Capture before graceful cleanup can orphan children. Identity checks
         // still apply; active/unknown task state is deliberately not consulted.
-        const captured = await Promise.all(['bridge', 'runtime', 'relay'].map(async name => {
+        const captured = await timed('captureServices', () => Promise.all(['bridge', 'runtime', 'relay'].map(async name => {
           const identity = serviceExitIdentity(snapshot, components[name].identity);
           return identity ? { name, identity: await captureProcessTree(root, dataDir, identity) } : null;
-        }));
-        if (desktopIdentity) await closeSharedDesktop({ inspect: () => inspectFresh(), initialSnapshot: snapshot,
+        })));
+        if (desktopIdentity) await timed('closeDesktop', () => closeSharedDesktop({ inspect: () => inspectFresh(), initialSnapshot: snapshot,
           sharedPort: Number(ws.port), launched: desktopIdentity, assertIdle: async () => {},
           captureTree: identity => captureProcessTree(root, dataDir, identity),
           requestClose: async identity => { try { await closeWindowVerified(root, dataDir, identity); }
             catch (error) { await log(`正常关闭 Codex 未完成，将复核身份后结束进程：${error.message}`); } },
-          terminate: identity => stopVerified(root, dataDir, identity) });
+          terminate: identity => stopVerified(root, dataDir, identity) }));
         assertDesktopExitState(await inspectFresh(), Number(ws.port), launchedDesktop, preservedDesktops);
-        await finishConfirmedServices({
+        await timed('closeServices', () => finishConfirmedServices({
           graceful: async () => {
             if (!captured.some(item => item?.name === 'bridge')) return;
             const controller = new AbortController();
@@ -447,11 +453,11 @@ export async function startHost(options = {}) {
               if (bridge.child) await waitForChildExit(bridge.child, 3500);
             } finally { clearTimeout(timeout); }
           },
-          release: captured.filter(Boolean).map(item => () => stopVerified(root, dataDir, item.identity, definition(item.name).port)),
-        });
+          release: captured.filter(Boolean).map(item => () => timed(`stop:${item.name}`, () => stopVerified(root, dataDir, item.identity, definition(item.name).port))),
+        }));
         clearInterval(interval);
         for (const component of Object.values(components)) component.state = 'stopped';
-        await publish(); await log('用户已确认退出全部服务；任务状态未阻止退出。');
+        await publish(); await log(`用户已确认退出全部服务；任务状态未阻止退出。耗时 ${Math.round(performance.now() - started)}ms；分步 ${JSON.stringify(timings)}`);
         setTimeout(() => { server.close(); server.closeAllConnections(); (options.exit || process.exit)(0); }, 150);
         return { ok: true, closedDesktop: desktopIdentity };
       }
@@ -518,7 +524,12 @@ export async function startHost(options = {}) {
       await publish(); await log(`桌面后台已安全退出。耗时 ${Math.round(performance.now() - started)}ms；分步 ${JSON.stringify(timings)}`);
       setTimeout(() => { server.close(); server.closeAllConnections(); (options.exit || process.exit)(0); }, 150);
       return { ok: true, closedDesktop: desktopIdentity };
-    } catch (error) { stopping = false; await publish(); throw error; }
+    } catch (error) {
+      stopping = confirmed || wasStopping;
+      if (confirmed) exitFailure = error.message;
+      await log(`退出未完成：${error.message}；耗时 ${Math.round(performance.now() - started)}ms；分步 ${JSON.stringify(timings)}${confirmed ? '；已暂停服务自动重启。' : ''}`);
+      await publish(); throw error;
+    }
   }
 
   const server = http.createServer(async (request, response) => {
@@ -537,7 +548,7 @@ export async function startHost(options = {}) {
         if (action === 'openCodex') return openCodex();
         if (action === 'prepareSwitch') return prepareSwitch();
         if (action === 'switchToShared') return switchToShared(expectedDesktop, confirmed);
-        if (action === 'retry') { for (const item of Object.values(components)) item.budget.reset(); return tick(); }
+        if (action === 'retry') { stopping = false; exitFailure = ''; for (const item of Object.values(components)) item.budget.reset(); return tick(); }
         if (action === 'prepareQuit') return prepareQuit();
         if (action === 'shutdownConfirmed') {
           if (confirmed !== true) throw new Error('请先确认退出全部服务。');
@@ -556,12 +567,14 @@ export async function startHost(options = {}) {
   await atomicJson(path.join(directory, 'host-control.json'), { port, token, pid: process.pid, root, dataDir });
   await log('桌面后台已启动；不会在 Windows 登录时自动启动。');
   const interval = setInterval(() => {
+    if (!busy && stopping && exitFailure) { void publish().catch(() => {}); return; }
     if (!busy && !stopping) void serialized(tick).catch(async error => {
       publicState = { ...publicState, state: 'paused', canWrite: false, reason: '无法读取系统状态，已暂停发送。', updatedAt: new Date().toISOString() };
       await persistState(publicState);
       await log(error.message);
     }).catch(() => {});
   }, options.pollMs || 5_000);
+  server.once('close', () => clearInterval(interval));
   void serialized(tick).catch(error => log(error.message));
   return { server, root, dataDir };
 }

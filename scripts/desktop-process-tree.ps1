@@ -76,7 +76,9 @@ function Stop-OwnedProcessTree($Identities, $PreserveExecutables = @()) {
         $preserved = Get-PreservedProcessIds $snapshot $PreserveExecutables
         foreach ($pidToPreserve in @($preserved.Keys)) { $known.Remove($pidToPreserve) }
         $expanded = @{}
-        foreach ($identity in @($known.Values)) {
+        # Expand parents first; descendants already expanded with their parent
+        # must not rebuild the same subtree once per captured child.
+        foreach ($identity in @($known.Values | Sort-Object { [DateTimeOffset]::Parse($_.startedAt) })) {
             if ($expanded.ContainsKey([int]$identity.pid)) { continue }
             $candidate = $snapshot | Where-Object ProcessId -eq $identity.pid
             if (-not (Test-ProcessIdentity $identity $candidate)) { continue }

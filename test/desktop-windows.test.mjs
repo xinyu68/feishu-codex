@@ -75,10 +75,11 @@ test('a verified exited service with a lingering Windows listener can finish cle
     await fs.mkdir(path.join(directory, 'scripts'));
     const script = await fs.readFile(path.join(root, 'scripts/desktop-stop-owned.ps1'), 'utf8');
     // Model the Windows failure: TCP still reports the terminated owner's PID.
-    const mocked = script.replace(/^(\uFEFF?param\([^\n]*\)\r?\n)/, `$1function Get-NetTCPConnection { [pscustomobject]@{ OwningProcess = ${child.pid}; LocalAddress = '127.0.0.1' } }\n`);
+    const mocked = script.replace(/@\(\[FeishuCodex\.TcpSnapshot\]::Read[^\n]+/, `@([pscustomobject]@{ pid = ${child.pid}; state = 'Listen'; localPort = $ServicePort; localAddress = '127.0.0.1' })`);
     assert.notEqual(mocked, script);
     await fs.writeFile(path.join(directory, 'scripts/desktop-stop-owned.ps1'), '\uFEFF' + mocked.replace(/^\uFEFF/, ''));
     await fs.copyFile(path.join(root, 'scripts/desktop-process-tree.ps1'), path.join(directory, 'scripts/desktop-process-tree.ps1'));
+    await fs.copyFile(path.join(root, 'scripts/desktop-tcp-snapshot.ps1'), path.join(directory, 'scripts/desktop-tcp-snapshot.ps1'));
     const exited = once(child, 'exit');
     await stopVerified(directory, directory, identity, 18791);
     await exited;
@@ -178,5 +179,35 @@ test('Windows ownership stop refuses wrong executable and releases only its isol
     const desktop = path.join(directory, 'desktop');
     for (const name of await fs.readdir(desktop).catch(() => [])) await fs.unlink(path.join(desktop, name));
     await fs.rmdir(desktop).catch(() => {}); await fs.rmdir(directory).catch(() => {});
+  }
+});
+
+test('native exit port checks reject a foreign listener and bypass the slow NetTCPIP provider', { skip: process.platform !== 'win32', timeout: 25_000 }, async () => {
+  const directory = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'feishu-native-exit-')));
+  const child = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { windowsHide: true, env: canonicalEnvironment(process.env), stdio: 'ignore' });
+  const server = net.createServer();
+  await once(child, 'spawn');
+  try {
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+    const port = server.address().port;
+    const snapshot = await inspectWindows(root, [port], [child.pid]);
+    const identity = snapshot.processes.find(item => item.pid === child.pid);
+    await fs.mkdir(path.join(directory, 'scripts'));
+    for (const name of ['desktop-process-tree.ps1', 'desktop-tcp-snapshot.ps1']) await fs.copyFile(path.join(root, 'scripts', name), path.join(directory, 'scripts', name));
+    const script = await fs.readFile(path.join(root, 'scripts/desktop-stop-owned.ps1'), 'utf8');
+    const guarded = script.replace(/^(\uFEFF?param\([^\n]*\)\r?\n)/, '$1function Get-NetTCPConnection { throw "Slow provider must not be used" }\n');
+    await fs.writeFile(path.join(directory, 'scripts/desktop-stop-owned.ps1'), '\uFEFF' + guarded.replace(/^\uFEFF/, ''));
+    await assert.rejects(stopVerified(directory, directory, identity, port), /监听端口属于其他进程/);
+    assert.equal(child.exitCode, null, 'foreign port must be rejected before termination');
+    await new Promise(resolve => server.close(resolve));
+    const exited = once(child, 'exit');
+    await stopVerified(directory, directory, identity, port);
+    await exited;
+  } finally {
+    if (server.listening) await new Promise(resolve => server.close(resolve));
+    if (child.exitCode === null) child.kill();
+    assert.equal(path.dirname(directory), await fs.realpath(os.tmpdir()));
+    assert.ok(path.basename(directory).startsWith('feishu-native-exit-'));
+    await fs.rm(directory, { recursive: true, force: true });
   }
 });
