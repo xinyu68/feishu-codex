@@ -24,12 +24,19 @@ export function runWindowlessScript(script, args = [], { timeout = 30_000 } = {}
   });
 }
 
-export function runPowerShell(script, args = [], { timeout = 30_000, interactive = false } = {}) {
+export function runPowerShell(script, args = [], { timeout = 30_000, interactive = false, completion } = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(powershell, ['-NoLogo', '-NoProfile', ...(interactive ? [] : ['-NonInteractive', '-WindowStyle', 'Hidden']), '-ExecutionPolicy', 'Bypass', '-File', script, ...args.map(String)], {
       windowsHide: !interactive, env: canonicalEnvironment(process.env), stdio: interactive ? 'inherit' : ['ignore', 'pipe', 'pipe'],
     });
-    let stdout = '', stderr = '';
+    let stdout = '', stderr = '', settled = false, polling = false, drainTimer, receiptTimer;
+    const finish = (error, terminate = false) => {
+      if (settled) return;
+      settled = true; clearTimeout(timer); clearTimeout(drainTimer); clearInterval(receiptTimer);
+      if (terminate) child.kill();
+      child.stdout?.destroy(); child.stderr?.destroy();
+      if (error) reject(error); else resolve(stdout.trim());
+    };
     // PowerShell helpers emit UTF-8. Decode across chunk boundaries so a split
     // Chinese character is not replaced before the next buffer arrives.
     child.stdout?.setEncoding('utf8');
@@ -37,16 +44,23 @@ export function runPowerShell(script, args = [], { timeout = 30_000, interactive
     child.stdout?.on('data', value => { stdout += value; if (stdout.length > 8_000_000) child.kill(); });
     child.stderr?.on('data', value => { stderr += value; if (stderr.length > 1_000_000) child.kill(); });
     const timer = setTimeout(() => {
-      child.kill();
       const progress = stdout.trim().split(/\r?\n/).at(-1)?.slice(0, 160);
-      reject(new Error(`Windows 操作超时（${path.basename(script)}${progress ? `；${progress}` : ''}）。部分操作可能已完成，请重试。`));
+      finish(new Error(`Windows 操作超时（${path.basename(script)}${progress ? `；${progress}` : ''}）。部分操作可能已完成，请重试。`), true);
     }, timeout);
-    child.once('error', error => { clearTimeout(timer); reject(error); });
-    child.once('close', code => {
-      clearTimeout(timer);
-      if (code === 0) resolve(stdout.trim());
-      else reject(new Error(stderr.trim() || stdout.trim() || `Windows 操作失败（${code}）`));
-    });
+    const result = code => code === 0 ? null : new Error(stderr.trim() || stdout.trim() || `Windows 操作失败（${code}）`);
+    child.once('error', error => finish(error));
+    child.once('close', code => finish(result(code)));
+    // A descendant may retain inherited pipes after the helper has exited.
+    child.once('exit', code => { if (!settled) drainTimer = setTimeout(() => finish(result(code)), 100); });
+    if (completion) receiptTimer = setInterval(async () => {
+      if (settled || polling) return;
+      polling = true;
+      try {
+        const receipt = JSON.parse((await fs.readFile(completion.file, 'utf8')).replace(/^\uFEFF/, ''));
+        if (receipt.schema === 1 && receipt.operationId === completion.operationId && receipt.success === true) finish(null, true);
+      } catch { /* Missing or incomplete receipts never count as success. */ }
+      finally { polling = false; }
+    }, 100);
   });
 }
 
@@ -185,10 +199,14 @@ export async function readJson(file) {
 }
 
 export async function stopVerified(root, dataDir, identity, port = 0) {
-  const file = path.join(dataDir, 'desktop', `stop-${randomUUID()}.json`);
+  const operationId = randomUUID();
+  const file = path.join(dataDir, 'desktop', `stop-${operationId}.json`);
+  const resultFile = `${file}.result`;
   await atomicJson(file, identity);
-  try { await runPowerShell(path.join(root, 'scripts', 'desktop-stop-owned.ps1'), ['-IdentityFile', file, '-Port', port], { timeout: 30_000 }); }
-  finally { await fs.unlink(file).catch(() => {}); }
+  try { await runPowerShell(path.join(root, 'scripts', 'desktop-stop-owned.ps1'),
+    ['-IdentityFile', file, '-Port', port, '-ResultFile', resultFile, '-OperationId', operationId],
+    { timeout: 30_000, completion: { file: resultFile, operationId } }); }
+  finally { await fs.unlink(file).catch(() => {}); await fs.unlink(resultFile).catch(() => {}); }
 }
 
 export async function closeWindowVerified(root, dataDir, identity) {

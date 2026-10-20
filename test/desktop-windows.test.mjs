@@ -8,10 +8,32 @@ import { once } from 'node:events';
 import net from 'node:net';
 import { fileURLToPath } from 'node:url';
 import { canonicalEnvironment } from '../desktop/lifecycle.mjs';
-import { captureProcessTree, closeWindowVerified, closeWindowsInspectors, inspectWindows, powershell, runWindowlessScript, stopVerified } from '../desktop/windows.mjs';
+import { captureProcessTree, closeWindowVerified, closeWindowsInspectors, inspectWindows, powershell, runPowerShell, runWindowlessScript, stopVerified } from '../desktop/windows.mjs';
 
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 after(closeWindowsInspectors);
+
+test('verified completion does not wait for a stuck PowerShell host, while an unrelated receipt cannot authorize success', { skip: process.platform !== 'win32', timeout: 25_000 }, async () => {
+  const directory = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'feishu-exit-receipt-')));
+  const script = path.join(directory, 'cleanup.ps1'), file = path.join(directory, 'result.json'), pidFile = path.join(directory, 'helper.pid');
+  let helperPid;
+  try {
+    await fs.writeFile(script, `param([string]$ResultFile,[string]$OperationId,[string]$PidFile)\n[IO.File]::WriteAllText($PidFile,[string]$PID)\n[IO.File]::WriteAllText($ResultFile,(@{schema=1;operationId=$OperationId;success=$true}|ConvertTo-Json -Compress))\nWrite-Output 'done'\nStart-Sleep -Seconds 60\n`);
+    await runPowerShell(script, ['-ResultFile', file, '-OperationId', 'this-operation', '-PidFile', pidFile],
+      { timeout: 10_000, completion: { file, operationId: 'this-operation' } });
+    helperPid = Number(await fs.readFile(pidFile, 'utf8'));
+    for (let i = 0; i < 20; i++) { try { process.kill(helperPid, 0); } catch { helperPid = null; break; } await new Promise(resolve => setTimeout(resolve, 50)); }
+    assert.equal(helperPid, null, 'only the completed helper must be terminated');
+    await fs.writeFile(script, `param([string]$ResultFile)\n[IO.File]::WriteAllText($ResultFile,'{"schema":1,"operationId":"another-operation","success":true}')\nWrite-Output 'done'\nexit 7\n`);
+    await assert.rejects(runPowerShell(script, ['-ResultFile', file],
+      { timeout: 10_000, completion: { file, operationId: 'next-operation' } }), /done|7/);
+  } finally {
+    if (helperPid) { try { process.kill(helperPid); } catch {} }
+    assert.equal(path.dirname(directory), await fs.realpath(os.tmpdir()));
+    assert.ok(path.basename(directory).startsWith('feishu-exit-receipt-'));
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+});
 
 test('native TCP inspection retains listener and established ownership in both address families', { skip: process.platform !== 'win32', timeout: 25_000 }, async () => {
   for (const address of ['127.0.0.1', '::1']) {
@@ -194,8 +216,14 @@ test('native exit port checks reject a foreign listener and bypass the slow NetT
   try {
     await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
     const port = server.address().port;
-    const snapshot = await inspectWindows(root, [port], [child.pid]);
-    const identity = snapshot.processes.find(item => item.pid === child.pid);
+    let identity;
+    for (let attempt = 0; attempt < 10; attempt++) {
+      const snapshot = await inspectWindows(root, [port], [child.pid]);
+      identity = snapshot.processes.find(item => item.pid === child.pid);
+      if (identity?.exe && identity.startedAt) break;
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    assert.ok(identity?.exe && identity.startedAt);
     await fs.mkdir(path.join(directory, 'scripts'));
     for (const name of ['desktop-process-tree.ps1', 'desktop-tcp-snapshot.ps1']) await fs.copyFile(path.join(root, 'scripts', name), path.join(directory, 'scripts', name));
     const script = await fs.readFile(path.join(root, 'scripts/desktop-stop-owned.ps1'), 'utf8');

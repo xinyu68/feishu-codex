@@ -1,4 +1,4 @@
-﻿param([Parameter(Mandatory=$true)][string]$IdentityFile, [int]$Port = 0)
+﻿param([Parameter(Mandatory=$true)][string]$IdentityFile, [int]$Port = 0, [string]$ResultFile = '', [string]$OperationId = '')
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 . (Join-Path $PSScriptRoot 'desktop-process-tree.ps1')
@@ -10,6 +10,12 @@ function Write-CleanupStage([string]$Stage) {
 }
 function Get-ServiceListeners([int]$ServicePort) {
     @([FeishuCodex.TcpSnapshot]::Read([int[]]@($ServicePort)) | Where-Object { $_.state -eq 'Listen' -and $_.localPort -eq $ServicePort })
+}
+function Complete-Cleanup {
+    if ($ResultFile -and $OperationId) {
+        $result = @{ schema = 1; operationId = $OperationId; success = $true } | ConvertTo-Json -Compress
+        [IO.File]::WriteAllText($ResultFile, $result, [Text.UTF8Encoding]::new($false))
+    }
 }
 $identity = [IO.File]::ReadAllText($IdentityFile) | ConvertFrom-Json
 if ($identity.pid -le 0 -or -not $identity.exe -or -not $identity.startedAt) { throw '进程身份记录不完整，没有停止任何服务。' }
@@ -42,9 +48,12 @@ if ($Port) {
         $owner = Get-CimInstance Win32_Process -Filter "ProcessId = $($identity.pid)" -ErrorAction Stop
         if (-not $owner -and -not @($remaining | Where-Object { $_.pid -ne $identity.pid -or $_.localAddress -ne '127.0.0.1' }).Count) {
             Write-Output '已确认服务进程退出；Windows 仍保留旧监听记录，下次启动将恢复连接。'
+            Complete-Cleanup
             exit 0
         }
         throw '端口尚未释放，已取消后续清理。'
     }
 }
 Write-Output '已确认服务及子进程退出，端口已释放。'
+Complete-Cleanup
+exit 0
