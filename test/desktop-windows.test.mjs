@@ -39,12 +39,14 @@ test('queued Windows checks get individual deadlines and timed out workers recov
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'feishu-inspector-queue-'));
   const script = path.join(directory, 'scripts/desktop-inspect.ps1');
   await fs.mkdir(path.dirname(script));
-  const fixture = delay => `param([switch]$Server, [switch]$ProgressOutput)
+  const fixture = (delay, firstDelay = delay) => `param([switch]$Server, [switch]$ProgressOutput)
+$first = $true
 while ($null -ne ($line = [Console]::In.ReadLine())) {
   $r = $line | ConvertFrom-Json
   [Console]::Out.WriteLine((@{id=$r.id;stage='processes'} | ConvertTo-Json -Compress))
   [Console]::Out.Flush()
-  Start-Sleep -Milliseconds ${delay}
+  Start-Sleep -Milliseconds $(if ($first) { ${firstDelay} } else { ${delay} })
+  $first = $false
   [Console]::Out.WriteLine((@{id=$r.id;ok=$true;result=@{processes=@();connections=@()}} | ConvertTo-Json -Depth 5 -Compress))
   [Console]::Out.Flush()
 }`;
@@ -54,7 +56,9 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
     await inspectWindows(directory, [18792]);
     await Promise.all(Array.from({ length: 4 }, () => inspectWindows(directory, [18792], [], { timeout: 2500 })));
     closeWindowsInspectors();
-    await fs.writeFile(script, fixture(10000));
+    await fs.writeFile(script, fixture(10000, 0));
+    // Complete startup before measuring the deliberately hung process stage.
+    await inspectWindows(directory, [18792]);
     await assert.rejects(inspectWindows(directory, [18792], [], { timeout: 3000 }), /Windows 检查超时.*进程身份/);
     await fs.writeFile(script, fixture(0));
     assert.ok((await inspectWindows(directory, [18792])).connections);
