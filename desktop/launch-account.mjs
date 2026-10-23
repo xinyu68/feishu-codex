@@ -17,8 +17,8 @@ export async function waitForLaunchAccount(probe, url, {
       await log(`Codex 启动检查通过：登录状态已就绪（${now() - started}ms，第 ${attempts} 次检查）。`);
       return state;
     } catch (error) {
-      const retryable = ['RUNTIME_PROBE_TIMEOUT', 'RUNTIME_CONNECTION_CLOSED', 'ECONNRESET', 'ECONNREFUSED', 'EPIPE', 'ETIMEDOUT'].includes(error.code);
-      await log(`Codex 启动检查未通过：${error.code || 'ACCOUNT_CHECK_FAILED'} · ${error.stage || 'account/read'}（${now() - started}ms，第 ${attempts} 次检查）。`);
+      const retryable = ['RUNTIME_PROBE_TIMEOUT', 'RUNTIME_CONNECTION_CLOSED', 'RUNTIME_ACCOUNT_UNAVAILABLE', 'ECONNRESET', 'ECONNREFUSED', 'EPIPE', 'ETIMEDOUT'].includes(error.code);
+      await log(`Codex 启动检查未通过：${error.code || 'ACCOUNT_CHECK_FAILED'} · ${error.stage || 'account/read'}${Number.isInteger(error.rpcCode) ? ` · RPC ${error.rpcCode}` : ''}（${now() - started}ms，第 ${attempts} 次检查）。`);
       if (!retryable) throw error;
       const remaining = deadline - now();
       if (remaining <= retryDelayMs) throw new Error('等待 Codex 登录状态超时，请检查网络后重新点击“打开 Codex”。账号和会话记录均已保留。');

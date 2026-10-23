@@ -82,3 +82,42 @@ test('protocol errors identify whether connection initialization or account read
     }
   }
 });
+
+test('temporary account RPC failures retry until authenticated, without exposing response secrets', async () => {
+  const server = new WebSocketServer({ host: '127.0.0.1', port: 0 }); await once(server, 'listening');
+  let checks = 0;
+  const logs = [];
+  server.on('connection', socket => socket.on('message', raw => {
+    const request = JSON.parse(raw.toString());
+    if (request.method === 'initialize') socket.send(JSON.stringify({ id: request.id, result: {} }));
+    if (request.method === 'account/read') socket.send(JSON.stringify(++checks === 1
+      ? { id: request.id, error: { code: -32603, message: 'temporary connection failure secret-fixture' } }
+      : { id: request.id, result: { account: { type: 'chatgpt' }, requiresOpenaiAuth: true } }));
+  }));
+  try {
+    const result = await waitForLaunchAccount(runtimeProbe, `ws://127.0.0.1:${server.address().port}`, { retryDelayMs: 1, log: async line => logs.push(line) });
+    assert.deepEqual(result, ready); assert.equal(checks, 2);
+    assert.match(logs[0], /RUNTIME_ACCOUNT_UNAVAILABLE.*account\/read.*RPC -32603/);
+    assert.doesNotMatch(logs.join('\n'), /secret-fixture/);
+  } finally { for (const socket of server.clients) socket.terminate(); await new Promise(resolve => server.close(resolve)); }
+});
+
+test('account auth rejection, invalid method and malformed response remain immediate failures', async () => {
+  for (const response of [{ error: { code: -32603, message: 'unauthorized: secret-fixture' } },
+    { error: { code: -32601, message: 'method not found' } }, {}]) {
+    const server = new WebSocketServer({ host: '127.0.0.1', port: 0 }); await once(server, 'listening');
+    let checks = 0;
+    server.on('connection', socket => socket.on('message', raw => {
+      const request = JSON.parse(raw.toString());
+      if (request.method === 'initialize') socket.send(JSON.stringify({ id: request.id, result: {} }));
+      if (request.method === 'account/read') { checks++; socket.send(JSON.stringify({ id: request.id, ...response })); }
+    }));
+    try {
+      await assert.rejects(waitForLaunchAccount(runtimeProbe, `ws://127.0.0.1:${server.address().port}`), error => {
+        assert.equal(error.stage, 'account/read');
+        assert.notEqual(error.code, 'RUNTIME_ACCOUNT_UNAVAILABLE'); assert.doesNotMatch(error.message, /secret-fixture/); return true;
+      });
+      assert.equal(checks, 1);
+    } finally { for (const socket of server.clients) socket.terminate(); await new Promise(resolve => server.close(resolve)); }
+  }
+});

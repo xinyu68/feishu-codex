@@ -26,7 +26,7 @@ export async function runtimeProbe(url, { idle = false, account = false, details
   const fail = error => { rejectOpen?.(error); for (const request of pending.values()) request.reject(error); pending.clear(); };
   const rpc = (method, params) => new Promise((resolve, reject) => {
     stage = method;
-    const id = ++seq; pending.set(id, { resolve, reject });
+    const id = ++seq; pending.set(id, { resolve, reject, method });
     socket.send(JSON.stringify({ id, method, params }), error => { if (error) { pending.delete(id); reject(error); } });
   });
   socket.on('error', fail);
@@ -40,7 +40,15 @@ export async function runtimeProbe(url, { idle = false, account = false, details
       }
       if (!request || value.method) return;
       pending.delete(value.id);
-      if (value.error || !Object.hasOwn(value, 'result')) request.reject(new Error('Codex 暂时无法确认连接状态。'));
+      if (value.error) {
+        const rpcCode = Number.isInteger(value.error.code) ? value.error.code : null;
+        const denied = /unauthorized|forbidden|invalid.?grant|revoked|authentication required|not logged|sign.?in required/i.test(String(value.error.message || ''));
+        const unavailable = request.method === 'account/read' && !denied
+          && (rpcCode === -32603 || (rpcCode >= -32099 && rpcCode <= -32000));
+        request.reject(Object.assign(new Error(unavailable ? 'Codex 登录状态暂时无法读取，正在等待服务恢复。'
+          : `Codex 状态查询失败（${request.method}${rpcCode === null ? '' : `，RPC ${rpcCode}`}）。请检查 Codex 登录与连接。`),
+        { code: unavailable ? 'RUNTIME_ACCOUNT_UNAVAILABLE' : 'RUNTIME_RPC_REJECTED', stage: request.method, rpcCode }));
+      } else if (!Object.hasOwn(value, 'result')) request.reject(Object.assign(new Error(`Codex 返回了无效响应（${request.method}）。`), { code: 'RUNTIME_PROTOCOL_ERROR', stage: request.method }));
       else request.resolve(value.result);
     } catch { fail(new Error('Codex 连接状态异常。')); }
   });
