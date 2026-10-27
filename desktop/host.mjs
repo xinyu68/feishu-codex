@@ -14,6 +14,7 @@ import { applicationExecutables, independentDesktop, stopIndependentDesktop } fr
 import { defaultCodexHome, installBundledSkill, managedSkillOwner } from './bundled-skill.mjs';
 import { waitForLaunchAccount } from './launch-account.mjs';
 import { inspectTask } from './runtime-task-state.mjs';
+import { forceQuitOwnedServices } from './force-quit.mjs';
 
 export async function runtimeProbe(url, { idle = false, account = false, details = false, timeout = 5_000 } = {}) {
   const socket = new WebSocket(url, { handshakeTimeout: timeout, maxPayload: 2 * 1024 * 1024 });
@@ -211,6 +212,7 @@ export async function startHost(options = {}) {
   }
 
   async function ensure(name) {
+    if (stopping) return;
     const item = components[name];
     const spec = definition(name);
     if (!item.identity) item.identity = await readJson(path.join(directory, `${name}-identity.json`));
@@ -257,6 +259,7 @@ export async function startHost(options = {}) {
       const output = await fs.open(path.join(directory, `${name}.stdout.log`), 'a');
       const error = await fs.open(path.join(directory, `${name}.stderr.log`), 'a');
       try {
+        if (stopping) return;
         const child = spawn(spec.exe, spec.args, { cwd: dataDir, env, windowsHide: true, stdio: ['ignore', output.fd, error.fd] });
         item.child = child;
         await new Promise((resolve, reject) => { child.once('spawn', resolve); child.once('error', reject); });
@@ -301,6 +304,7 @@ export async function startHost(options = {}) {
     // Publish topology changes before starting/checking a component.
     await publish();
     for (const name of ['relay', 'runtime', 'bridge']) {
+      if (stopping) break;
       try { await ensure(name); } catch (error) { components[name].state = 'blocked'; components[name].error = error.message; }
       await publish();
     }
@@ -393,25 +397,19 @@ export async function startHost(options = {}) {
   }
 
   async function prepareQuit() {
-    const current = await inspectFresh();
-    const plan = desktopExitPlan(current, Number(ws.port), launchedDesktop);
-    let warning = '';
-    try {
-      await checkIdleServices({
-        runtime: components.runtime.identity && current.processes.some(item => sameProcess(components.runtime.identity, item))
-          ? () => probe(wsUrl, { idle: true, details: true, timeout: 4000 }) : undefined,
-        bridge: components.bridge.identity && current.processes.some(item => sameProcess(components.bridge.identity, item)) ? async () => {
-          const response = await fetch(`http://127.0.0.1:${bridgePort}/api/idle-state`, { signal: AbortSignal.timeout(4000) });
-          if (!response.ok) throw new Error('暂时无法确认飞书任务状态。');
-          return response.json();
-        } : undefined,
-      });
-    } catch (error) { warning = error.message.replace(/，请[^。\n]*。/g, '。'); }
-    return { needsConfirmation: Boolean(plan.desktopIdentity || warning),
-      detail: warning ? `当前任务信息：\n${warning}` : plan.desktopIdentity ? '将同时关闭本应用打开的 Codex。' : '' };
+    return { needsConfirmation: true, detail: '将强制结束本应用的服务及关联 Codex，运行中的任务会中断。' };
   }
 
   async function shutdown({ closeDesktop = false, uninstall = false, confirmed = false } = {}) {
+    if (confirmed) {
+      stopping = true; exitFailure = ''; clearInterval(interval);
+      let result;
+      try { result = await forceQuitOwnedServices({ root, dataDir }); }
+      catch (error) { result = { warnings: [error.message] }; }
+      await log(`用户确认强制退出：${JSON.stringify(result)}`);
+      setTimeout(() => { server.close(); server.closeAllConnections(); (options.exit || process.exit)(0); }, 150);
+      return { ok: true, ...result };
+    }
     const started = performance.now();
     const timings = {};
     const timed = async (name, operation) => {
@@ -552,6 +550,11 @@ export async function startHost(options = {}) {
       // A read-only freshness check need not wait behind slow component health
       // probes. The shared inspection coalesces simultaneous bridge checks.
       if (action === 'checkWrite') { reply(200, await checkWrite()); return; }
+      if (action === 'prepareQuit') { reply(200, await prepareQuit()); return; }
+      if (action === 'shutdownConfirmed') {
+        if (confirmed !== true) throw new Error('请先确认退出全部服务。');
+        reply(200, await shutdown({ closeDesktop: true, confirmed: true })); return;
+      }
       const result = await serialized(async () => {
         if (action === 'openCodex') return openCodex();
         if (action === 'prepareSwitch') return prepareSwitch();

@@ -15,7 +15,7 @@ async function freePort() {
   return port;
 }
 
-test('confirmed exit inspection failure pauses supervision until explicit retry', { timeout: 15_000 }, async () => {
+test('confirmed exit does not consult failing inspections or let a cleanup helper failure keep the host open', { timeout: 15_000 }, async () => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'feishu-exit-recovery-'));
   const root = path.join(directory, 'product'), dataDir = path.join(directory, 'data');
   const port = await freePort(), bridgePort = await freePort(), runtimePort = await freePort();
@@ -28,10 +28,11 @@ test('confirmed exit inspection failure pauses supervision until explicit retry'
   await fs.mkdir(root);
   await fs.writeFile(path.join(dataDir, 'desktop/deployment.json'), JSON.stringify({ state: 'active', productRoot: root }));
   for (const component of components) await fs.writeFile(path.join(dataDir, 'desktop', component.name + '-identity.json'), JSON.stringify(component));
-  let inspections = 0, failNext = false, host;
+  let inspections = 0, failNext = false, host, exits = 0;
   try {
     host = await startHost({ root, dataDir, codexHome: path.join(directory, 'codex'), port, bridgePort,
-      wsUrl: `ws://127.0.0.1:${runtimePort}`, pollMs: 30,
+      wsUrl: `ws://127.0.0.1:${runtimePort}`, pollMs: 60_000,
+      exit: () => { exits++; },
       inspector: async () => {
         inspections++;
         if (failNext) { failNext = false; throw Error('Windows inspection fixture timeout'); }
@@ -43,19 +44,14 @@ test('confirmed exit inspection failure pauses supervision until explicit retry'
     // Wait until the initial tick has finished before introducing a failure.
     await delay(120);
     failNext = true;
-    const failed = await request('shutdownConfirmed');
-    assert.equal(failed.status, 409);
     const count = inspections;
-    await delay(180);
-    assert.equal(inspections, count, 'the supervisor must remain paused after failed confirmed exit');
-    const paused = await (await fetch(`http://127.0.0.1:${port}/status`)).json();
-    assert.equal(paused.canWrite, false);
-    assert.match(paused.reason, /自动重启已暂停/);
-    assert.equal((await request('retry')).status, 200);
-    const resumed = await (await fetch(`http://127.0.0.1:${port}/status`)).json();
-    assert.notEqual(resumed.state, 'stopping');
-    assert.doesNotMatch(resumed.reason, /自动重启已暂停/);
-    assert.ok(inspections > count);
+    assert.equal((await request('prepareQuit')).status, 200);
+    const result = await request('shutdownConfirmed');
+    assert.equal(result.status, 200);
+    assert.equal((await result.json()).ok, true);
+    await delay(250);
+    assert.equal(inspections, count, 'confirmed exit must not depend on another topology check');
+    assert.equal(exits, 1);
   } finally {
     if (host) { await new Promise(resolve => { host.server.close(resolve); host.server.closeAllConnections(); }); }
     const resolved = await fs.realpath(directory);
