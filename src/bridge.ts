@@ -422,25 +422,19 @@ export class Bridge {
         && (known.chatType === 'group' || current.actorId === known.actorId) ? { ...current, ...known, threadId }
         : unavailable('任务历史绑定的接收位置已失效或授权已撤销，未改投其他位置。');
     }
-    if (completion) {
-      const engine = isHermesThread(threadId) ? 'hermes' : 'codex';
-      const targets = this.store.notificationTargets(this.store.config, engine);
-      const configured = engine === 'hermes' ? this.store.config.hermesNotificationTarget : this.store.config.desktopNotificationTarget;
-      if (configured === null) return unavailable(`${targets.length > 1 ? '存在多个已授权的飞书私聊，' : ''}尚未设置默认通知接收位置，请在机器人设置中重新选择。`);
-      if (configured) {
-        const target = targets.find(item => item.chatId === configured.chatId && item.actorId === configured.actorId && item.botAppId === configured.botAppId);
-        return target ? { ...this.store.state.conversations[target.chatId]! }
-          : unavailable('默认通知接收位置已失效，账号或机器人应用不再匹配；请重新选择，未改投其他位置。');
-      }
-      if (targets.length === 1) return { ...this.store.state.conversations[targets[0]!.chatId]! };
-      return unavailable(targets.length > 1
-        ? '存在多个已授权的飞书私聊，尚未设置默认通知接收位置；请在设置中选择。'
-        : '当前没有可用且已授权的飞书私聊。');
+    const engine = isHermesThread(threadId) ? 'hermes' : 'codex';
+    const targets = this.store.notificationTargets(this.store.config, engine);
+    const configured = engine === 'hermes' ? this.store.config.hermesNotificationTarget : this.store.config.desktopNotificationTarget;
+    if (configured === null) return unavailable(`${targets.length > 1 ? '存在多个已授权的飞书私聊，' : ''}尚未设置默认通知接收位置，请在机器人设置中重新选择。`);
+    if (configured) {
+      const target = targets.find(item => item.chatId === configured.chatId && item.actorId === configured.actorId && item.botAppId === configured.botAppId);
+      return target ? { ...this.store.state.conversations[target.chatId]! }
+        : unavailable('默认通知接收位置已失效，账号或机器人应用不再匹配；请重新选择，未改投其他位置。');
     }
-    // Artifact delivery keeps its existing routing and never adopts the completion-only default.
-    const privateChats = conversations.filter(item => !this.store.isGroup(item.chatId) && this.store.isAuthorized(item.chatId, item.actorId));
-    return privateChats.length === 1 ? { ...privateChats[0]! } : unavailable(privateChats.length > 1
-      ? '存在多个已授权的飞书私聊，任务尚未绑定接收位置。' : '当前没有已授权的飞书私聊。');
+    if (targets.length === 1) return { ...this.store.state.conversations[targets[0]!.chatId]! };
+    return unavailable(targets.length > 1
+      ? '存在多个已授权的飞书私聊，尚未设置默认通知接收位置；请在设置中选择。'
+      : '当前没有可用且已授权的飞书私聊。');
   }
   private roleInstructions(conversation: Conversation): string | undefined {
     const chatId = conversation.chatId;

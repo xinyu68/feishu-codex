@@ -36,6 +36,8 @@ test('bundled MCP advertises completion and explicit artifact tools', async t =>
   const artifactReply = replies.find(reply => reply.id === 4);
   assert.deepEqual(artifactReply?.result.structuredContent.paths, [await import('node:fs/promises').then(module => module.realpath(artifact))]);
   assert.match(artifactReply?.result.content[0].text, /已提交 1 个/);
+  assert.match(artifactReply?.result.content[0].text, /接收位置与发送尚未确认/);
+  assert.match(replies[1]?.result.tools[1].description, /同类型的默认通知位置/);
   assert.match(replies.find(reply => reply.id === 5)?.error.message ?? '', /not a regular file/);
 });
 

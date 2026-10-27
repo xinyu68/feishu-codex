@@ -22,7 +22,7 @@ const tools: Array<{ name: string; description: string; inputSchema: Record<stri
   },
 }, {
   name: ARTIFACT_TOOL_NAME,
-  description: '仅当用户明确要求把某个已知的本地成品图片或文件发送到飞书时调用。发送到当前任务绑定的私聊或群聊，不使用默认通知机器人；Hermes 在本轮结束后由桥接发送。只传用户点名或本轮明确生成的成品文件，不要扫描项目、不要发送目录、通配符、源码改动、密钥或其他未明确要求的文件。图片会作为飞书图片发送，其他文件会作为飞书文件发送。返回已提交不等于送达，以桥接的实际发送结果为准。普通编码任务结束时不要自动调用。',
+  description: '仅当用户明确要求把某个已知的本地成品图片或文件发送到飞书时调用。优先发送到当前任务绑定的私聊或群聊；未绑定时使用执行端同类型的默认通知位置，未配置默认时仅在同类型有唯一已授权私聊时自动选择。Codex 与 Hermes 不跨类型兜底；绑定或默认位置失效时停止发送。Hermes 在本轮结束后由桥接发送。只传用户点名或本轮明确生成的成品文件，不要扫描项目、不要发送目录、通配符、源码改动、密钥或其他未明确要求的文件。图片会作为飞书图片发送，其他文件会作为飞书文件发送。返回已提交仅表示文件校验通过，不等于送达，以桥接的实际发送结果为准。普通编码任务结束时不要自动调用。',
   inputSchema: {
     type: 'object',
     properties: {
@@ -106,7 +106,7 @@ input.on('line', line => {
         try {
           const paths = await validateArtifactPaths(args?.paths);
           result(request.id, {
-            content: [{ type: 'text', text: `已提交 ${paths.length} 个成品文件给 Feishu Codex；实际发送结果会显示在飞书中。` }],
+            content: [{ type: 'text', text: `已提交 ${paths.length} 个成品文件给 Feishu Codex；仅文件校验通过，接收位置与发送尚未确认。请勿声称已发送或送达，以桥接实际结果为准；无可用接收位置时不会发送。` }],
             structuredContent: { paths }, isError: false,
           });
         } catch (error) { failure(request.id, -32602, error instanceof Error ? error.message : String(error)); }

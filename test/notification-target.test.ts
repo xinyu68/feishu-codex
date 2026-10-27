@@ -192,15 +192,19 @@ test('revoking access, replacing the selected app or changing chat type after re
   }
 });
 
-test('a completion default does not choose a recipient for an otherwise ambiguous artifact request', async t => {
+test('an unbound artifact uses the selected same-engine default and deduplicates without changing bindings', async t => {
   const fx = fixture(t); fx.store.saveConfig({ desktopNotificationTarget: targetB, autoNotifyDesktop: false });
   const artifact = path.join(fx.dir, 'report.txt'); fs.writeFileSync(artifact, 'private report');
-  fx.emit('turn/snapshot', 'artifact', { items: [{ id: 'artifact-call', type: 'mcpToolCall', server: 'feishu_completion',
-    tool: 'send_artifact_to_feishu', status: 'completed', arguments: { paths: [artifact] } }] });
-  await settle();
-  assert.deepEqual(fx.files, []);
-  assert.deepEqual(fx.cards, []);
-  assert.equal(Object.keys(fx.store.state.artifacts).length, 0);
+  const before = structuredClone(fx.store.state.conversations);
+  const event = { items: [{ id: 'artifact-call', type: 'mcpToolCall', server: 'feishu_completion',
+    tool: 'send_artifact_to_feishu', status: 'completed', arguments: { paths: [artifact] } }] };
+  fx.emit('turn/snapshot', 'artifact', event);
+  for (let count = 0; count < 100 && !fx.cards.length; count++) await new Promise(resolve => setTimeout(resolve, 10));
+  fx.emit('turn/snapshot', 'artifact', event); await settle();
+  assert.deepEqual(fx.files, ['reviewer:oc_b']);
+  assert.equal(fx.cards[0]?.card.title, '成品已发送');
+  assert.equal(Object.values(fx.store.state.artifacts)[0]?.status, 'sent');
+  assert.deepEqual(fx.store.state.conversations, before);
 });
 
 test('an unauthorized current or historical binding does not redirect its result to a valid default', async t => {
@@ -283,4 +287,30 @@ test('Hermes completion defaults are independent, explicit and never cross over 
   assert.equal(fx.cards.length, 1);
   fx.complete('c1'); await settle();
   assert.equal(fx.cards[1]!.botId, 'reviewer');
+});
+
+test('artifact routing honors same-engine defaults, unique targets, revocations and binding priority', async t => {
+  const fx = fixture(t, 2);
+  const resolve = (id = 'unbound') => (fx.bridge as any).notificationRecipient(id);
+  const hermesTarget = fx.store.notificationTargets(fx.store.config, 'hermes').find(item => item.botId === 'hermes-2')!;
+  fx.store.saveConfig({ desktopNotificationTarget: targetB, hermesNotificationTarget: hermesTarget });
+  assert.equal(resolve()?.chatId, chatB);
+  assert.equal(resolve('hermes:unbound')?.chatId, hermesTarget.chatId);
+  fx.store.state.conversations.oc_a!.threadId = 'bound';
+  assert.equal(resolve('bound')?.chatId, 'oc_a');
+  fx.store.rememberThread(fx.store.state.conversations.oc_a!);
+  fx.store.state.conversations.oc_a!.threadId = 'other';
+  assert.equal(resolve('bound')?.chatId, 'oc_a');
+  fx.store.authorize('ou_a', false);
+  assert.equal(resolve('bound'), undefined, 'revoked binding must not redirect to default');
+  fx.store.authorize('ou_b', false, 'reviewer');
+  assert.equal(resolve(), undefined, 'revoked default must not redirect');
+  fx.store.saveConfig({ hermesNotificationTarget: null });
+  assert.equal(resolve('hermes:unbound'), undefined, 'explicitly cleared default stays cleared');
+  fx.store.authorize('ou_h2', false, 'hermes-2');
+  delete fx.store.config.hermesNotificationTarget;
+  assert.equal(resolve('hermes:unbound')?.chatId, conversationKey('hermes-1', 'oc_h1'));
+  fx.store.authorize('ou_h1', false, 'hermes-1');
+  fx.store.authorize('ou_b', true, 'reviewer');
+  assert.equal(resolve('hermes:unbound'), undefined, 'Hermes must never fall back to Codex');
 });
