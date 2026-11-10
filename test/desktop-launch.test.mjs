@@ -238,3 +238,16 @@ test('normal desktop startup uses the windowless task host instead of PowerShell
   assert.doesNotMatch(register, /WindowsPowerShell/i);
   assert.match(taskHost, /shell\.Run\(command, 0, True\)/i);
 });
+
+test('a pending Codex update routes manual open to recovery instead of rejecting as an independent desktop', async () => {
+  const f = fixture();
+  f.coordinator.update({ ...ready('independent', false), codexUpdate: { state: 'recovering', message: 'Restoring after update' } });
+  await f.coordinator.openCodex(); assert.equal(f.calls(), 1);
+});
+
+test('automatic launch waits for update recovery without reporting an independent desktop error', async () => {
+  const f = fixture(); f.coordinator.start(enabled);
+  f.coordinator.update({ ...ready('independent', false), codexUpdate: { state: 'recovering' } });
+  await drain(); assert.equal(f.calls(), 0); assert.notEqual(f.coordinator.getState().state, 'error');
+  f.coordinator.update(ready('shared')); assert.equal(f.coordinator.getState().state, 'idle');
+});

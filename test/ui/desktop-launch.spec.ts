@@ -4,6 +4,15 @@ import type { DesktopPreferences, DesktopStatus } from '../../ui/src/types';
 
 const ready: DesktopStatus = { state: 'ready', canWrite: true, runtime: { state: 'ready' }, bridge: { state: 'ready' }, desktop: { mode: 'closed' }, launch: { state: 'idle' } };
 test.beforeEach(({ page }) => { page.on('pageerror', error => { throw error; }); });
+
+test('Codex package update recovery replaces the independent-mode warning and exposes retry on expiry', async ({ page }) => {
+  await fixture(page, { ...ready, canWrite: false, desktop: { mode: 'independent' }, codexUpdate: { state: 'recovering', message: '检测到 Codex 已更新，正在恢复飞书连接。' } });
+  await expect(page.getByText('检测到 Codex 已更新，正在恢复飞书连接。', { exact: true })).toBeVisible();
+  await expect(page.getByText('Codex 已打开，但尚未连接飞书', { exact: true })).toHaveCount(0);
+  await page.evaluate(() => (window as unknown as { updateNative(status: DesktopStatus): void }).updateNative({ state: 'paused', canWrite: false, desktop: { mode: 'closed' }, codexUpdate: { state: 'expired', message: 'Codex 更新后的自动连接未完成，请点击“打开 Codex”重试。' } }));
+  await page.getByRole('button', { name: '重试连接', exact: true }).click();
+  expect(await page.evaluate(() => (window as unknown as { nativeCalls: string[] }).nativeCalls)).toContain('retry');
+});
 async function fixture(page: Page, status: DesktopStatus = ready, native = true, connection = 'connected') {
   await page.addInitScript(({ initial, native }) => {
     class QuietEventSource extends EventTarget { onmessage = null; onopen = null; close() {} }

@@ -70,6 +70,7 @@ export class LaunchCoordinator {
       return;
     }
     const mode = this.status?.desktop?.mode;
+    if (this.status?.codexUpdate) return;
     if (mode === 'shared') { this.intent = null; this.publish({ state: 'idle' }); return; }
     if (mode === 'independent' && this.intent.kind === 'startup') {
       this.intent = null; this.publish({ state: 'error', message: INDEPENDENT_MESSAGE }); return;
@@ -83,6 +84,7 @@ export class LaunchCoordinator {
     if (this.inFlight) return this.inFlight;
     this.intent = null;
     const mode = this.status?.desktop?.mode;
+    if (this.status?.codexUpdate) return this.launch();
     if (mode === 'independent') return this.reject(INDEPENDENT_MESSAGE);
     if (mode !== 'shared' && (mode !== 'closed' || this.status?.canWrite !== true)) return this.reject('后台尚未准备好。请等待服务就绪，或重试连接后再打开 Codex。');
     return this.launch();

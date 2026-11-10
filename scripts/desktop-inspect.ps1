@@ -46,7 +46,20 @@ function Get-DesktopInspection([string]$PortText, [string]$ProcessIdText) {
     $mcpBinaries = @(Get-ChildItem -LiteralPath (Join-Path $env:LOCALAPPDATA 'OpenAI\Codex\runtimes\cua_node') -Directory -ErrorAction SilentlyContinue | ForEach-Object {
         $candidate = Join-Path $_.FullName 'bin\node.exe'; if (Test-Path -LiteralPath $candidate -PathType Leaf) { Get-Item -LiteralPath $candidate }
     } | Sort-Object LastWriteTime -Descending)
-    return @{ processes = $processes; desktopRoots = $desktopRoots; unknownDesktop = $unknown; connections = $connections; nativeCodexPath = $(if ($binaries.Count) { $binaries[0].FullName } else { $null }); mcpNodePath = $(if ($mcpBinaries.Count) { $mcpBinaries[0].FullName } else { $null }) }
+    # Store registration can lag briefly while an update replaces its package.
+    # Refresh it without holding a launch-time path for the lifetime of the host.
+    if (-not $script:packageCheckedAt -or ([DateTime]::UtcNow - $script:packageCheckedAt).TotalSeconds -ge 10) {
+        $script:desktopPackagePath = $null
+        try {
+            $currentPackage = Get-AppxPackage -Name OpenAI.Codex -ErrorAction Stop | Sort-Object { [version]$_.Version } -Descending | Select-Object -First 1
+            if ($currentPackage) {
+                $candidate = Join-Path $currentPackage.InstallLocation 'app\ChatGPT.exe'
+                if (Test-Path -LiteralPath $candidate -PathType Leaf) { $script:desktopPackagePath = $candidate }
+            }
+        } catch { }
+        $script:packageCheckedAt = [DateTime]::UtcNow
+    }
+    return @{ processes = $processes; desktopRoots = $desktopRoots; unknownDesktop = $unknown; connections = $connections; desktopPackagePath = $script:desktopPackagePath; nativeCodexPath = $(if ($binaries.Count) { $binaries[0].FullName } else { $null }); mcpNodePath = $(if ($mcpBinaries.Count) { $mcpBinaries[0].FullName } else { $null }) }
 }
 
 if ($Server) {

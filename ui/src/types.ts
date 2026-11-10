@@ -48,6 +48,7 @@ export type BotProfile = {
   connection: AppState['connection'];
 };
 export type DesktopStatus = {
+  codexUpdate?: { state: 'recovering' | 'expired'; message: string };
   shellVersion?: string;
   state?: string; canWrite?: boolean; reason?: string; actionError?: string;
   phase?: string; message?: string; error?: string;

@@ -15,6 +15,7 @@ import { defaultCodexHome, installBundledSkill, managedSkillOwner } from './bund
 import { waitForLaunchAccount } from './launch-account.mjs';
 import { inspectTask } from './runtime-task-state.mjs';
 import { forceQuitOwnedServices } from './force-quit.mjs';
+import { CodexUpdateRecovery } from './update-recovery.mjs';
 
 export async function runtimeProbe(url, { idle = false, account = false, details = false, timeout = 5_000 } = {}) {
   const socket = new WebSocket(url, { handshakeTimeout: timeout, maxPayload: 2 * 1024 * 1024 });
@@ -122,6 +123,7 @@ export async function startHost(options = {}) {
   const log = async text => { await fs.appendFile(path.join(directory, 'host.log'), `${new Date().toISOString()} ${text}\n`).catch(() => {}); };
   const ports = [port, bridgePort, Number(ws.port)];
   const inspector = options.inspector || inspectWindows;
+  const executePowerShell = options.runPowerShell || runPowerShell;
   const trackedPids = new Set([process.pid]);
   for (const name of ['host', 'relay', 'runtime', 'bridge']) {
     const saved = await readJson(path.join(directory, `${name}-identity.json`));
@@ -165,6 +167,9 @@ export async function startHost(options = {}) {
   let stopping = false, busy = null, launchedDesktop = await readJson(path.join(directory, 'desktop-identity.json'));
   let exitFailure = '';
   let desktop = desktopMode(snapshot, Number(ws.port), launchedDesktop);
+  const updateRecovery = new CodexUpdateRecovery(options.updateRecovery);
+  let updateState = updateRecovery.observe(snapshot, desktop, launchedDesktop);
+  let lastNativeCodexPath = snapshot.nativeCodexPath;
   let publicState;
 
   let lastPersistenceErrorAt = 0;
@@ -188,6 +193,7 @@ export async function startHost(options = {}) {
       runtime: plain(components.runtime), bridge: plain(components.bridge), relay: plain(components.relay), desktop,
       bridgeUrl: `http://127.0.0.1:${bridgePort}`, updatedAt: new Date().toISOString() };
     if (exitFailure) Object.assign(publicState, { state: 'error', reason: `退出未完成，服务自动重启已暂停。可再次退出，或点击“重试连接”恢复服务。${exitFailure}` });
+    if (updateState && !stopping) Object.assign(publicState, { state: 'paused', codexUpdate: updateState, canWrite: false, reason: updateState.message });
     if (persist) await persistState(publicState);
     return publicState;
   }
@@ -297,10 +303,62 @@ export async function startHost(options = {}) {
     if (ready) item.budget.stable();
   }
 
-  async function tick() {
+  function refreshUpdateState() {
+    const before = updateRecovery.pending;
+    updateState = updateRecovery.observe(snapshot, desktop, launchedDesktop);
+    if (snapshot.nativeCodexPath && !samePath(snapshot.nativeCodexPath, lastNativeCodexPath)) {
+      lastNativeCodexPath = snapshot.nativeCodexPath;
+      components.runtime.budget.reset();
+    }
+    if (!before && updateRecovery.pending) {
+      for (const component of Object.values(components)) component.budget.reset();
+      void log('检测到 Codex 商店版本更新，正在恢复连接；保留仍可用的任务后台。');
+    }
+  }
+
+  async function recoverCodexUpdate() {
+    if (stopping || !updateRecovery.pending || ['runtime', 'bridge', 'relay'].some(name => components[name].state !== 'ready')) return false;
+    const action = updateRecovery.action(snapshot, desktop);
+    if (!action) return false;
+    try {
+      // Do not recycle the shared backend or interrupt desktop/phone work that
+      // is still running after the application window exits for an update.
+      const idle = await probe(wsUrl, { idle: true });
+      if (!idle?.ready || !Number.isInteger(idle.active)) return false;
+      if (idle.active !== 0) { updateRecovery.waitForTasks(); updateState = updateRecovery.observe(snapshot, desktop, launchedDesktop); await publish(); return false; }
+      updateRecovery.resume();
+      snapshot = await inspectFresh();
+      desktop = desktopMode(snapshot, Number(ws.port), launchedDesktop);
+      refreshUpdateState();
+      const fresh = updateRecovery.action(snapshot, desktop);
+      if (!fresh || fresh.kind !== action.kind || (fresh.desktop && !sameProcess(action.desktop, fresh.desktop))) return false;
+      await waitForLaunchAccount(probe, wsUrl, { log });
+      const stillIdle = await probe(wsUrl, { idle: true });
+      if (!stillIdle?.ready || !Number.isInteger(stillIdle.active)) return false;
+      if (stillIdle.active !== 0) { updateRecovery.waitForTasks(); return false; }
+      if (fresh.kind === 'reconnect') {
+        await (options.stopIndependentDesktop || stopIndependentDesktop)({ inspect: () => inspectFresh(),
+          expected: fresh.desktop, sharedPort: Number(ws.port), launched: launchedDesktop,
+          preserveExecutables: applicationExecutables(root),
+          requestClose: identity => closeWindowVerified(root, dataDir, identity), terminate: identity => stopVerified(root, dataDir, identity) });
+        snapshot = await inspectFresh();
+      }
+      await openCodex({ recovering: true, accountVerified: true });
+      updateRecovery.finish(); updateState = null;
+      await log('Codex 更新后的飞书连接已恢复，Feishu Codex 及现有任务后台继续运行。');
+      await publish(); return true;
+    } catch (error) {
+      updateRecovery.failed();
+      await log(`Codex 更新后的连接尚未恢复，将自动重试：${error.message}`);
+      return false;
+    }
+  }
+
+  async function tick({ recover = true } = {}) {
     if (stopping) return publish();
     snapshot = await inspectFresh();
     desktop = desktopMode(snapshot, Number(ws.port), launchedDesktop);
+    refreshUpdateState();
     // Publish topology changes before starting/checking a component.
     await publish();
     for (const name of ['relay', 'runtime', 'bridge']) {
@@ -308,6 +366,7 @@ export async function startHost(options = {}) {
       try { await ensure(name); } catch (error) { components[name].state = 'blocked'; components[name].error = error.message; }
       await publish();
     }
+    if (recover) await recoverCodexUpdate();
     return publicState;
   }
   function serialized(operation) {
@@ -320,31 +379,38 @@ export async function startHost(options = {}) {
   async function checkWrite() {
     snapshot = await inspectFresh(500);
     desktop = desktopMode(snapshot, Number(ws.port), launchedDesktop);
+    refreshUpdateState();
     // Always check fresh topology and component readiness. Persisting its
     // display snapshot is left to tick so a file lock cannot reject a message.
     const current = await publish({ persist: false });
     return { canWrite: current.canWrite, reason: current.reason };
   }
 
-  async function openCodex({ accountVerified = false } = {}) {
+  async function openCodex({ accountVerified = false, recovering = false } = {}) {
     await checkWrite();
+    if (updateRecovery.pending && !recovering) {
+      updateRecovery.retry();
+      await tick({ recover: false });
+      if (await recoverCodexUpdate()) return { ok: true, message: 'Codex 更新后的连接已恢复。' };
+      throw new Error(updateState?.message || 'Codex 更新后的连接正在恢复，请稍后重试。');
+    }
     if (desktop.mode === 'shared') {
-      await runPowerShell(path.join(root, 'scripts', 'desktop-focus.ps1'), ['-ProcessId', desktop.pids[0]]);
+      await executePowerShell(path.join(root, 'scripts', 'desktop-focus.ps1'), ['-ProcessId', desktop.pids[0]]);
       return { ok: true, message: '已连接飞书和 Codex。' };
     }
     if (desktop.mode !== 'closed') throw new Error(desktop.reason);
-    if (!publicState.canWrite) throw new Error(publicState.reason);
+    if (!publicState.canWrite && !(recovering && updateState && ['runtime', 'bridge', 'relay'].every(name => components[name].state === 'ready'))) throw new Error(publicState.reason);
     if (!accountVerified) {
       await waitForLaunchAccount(probe, wsUrl, { log });
     }
     // The user may open the original shortcut while account readiness is
     // pending. Revalidate topology before requesting any desktop launch.
     await checkWrite();
-    if (desktop.mode === 'shared') return openCodex({ accountVerified: true });
+    if (desktop.mode === 'shared') return openCodex({ accountVerified: true, recovering });
     if (desktop.mode !== 'closed') throw new Error(desktop.reason);
-    if (!publicState.canWrite) throw new Error(publicState.reason);
+    if (!publicState.canWrite && !(recovering && updateState && ['runtime', 'bridge', 'relay'].every(name => components[name].state === 'ready'))) throw new Error(publicState.reason);
     const resultFile = path.join(directory, 'desktop-launch-result.json');
-    await runPowerShell(path.join(root, 'scripts', 'launch-packaged-shared.ps1'), ['-WsUrl', wsUrl, '-ResultPath', resultFile], { timeout: 45_000 });
+    await executePowerShell(path.join(root, 'scripts', 'launch-packaged-shared.ps1'), ['-WsUrl', wsUrl, '-ResultPath', resultFile], { timeout: 45_000 });
     const result = await readJson(resultFile);
     if (!result?.started || result.error) throw new Error(result?.error || 'Codex 启动结果尚未确认。');
     let identity;
@@ -559,7 +625,7 @@ export async function startHost(options = {}) {
         if (action === 'openCodex') return openCodex();
         if (action === 'prepareSwitch') return prepareSwitch();
         if (action === 'switchToShared') return switchToShared(expectedDesktop, confirmed);
-        if (action === 'retry') { stopping = false; exitFailure = ''; for (const item of Object.values(components)) item.budget.reset(); return tick(); }
+        if (action === 'retry') { stopping = false; exitFailure = ''; updateRecovery.retry(); for (const item of Object.values(components)) item.budget.reset(); return tick(); }
         if (action === 'prepareQuit') return prepareQuit();
         if (action === 'shutdownConfirmed') {
           if (confirmed !== true) throw new Error('请先确认退出全部服务。');
@@ -587,7 +653,7 @@ export async function startHost(options = {}) {
   }, options.pollMs || 5_000);
   server.once('close', () => clearInterval(interval));
   void serialized(tick).catch(error => log(error.message));
-  return { server, root, dataDir };
+  return { server, root, dataDir, whenIdle: () => busy || Promise.resolve() };
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
