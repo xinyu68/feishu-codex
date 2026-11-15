@@ -46,6 +46,7 @@ for (const mode of ['closed', 'independent']) test(`host automatically restores 
     await fs.rm(directory, { recursive: true, force: true });
   });
   host = await startHost({ root, dataDir, port, bridgePort, wsUrl: `ws://127.0.0.1:${runtimePort}`,
+    prepareRuntime: async sourcePath => ({ exe: sourcePath, sourcePath }),
     codexHome: path.join(directory, 'codex'), pollMs: 50,
     inspector: async () => ({ processes: [own, ...services, ...roots,
       ...(!connected && roots.length ? [{ pid: 900012, parentPid: roots[0].pid, exe: 'C:\\runtime\\codex.exe', startedAt, commandLine: 'codex.exe app-server' }] : [])], desktopRoots: roots, unknownDesktop: false,

@@ -31,6 +31,7 @@ test('confirmed exit does not consult failing inspections or let a cleanup helpe
   let inspections = 0, failNext = false, host, exits = 0;
   try {
     host = await startHost({ root, dataDir, codexHome: path.join(directory, 'codex'), port, bridgePort,
+      prepareRuntime: async sourcePath => ({ exe: sourcePath, sourcePath }),
       wsUrl: `ws://127.0.0.1:${runtimePort}`, pollMs: 60_000,
       exit: () => { exits++; },
       inspector: async () => {

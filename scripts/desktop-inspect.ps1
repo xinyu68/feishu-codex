@@ -50,16 +50,19 @@ function Get-DesktopInspection([string]$PortText, [string]$ProcessIdText) {
     # Refresh it without holding a launch-time path for the lifetime of the host.
     if (-not $script:packageCheckedAt -or ([DateTime]::UtcNow - $script:packageCheckedAt).TotalSeconds -ge 10) {
         $script:desktopPackagePath = $null
+        $script:desktopRuntimePath = $null
         try {
             $currentPackage = Get-AppxPackage -Name OpenAI.Codex -ErrorAction Stop | Sort-Object { [version]$_.Version } -Descending | Select-Object -First 1
             if ($currentPackage) {
                 $candidate = Join-Path $currentPackage.InstallLocation 'app\ChatGPT.exe'
                 if (Test-Path -LiteralPath $candidate -PathType Leaf) { $script:desktopPackagePath = $candidate }
+                $runtimeCandidate = Join-Path $currentPackage.InstallLocation 'app\resources\codex.exe'
+                if (Test-Path -LiteralPath $runtimeCandidate -PathType Leaf) { $script:desktopRuntimePath = $runtimeCandidate }
             }
         } catch { }
         $script:packageCheckedAt = [DateTime]::UtcNow
     }
-    return @{ processes = $processes; desktopRoots = $desktopRoots; unknownDesktop = $unknown; connections = $connections; desktopPackagePath = $script:desktopPackagePath; nativeCodexPath = $(if ($binaries.Count) { $binaries[0].FullName } else { $null }); mcpNodePath = $(if ($mcpBinaries.Count) { $mcpBinaries[0].FullName } else { $null }) }
+    return @{ processes = $processes; desktopRoots = $desktopRoots; unknownDesktop = $unknown; connections = $connections; desktopPackagePath = $script:desktopPackagePath; desktopRuntimePath = $script:desktopRuntimePath; nativeCodexPath = $(if ($binaries.Count) { $binaries[0].FullName } else { $null }); mcpNodePath = $(if ($mcpBinaries.Count) { $mcpBinaries[0].FullName } else { $null }) }
 }
 
 if ($Server) {

@@ -14,8 +14,9 @@ import { applicationExecutables, independentDesktop, stopIndependentDesktop } fr
 import { defaultCodexHome, installBundledSkill, managedSkillOwner } from './bundled-skill.mjs';
 import { waitForLaunchAccount } from './launch-account.mjs';
 import { inspectTask } from './runtime-task-state.mjs';
-import { forceQuitOwnedServices } from './force-quit.mjs';
+import { forceQuitOwnedServices, stopOwnedRuntimeForUpgrade } from './force-quit.mjs';
 import { CodexUpdateRecovery } from './update-recovery.mjs';
+import { RuntimeBundles } from './runtime-bundle.mjs';
 
 export async function runtimeProbe(url, { idle = false, account = false, details = false, timeout = 5_000 } = {}) {
   const socket = new WebSocket(url, { handshakeTimeout: timeout, maxPayload: 2 * 1024 * 1024 });
@@ -170,6 +171,9 @@ export async function startHost(options = {}) {
   const updateRecovery = new CodexUpdateRecovery(options.updateRecovery);
   let updateState = updateRecovery.observe(snapshot, desktop, launchedDesktop);
   let lastNativeCodexPath = snapshot.nativeCodexPath;
+  const runtimeBundles = new RuntimeBundles(dataDir);
+  const prepareRuntime = options.prepareRuntime || (source => runtimeBundles.prepare(source));
+  let runtimeBundle, runtimeUpgrade, runtimePreparationError = '', lastRuntimeError = '', lastRuntimePrune = 0;
   let publicState;
 
   let lastPersistenceErrorAt = 0;
@@ -193,14 +197,20 @@ export async function startHost(options = {}) {
       runtime: plain(components.runtime), bridge: plain(components.bridge), relay: plain(components.relay), desktop,
       bridgeUrl: `http://127.0.0.1:${bridgePort}`, updatedAt: new Date().toISOString() };
     if (exitFailure) Object.assign(publicState, { state: 'error', reason: `退出未完成，服务自动重启已暂停。可再次退出，或点击“重试连接”恢复服务。${exitFailure}` });
-    if (updateState && !stopping) Object.assign(publicState, { state: 'paused', codexUpdate: updateState, canWrite: false, reason: updateState.message });
+    const recovery = runtimeUpgrade
+      ? { state: components.runtime.state === 'blocked' && runtimeUpgrade.stopped ? 'expired' : 'recovering',
+          message: components.runtime.state === 'blocked' && runtimeUpgrade.stopped ? 'Codex 运行文件切换暂未完成，请重试连接或查看日志。'
+            : runtimeUpgrade.uncertain ? '暂时无法确认 Codex 状态，将自动重试运行文件切换。'
+              : runtimeUpgrade.waiting ? 'Codex 运行文件已更新，等待当前任务结束后切换。' : '正在切换完整的 Codex 运行文件，桌面和飞书服务保持运行。' }
+      : runtimePreparationError ? { state: 'recovering', message: runtimePreparationError } : updateState;
+    if (recovery && !stopping) Object.assign(publicState, { state: 'paused', codexUpdate: recovery, canWrite: false, reason: recovery.message });
     if (persist) await persistState(publicState);
     return publicState;
   }
 
   function definition(name) {
     if (name === 'runtime') {
-      const exe = customCodex || snapshot.nativeCodexPath;
+      const exe = runtimeBundle?.exe || components.runtime.identity?.exe;
       if (!exe) throw new Error('未找到已安装的 Codex 后台，请先安装并打开官方 Codex 一次。');
       const notifyServer = path.join(root, 'build', 'server', 'notify-mcp.js');
       const notifyCommand = customMcpNode || process.execPath;
@@ -220,14 +230,34 @@ export async function startHost(options = {}) {
   async function ensure(name) {
     if (stopping) return;
     const item = components[name];
-    const spec = definition(name);
     if (!item.identity) item.identity = await readJson(path.join(directory, `${name}-identity.json`));
+    if (name === 'runtime') {
+      const source = customCodex || snapshot.desktopRuntimePath || snapshot.nativeCodexPath;
+      try {
+        const prepared = await prepareRuntime(source);
+        if (!samePath(prepared.exe, runtimeBundle?.exe)) await log(`Codex 运行文件已完整校验：${prepared.sourcePath || source}`);
+        runtimeBundle = prepared;
+        runtimePreparationError = ''; lastRuntimeError = '';
+        if (runtimeUpgrade) runtimeUpgrade.target = runtimeBundle.exe;
+      } catch (error) {
+        runtimePreparationError = error.message;
+        if (lastRuntimeError !== error.message) {
+          lastRuntimeError = error.message;
+          await log(`Codex 运行文件未就绪：${error.message} · ${source || '未发现来源'}${error.cause ? ` · ${error.cause.code || error.cause.message}${error.cause.path ? ' · ' + path.basename(error.cause.path) : ''}` : ''}`);
+        }
+        if (!item.identity || !sameProcess(item.identity, snapshot.processes.find(candidate => candidate.pid === item.identity.pid))) {
+          item.state = 'blocked'; item.error = runtimePreparationError; return;
+        }
+      }
+    }
+    const spec = definition(name);
     if (!item.identity && item.child) {
       if (item.child.exitCode !== null || item.child.signalCode !== null) {
         item.child = null; item.budget.failed(); item.state = 'backoff';
       } else {
         const candidate = snapshot.processes.find(process => process.pid === item.child.pid);
-        if (candidate && candidate.parentPid === process.pid && samePath(candidate.exe, spec.exe) && (!spec.entry || matchesEntry(candidate, spec.entry))) {
+        const startedSpec = item.launchSpec || spec;
+        if (candidate && candidate.parentPid === process.pid && samePath(candidate.exe, startedSpec.exe) && (!startedSpec.entry || matchesEntry(candidate, startedSpec.entry))) {
           item.identity = { pid: candidate.pid, exe: candidate.exe, startedAt: candidate.startedAt };
           await atomicJson(path.join(directory, `${name}-identity.json`), item.identity);
         } else {
@@ -266,8 +296,9 @@ export async function startHost(options = {}) {
       const error = await fs.open(path.join(directory, `${name}.stderr.log`), 'a');
       try {
         if (stopping) return;
-        const child = spawn(spec.exe, spec.args, { cwd: dataDir, env, windowsHide: true, stdio: ['ignore', output.fd, error.fd] });
+        const child = (options.spawnProcess || spawn)(spec.exe, spec.args, { cwd: dataDir, env, windowsHide: true, stdio: ['ignore', output.fd, error.fd] });
         item.child = child;
+        item.launchSpec = spec;
         await new Promise((resolve, reject) => { child.once('spawn', resolve); child.once('error', reject); });
         trackedPids.add(child.pid);
         child.on('error', failure => { void log(`${name}: ${failure.message}`); });
@@ -301,6 +332,54 @@ export async function startHost(options = {}) {
     item.state = ready ? 'ready' : 'unhealthy';
     item.error = ready ? '' : '进程仍在运行，但暂未就绪。已暂停发送，不会强行结束正在进行的任务。';
     if (ready) item.budget.stable();
+    if (name === 'runtime' && runtimeBundle && !runtimePreparationError) {
+      if (!samePath(live.exe, runtimeBundle.exe)) {
+        if (!runtimeUpgrade) await log('Codex 运行文件发生变化，将在任务空闲后切换到应用保管的完整版本。');
+        runtimeUpgrade ||= { previous: { ...item.identity }, target: runtimeBundle.exe, stopped: false, nextAt: 0 };
+      } else if (ready && runtimeUpgrade) {
+        runtimeUpgrade = null;
+        await log('Codex 完整运行文件切换完成；桌面、飞书和控制服务未重启。');
+      }
+      if (ready && Date.now() - lastRuntimePrune >= 60_000) {
+        lastRuntimePrune = Date.now();
+        await runtimeBundles.prune([...snapshot.processes.map(process => process.exe), runtimeBundle.exe]).catch(() => {});
+      }
+    }
+  }
+
+  async function migrateRuntime() {
+    const migration = runtimeUpgrade;
+    if (stopping || !migration || migration.stopped || runtimePreparationError || Date.now() < migration.nextAt) return;
+    const item = components.runtime;
+    try {
+      const idle = await probe(wsUrl, { idle: true, timeout: 8_000 });
+      if (!idle?.ready || !Number.isInteger(idle.active)) { migration.uncertain = true; await publish(); return; }
+      migration.uncertain = false;
+      if (idle.active !== 0) { migration.waiting = true; await publish(); return; }
+      migration.waiting = false;
+      snapshot = await inspectFresh();
+      const live = snapshot.processes.find(candidate => candidate.pid === migration.previous.pid);
+      const listeners = snapshot.connections.filter(connection => connection.state === 'Listen' && connection.localPort === Number(ws.port));
+      if (!sameProcess(migration.previous, live) || !sameProcess(item.identity, live)
+        || listeners.some(connection => connection.pid !== live.pid || connection.localAddress !== '127.0.0.1')) throw Error('Codex 后台身份或端口已变化，未执行切换。');
+      const target = await prepareRuntime(customCodex || snapshot.desktopRuntimePath || snapshot.nativeCodexPath);
+      if (!samePath(target.exe, migration.target)) return;
+      const confirmed = await probe(wsUrl, { idle: true, timeout: 8_000 });
+      if (!confirmed?.ready || confirmed.active !== 0) { migration.waiting = true; return; }
+      await (options.stopRuntimeForUpgrade || stopOwnedRuntimeForUpgrade)({ root, dataDir, identity: migration.previous });
+      migration.stopped = true;
+      const recorded = await readJson(path.join(directory, 'runtime-identity.json'));
+      if (sameProcess(recorded, migration.previous)) await fs.unlink(path.join(directory, 'runtime-identity.json'));
+      item.identity = null; item.child = null; item.launchSpec = null; item.budget.reset(); item.state = 'starting'; item.error = '';
+      await log('旧 Codex 后台已退出，正在使用完整的新运行文件恢复原连接地址。');
+      snapshot = await inspectFresh();
+      await ensure('runtime');
+    } catch (error) {
+      migration.uncertain = true;
+      migration.nextAt = Date.now() + 5_000;
+      await log(`Codex 运行文件切换暂未完成，将重试：${error.message}`);
+    }
+    await publish();
   }
 
   function refreshUpdateState() {
@@ -366,7 +445,7 @@ export async function startHost(options = {}) {
       try { await ensure(name); } catch (error) { components[name].state = 'blocked'; components[name].error = error.message; }
       await publish();
     }
-    if (recover) await recoverCodexUpdate();
+    if (recover) { await migrateRuntime(); await recoverCodexUpdate(); }
     return publicState;
   }
   function serialized(operation) {
@@ -388,6 +467,10 @@ export async function startHost(options = {}) {
 
   async function openCodex({ accountVerified = false, recovering = false } = {}) {
     await checkWrite();
+    if (runtimeUpgrade || runtimePreparationError) {
+      await tick({ recover: false }); await migrateRuntime();
+      if (runtimeUpgrade || runtimePreparationError) throw Error(publicState.reason || 'Codex 运行文件正在准备，请稍后重试。');
+    }
     if (updateRecovery.pending && !recovering) {
       updateRecovery.retry();
       await tick({ recover: false });
