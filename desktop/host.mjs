@@ -7,9 +7,9 @@ import { randomBytes } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import WebSocket from 'ws';
 import { atomicJson, captureProcessTree, closeWindowVerified, inspectWindows, readJson, runPowerShell, stopVerified } from './windows.mjs';
-import { canonicalEnvironment, canRetireReusedIdentity, desktopMode, matchesEntry, RestartBudget, samePath, sameProcess, writePermission } from './lifecycle.mjs';
+import { canonicalEnvironment, canRetireReusedIdentity, desktopMode, matchesEntry, recordedProcessState, RestartBudget, samePath, sameProcess, writePermission } from './lifecycle.mjs';
 import { assertDesktopExitState, checkIdleServices, closeSharedDesktop, desktopExitPlan, finishConfirmedServices, serviceExitIdentity, waitForChildExit } from './shutdown.mjs';
-import { recoverRuntimeEndpoint } from './runtime-endpoint.mjs';
+import { recoverRuntimeEndpoint, runtimeEndpointConflict } from './runtime-endpoint.mjs';
 import { applicationExecutables, independentDesktop, stopIndependentDesktop } from './switch-desktop.mjs';
 import { defaultCodexHome, installBundledSkill, managedSkillOwner } from './bundled-skill.mjs';
 import { waitForLaunchAccount } from './launch-account.mjs';
@@ -142,19 +142,6 @@ export async function startHost(options = {}) {
   const oldHost = await readJson(path.join(directory, 'host-identity.json'));
   if (oldHost && sameProcess(oldHost, snapshot.processes.find(item => item.pid === oldHost.pid))) throw new Error('桌面后台已经运行。');
   if (snapshot.connections.some(item => item.state === 'Listen' && item.localPort === port)) throw new Error('桌面后台端口被其他程序占用。');
-  if (!options.wsUrl) {
-    const oldRuntime = await readJson(path.join(directory, 'runtime-identity.json'));
-    const recoveredUrl = await recoverRuntimeEndpoint({ snapshot, identity: oldRuntime, url: wsUrl, probe, reservedPorts: [port, bridgePort] });
-    if (recoveredUrl) {
-      await atomicJson(path.join(directory, 'runtime-endpoint-recovery.json'), { previousUrl: wsUrl, wsUrl: recoveredUrl, previousIdentity: oldRuntime, recoveredAt: new Date().toISOString() });
-      await atomicJson(path.join(dataDir, 'runtime.json'), { ...savedRuntime, mode: 'shared', wsUrl: recoveredUrl });
-      ports[2] = Number(new URL(recoveredUrl).port);
-      wsUrl = recoveredUrl; ws = new URL(recoveredUrl);
-      await fs.unlink(path.join(directory, 'runtime-identity.json'));
-      await log('旧 Codex 服务已退出，但 Windows 尚未释放端口；已切换到可用的本机连接端口，未终止其他程序。');
-      snapshot = await inspectFresh();
-    }
-  }
   try {
     const skill = await installBundledSkill({ root, codexHome });
     if (skill.status !== 'unchanged') await log(`内置 Skill：${skill.status} · ${skill.path}${['conflict', 'modified'].includes(skill.status) ? '（保留现有文件）' : ''}`);
@@ -174,6 +161,7 @@ export async function startHost(options = {}) {
   const runtimeBundles = new RuntimeBundles(dataDir);
   const prepareRuntime = options.prepareRuntime || (source => runtimeBundles.prepare(source));
   let runtimeBundle, runtimeUpgrade, runtimePreparationError = '', lastRuntimeError = '', lastRuntimePrune = 0;
+  let endpointChange, endpointDesktop, endpointRecoveryError = '';
   let publicState;
 
   let lastPersistenceErrorAt = 0;
@@ -204,6 +192,8 @@ export async function startHost(options = {}) {
               : runtimeUpgrade.waiting ? 'Codex 运行文件已更新，等待当前任务结束后切换。' : '正在切换完整的 Codex 运行文件，桌面和飞书服务保持运行。' }
       : runtimePreparationError ? { state: 'recovering', message: runtimePreparationError } : updateState;
     if (recovery && !stopping) Object.assign(publicState, { state: 'paused', codexUpdate: recovery, canWrite: false, reason: recovery.message });
+    if ((endpointChange || endpointDesktop || endpointRecoveryError) && !stopping) Object.assign(publicState, { state: 'paused', canWrite: false,
+      reason: endpointRecoveryError || 'Codex 连接端口被占用，正在自动更换端口并恢复连接。' });
     if (persist) await persistState(publicState);
     return publicState;
   }
@@ -433,19 +423,107 @@ export async function startHost(options = {}) {
     }
   }
 
+  async function recoverEndpoint() {
+    if (options.wsUrl || stopping) return;
+    const runtime = components.runtime;
+    if (runtime.child && runtime.child.exitCode === null && runtime.child.signalCode === null) return;
+    const identity = runtime.identity || await readJson(path.join(directory, 'runtime-identity.json'));
+    if (!endpointChange) {
+      if (!runtimeEndpointConflict(snapshot, identity, wsUrl)) { endpointRecoveryError = ''; return; }
+      const next = await recoverRuntimeEndpoint({ snapshot, identity, url: wsUrl, probe, reservedPorts: [port, bridgePort] });
+      if (!next) return;
+      endpointChange = { next, previousUrl: wsUrl, identity };
+      await log(`Codex 连接端口 ${ws.port} 已被占用，正在选择其他可用端口；不会停止占用端口的程序。`);
+    }
+    await publish();
+    // The old bridge holds the previous WebSocket URL in its environment.
+    // Close it only when idle, then start one consumer using the new URL.
+    const bridge = components.bridge, spec = definition('bridge');
+    const recorded = bridge.identity || await readJson(path.join(directory, 'bridge-identity.json'));
+    const live = recorded && snapshot.processes.find(candidate => candidate.pid === recorded.pid);
+    const listeners = snapshot.connections.filter(item => item.state === 'Listen' && item.localPort === bridgePort);
+    if (live) {
+      if (!sameProcess(recorded, live) || !samePath(live.exe, spec.exe) || !matchesEntry(live, spec.entry)
+        || listeners.some(item => item.pid !== live.pid || item.localAddress !== '127.0.0.1')) throw Error('无法核验飞书服务归属，暂缓更换端口。');
+      if (!endpointChange.bridgeClosing) {
+        const response = await fetch(`http://127.0.0.1:${bridgePort}/api/idle-state`, { signal: AbortSignal.timeout(3000) });
+        const idle = response.ok && await response.json();
+        if (!idle || typeof idle.activeWork !== 'boolean' || !Array.isArray(idle.conversations) || !Array.isArray(idle.pendingRequests)
+          || typeof idle.csrfToken !== 'string') throw Error('暂时无法确认飞书任务状态，稍后自动重试端口恢复。');
+        if (idle.activeWork || idle.pendingRequests.length || idle.conversations.some(item => item.busy)) {
+          endpointRecoveryError = 'Codex 端口被占用，等待飞书当前任务结束后自动恢复连接。'; return;
+        }
+        const closed = await fetch(`http://127.0.0.1:${bridgePort}/api/shutdown`, { method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-Bridge-Token': idle.csrfToken }, body: '{}', signal: AbortSignal.timeout(5000) });
+        if (!closed.ok) throw Error('飞书服务仍在处理任务，稍后自动重试端口恢复。');
+        endpointChange.bridgeClosing = true;
+      }
+      endpointRecoveryError = '正在重连飞书服务，消息不会自动重复提交。'; return;
+    }
+    if (listeners.length || (recorded && recordedProcessState(recorded, snapshot.processes) !== 'dead')) throw Error('飞书服务尚未完全退出，稍后自动重试端口恢复。');
+    // Recheck the runtime after the bridge has released its consumers. An
+    // inspection change must never authorize replacing a live backend.
+    if (identity && recordedProcessState(identity, snapshot.processes) !== 'dead') throw Error('Codex 后台状态已变化，暂缓更换端口。');
+    const configuration = await readJson(path.join(dataDir, 'runtime.json')) || {};
+    if (configuration.wsUrl && ![endpointChange.previousUrl, endpointChange.next].includes(configuration.wsUrl)) throw Error('Codex 连接配置已变化，请重试连接。');
+    const previous = await readJson(path.join(directory, 'runtime-identity.json'));
+    if (previous && !sameProcess(previous, endpointChange.identity)) throw Error('Codex 后台归属已变化，暂缓更换端口。');
+    if (desktop.mode === 'shared' && sameProcess(launchedDesktop, snapshot.desktopRoots?.[0])) endpointDesktop = { ...launchedDesktop };
+    await atomicJson(path.join(directory, 'runtime-endpoint-recovery.json'), { previousUrl: endpointChange.previousUrl,
+      wsUrl: endpointChange.next, previousIdentity: endpointChange.identity, recoveredAt: new Date().toISOString() });
+    await atomicJson(path.join(dataDir, 'runtime.json'), { ...configuration, mode: 'shared', wsUrl: endpointChange.next });
+    wsUrl = endpointChange.next; ws = new URL(wsUrl); ports[2] = Number(ws.port);
+    for (const name of ['runtime', 'bridge']) {
+      await fs.unlink(path.join(directory, `${name}-identity.json`)).catch(error => { if (error.code !== 'ENOENT') throw error; });
+      const item = components[name]; item.identity = null; item.child = null; item.launchSpec = null; item.state = 'stopped'; item.error = ''; item.budget.reset();
+    }
+    runtimeUpgrade = null; endpointChange = null; endpointRecoveryError = '';
+    desktop = desktopMode(snapshot, Number(ws.port), launchedDesktop);
+    await log(`Codex 连接已自动改用本机端口 ${ws.port}，正在恢复服务；原端口的程序保持运行。`);
+    snapshot = await inspectFresh();
+  }
+
+  async function reconnectEndpointDesktop() {
+    if (!endpointDesktop || stopping || ['runtime', 'bridge', 'relay'].some(name => components[name].state !== 'ready')) return;
+    if (snapshot.desktopRoots.some(item => !sameProcess(item, endpointDesktop)) || snapshot.unknownDesktop) {
+      endpointDesktop = null; return; // Never restart a separately opened desktop.
+    }
+    if (snapshot.desktopRoots.length) {
+      await closeSharedDesktop({ inspect: () => inspectFresh(), initialSnapshot: snapshot, sharedPort: Number(ws.port), launched: endpointDesktop,
+        assertIdle: async () => {
+          const state = await probe(wsUrl, { idle: true });
+          if (!state?.ready || state.active !== 0) throw Error('等待 Codex 当前任务结束后恢复桌面连接。');
+        }, captureTree: identity => captureProcessTree(root, dataDir, identity),
+        requestClose: identity => closeWindowVerified(root, dataDir, identity), terminate: identity => stopVerified(root, dataDir, identity) });
+    }
+    launchedDesktop = null;
+    await fs.unlink(path.join(directory, 'desktop-identity.json')).catch(error => { if (error.code !== 'ENOENT') throw error; });
+    const reconnecting = endpointDesktop; endpointDesktop = null;
+    try { await openCodex(); await log('Codex 桌面已重新连接到自动恢复的本机端口。'); }
+    catch (error) { endpointDesktop = reconnecting; throw error; }
+  }
+
   async function tick({ recover = true } = {}) {
     if (stopping) return publish();
     snapshot = await inspectFresh();
     desktop = desktopMode(snapshot, Number(ws.port), launchedDesktop);
     refreshUpdateState();
+    try { await recoverEndpoint(); }
+    catch (error) {
+      if (endpointRecoveryError !== error.message) await log(`Codex 端口自动恢复暂未完成：${error.message}`);
+      endpointRecoveryError = error.message;
+    }
     // Publish topology changes before starting/checking a component.
     await publish();
+    if (endpointChange || endpointRecoveryError) return publicState;
     for (const name of ['relay', 'runtime', 'bridge']) {
       if (stopping) break;
       try { await ensure(name); } catch (error) { components[name].state = 'blocked'; components[name].error = error.message; }
       await publish();
     }
     if (recover) { await migrateRuntime(); await recoverCodexUpdate(); }
+    try { await reconnectEndpointDesktop(); }
+    catch (error) { await log(`Codex 桌面端口重连暂未完成：${error.message}`); }
     return publicState;
   }
   function serialized(operation) {

@@ -22,11 +22,26 @@ test('a responding runtime is preserved even if Windows inspection omitted its p
   assert.equal(result, null);
 });
 
-test('foreign and live listeners do not trigger recovery or a protocol connection', async () => {
-  for (const state of [snapshot([identity]), snapshot([], [{ state: 'Listen', localPort: 18791, localAddress: '127.0.0.1', pid: 32 }])]) {
+test('live and unverifiable recorded runtimes never change endpoint', async () => {
+  for (const state of [snapshot([identity]), snapshot([{ ...identity, exe: '' }])]) {
     assert.equal(await recoverRuntimeEndpoint({ snapshot: state, identity, url: 'ws://127.0.0.1:18791',
       probe: () => { throw new Error('must not probe'); }, allocate: () => { throw new Error('must not allocate'); } }), null);
   }
+});
+
+test('a foreign wildcard system listener selects a new port without probing the foreign service', async () => {
+  const state = snapshot([], ['0.0.0.0', '::'].map(localAddress => ({ state: 'Listen', localPort: 18791, localAddress, pid: 4240 })));
+  for (const old of [identity, null, { ...identity, pid: 4240 }]) {
+    assert.equal(await recoverRuntimeEndpoint({ snapshot: state, identity: old, url: 'ws://127.0.0.1:18791',
+      probe: () => { throw Error('must not contact Spooler'); }, allocate: async () => 18793 }), 'ws://127.0.0.1:18793');
+  }
+});
+
+test('an unrecorded Codex listener is left alone rather than creating a duplicate backend', async () => {
+  const state = snapshot([{ pid: 32, exe: 'C:\\Codex\\codex.exe', commandLine: 'codex.exe app-server --listen ws://127.0.0.1:18791' }],
+    [{ state: 'Listen', localPort: 18791, localAddress: '127.0.0.1', pid: 32 }]);
+  assert.equal(await recoverRuntimeEndpoint({ snapshot: state, identity, url: 'ws://127.0.0.1:18791',
+    probe: () => { throw Error('must not probe'); }, allocate: () => { throw Error('must not allocate'); } }), null);
 });
 
 test('an unresponsive exited runtime selects a usable loopback port without closing the old listener', async t => {

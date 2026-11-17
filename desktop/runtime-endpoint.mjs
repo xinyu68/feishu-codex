@@ -9,12 +9,26 @@ export function orphanedRuntimeListener(snapshot, identity, port) {
 
 export async function recoverRuntimeEndpoint({ snapshot, identity, url, probe, allocate = availableLoopbackPort, reservedPorts = [] }) {
   const current = new URL(url);
-  if (!orphanedRuntimeListener(snapshot, identity, Number(current.port))) return null;
+  const conflict = runtimeEndpointConflict(snapshot, identity, url);
+  if (!conflict) return null;
   // A responding server must never be replaced just because an inspection missed it.
-  if ((await probe(url, { timeout: 1500 }).catch(() => ({ ready: false })))?.ready) return null;
+  // Never send the Codex protocol to a known foreign service, such as Spooler.
+  if (conflict === 'orphaned' && (await probe(url, { timeout: 1500 }).catch(() => ({ ready: false })))?.ready) return null;
   const port = await allocate();
   if (!Number.isInteger(port) || port < 1024 || port > 65535 || port === Number(current.port) || reservedPorts.includes(port)) throw new Error('无法分配可用的本机连接端口。');
   return `ws://127.0.0.1:${port}`;
+}
+
+export function runtimeEndpointConflict(snapshot, identity, url) {
+  if (identity && recordedProcessState(identity, snapshot.processes) !== 'dead') return null;
+  const listeners = snapshot.connections.filter(item => item.state === 'Listen' && item.localPort === Number(new URL(url).port));
+  if (!listeners.length) return null;
+  // An unrecorded Codex listener may belong to an existing session. Leave it
+  // alone instead of starting a second backend against the same histories.
+  if (listeners.some(listener => snapshot.processes.some(item => item.pid === listener.pid
+    && /(?:^|[\\/])codex\.exe$/i.test(item.exe || '') && /\bapp-server\b/.test(item.commandLine || '')
+    && item.commandLine.includes(url)))) return null;
+  return orphanedRuntimeListener(snapshot, identity, Number(new URL(url).port)) ? 'orphaned' : 'foreign';
 }
 
 function availableLoopbackPort() {
