@@ -1,5 +1,6 @@
 const DEFAULT_PREFERENCES = Object.freeze({ openCodexOnLaunch: true, closeWindowAction: 'tray' });
 const INDEPENDENT_MESSAGE = 'Codex 已打开，但尚未连接飞书。点击“连接飞书”，确认后会重新打开 Codex。';
+const WAITING_MESSAGE = '正在准备飞书服务，就绪后会自动打开 Codex。';
 
 export function validatePreferences(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)
@@ -50,7 +51,7 @@ export class LaunchCoordinator {
     if (!validatePreferences(preferences).openCodexOnLaunch || this.hidden) return this.getState();
     if (this.inFlight || this.intent) return this.getState();
     this.intent = { kind: 'startup', deadline: null };
-    this.publish({ state: 'opening', message: '正在准备飞书服务，就绪后会自动打开 Codex。' });
+    this.publish({ state: 'opening', message: WAITING_MESSAGE });
     this.evaluate();
     return this.getState();
   }
@@ -63,25 +64,42 @@ export class LaunchCoordinator {
   evaluate() {
     if (!this.intent || this.inFlight) return;
     if (this.intent.kind === 'startup' && (!this.status || this.status.state === 'setup')) { this.intent.deadline = null; return; }
+    const mode = this.status.desktop?.mode;
+    if (mode === 'shared' && !this.status.codexUpdate) { this.intent = null; this.publish({ state: 'idle' }); return; }
+    if (this.status.runtime?.state === 'preparing') {
+      this.intent.deadline = null;
+      const message = mode === 'closed'
+        ? '正在准备 Codex 运行文件，就绪后会自动打开 Codex。'
+        : this.status.reason || '正在准备 Codex 运行文件，请稍候。';
+      this.publish({ state: 'opening', message });
+      return;
+    }
     if (this.intent.deadline === null) this.intent.deadline = this.now() + this.readyTimeoutMs;
     if (this.now() >= this.intent.deadline) {
       this.intent = null;
       this.publish({ state: 'error', message: '等待服务就绪超时。可以重试连接，就绪后手动打开 Codex；不会自动重复启动。' });
       return;
     }
-    const mode = this.status?.desktop?.mode;
-    if (this.status?.codexUpdate) return;
-    if (mode === 'shared') { this.intent = null; this.publish({ state: 'idle' }); return; }
+    if (this.status?.codexUpdate) {
+      this.publish({ state: 'opening', message: this.status.codexUpdate.message || WAITING_MESSAGE });
+      return;
+    }
     if (mode === 'independent' && this.intent.kind === 'startup') {
       this.intent = null; this.publish({ state: 'error', message: INDEPENDENT_MESSAGE }); return;
     }
-    if (mode !== 'closed' || this.status?.canWrite !== true) return;
+    if (mode !== 'closed' || this.status?.canWrite !== true) {
+      this.publish({ state: 'opening', message: WAITING_MESSAGE });
+      return;
+    }
     this.intent = null;
     if (this.hidden) { this.publish({ state: 'idle' }); return; }
     void this.launch().catch(() => {});
   }
   openCodex() {
     if (this.inFlight) return this.inFlight;
+    if (this.status?.runtime?.state === 'preparing') {
+      return Promise.reject(new Error(this.status.reason || '正在准备 Codex 运行文件，请稍候。'));
+    }
     this.intent = null;
     const mode = this.status?.desktop?.mode;
     if (this.status?.codexUpdate) return this.launch();

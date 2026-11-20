@@ -19,3 +19,5 @@ Codex and Feishu/Lark names and trademarks belong to their respective owners. Th
 Electron, Node.js, React, the Feishu SDK and other dependencies retain their own licenses. The Windows package includes the Node.js license and the installed production dependencies with their notices; Electron distribution notices are supplied by the packaging toolchain.
 
 The Feishu Codex application icon is project-specific, AI-assisted artwork, included under this project's MIT terms. It is not an official Codex or Feishu logo. Source artwork and its design prompt are in `desktop/assets/`.
+
+Microsoft Playwright MCP and Playwright are distributed under Apache-2.0. Their licenses and notices are included with the production dependencies. The browser integration uses a separate browser context and does not implement or replace OpenAI Desktop authorization.

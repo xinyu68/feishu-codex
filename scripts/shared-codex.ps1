@@ -264,6 +264,10 @@ function Start-SharedCodex {
     $arguments += @('-c', 'mcp_servers.feishu_completion.tool_timeout_sec=1830')
     $bridgePort = if ($env:FEISHU_CODEX_PORT) { [string]$env:FEISHU_CODEX_PORT } else { '8790' }
     $arguments += @('-c', ('mcp_servers.feishu_completion.env.FEISHU_CODEX_PORT=' + (ConvertTo-Json $bridgePort -Compress)))
+    $browserLauncher = Join-Path $PSScriptRoot 'playwright-mcp.mjs'
+    $browserOverridesJson = & $notifyNode $browserLauncher --config-args --data-dir $dataRoot
+    if ($LASTEXITCODE -ne 0) { throw 'Unable to configure the bundled Playwright MCP.' }
+    $arguments += @($browserOverridesJson | ConvertFrom-Json)
     $argumentLine = ($arguments | ForEach-Object { ConvertTo-CodexNativeArgument $_ }) -join ' '
     $previousToolsPipe = $env:CODEX_APP_TOOLS_PIPE_PATH
     $previousMcpNode = $env:CODEX_MCP_NODE_PATH

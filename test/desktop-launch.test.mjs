@@ -81,6 +81,30 @@ test('startup times out without retries or process effects', async () => {
   f.coordinator.update(ready()); await drain(); assert.equal(f.calls(), 0);
 });
 
+test('slow runtime preparation keeps the startup request until Codex and Feishu are ready', async () => {
+  const f = fixture();
+  const starting = { state: 'starting', canWrite: false, desktop: { mode: 'closed' } };
+  const preparing = { ...starting, runtime: { state: 'preparing' } };
+  f.coordinator.start(enabled);
+  f.coordinator.update(starting);
+  f.advance(20_000);
+  f.coordinator.update(preparing);
+  f.advance(150_000);
+  f.coordinator.update(preparing);
+
+  assert.match(f.coordinator.getState().message, /正在准备 Codex 运行文件.*自动打开/);
+  await assert.rejects(f.coordinator.openCodex(), /正在准备 Codex 运行文件/);
+  assert.equal(f.calls(), 0);
+
+  f.coordinator.update(starting);
+  f.advance(30_000);
+  f.coordinator.update(ready());
+  f.coordinator.update(ready());
+  await drain();
+  assert.equal(f.calls(), 1);
+  assert.equal(f.coordinator.getState().state, 'idle');
+});
+
 test('double click shares one confirmation and carries the originally confirmed identity', async () => {
   let confirm, confirmations = 0, restarts = 0;
   const expected = { pid: 73, exe: 'original', startedAt: 'before-popup' };

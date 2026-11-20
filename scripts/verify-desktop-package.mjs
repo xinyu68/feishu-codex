@@ -34,6 +34,9 @@ export async function verifyDesktopPackage(resources) {
   if (digest(await fs.readFile(path.join(sourceRoot, skill))) !== digest(await fs.readFile(path.join(product, skill)))) throw new Error('安装包内置 Skill 缺失或不完整。');
   const hermesLauncher = 'scripts/hermes-runtime.py';
   if (digest(await fs.readFile(path.join(sourceRoot, hermesLauncher))) !== digest(await fs.readFile(path.join(product, hermesLauncher)))) throw new Error('安装包 Hermes 启动组件缺失或不完整。');
+  for (const entry of ['desktop/playwright-mcp.mjs', 'scripts/playwright-mcp.mjs']) {
+    if (digest(await fs.readFile(path.join(sourceRoot, entry))) !== digest(await fs.readFile(path.join(product, entry)))) throw new Error(`安装包浏览器组件缺失或不完整：${entry}`);
+  }
   const expected = path.join(sourceRoot, '.desktop-package', 'product', 'node_modules');
   const dependencyFiles = await verifyDependencyTree(expected, path.join(product, 'node_modules'));
   const node = path.join(resources, 'node', 'node.exe');
@@ -43,6 +46,8 @@ export async function verifyDesktopPackage(resources) {
   const code = `import path from 'node:path'; import { pathToFileURL } from 'node:url';
     for (const entry of ['desktop/host.mjs', 'build/server/server.js'])
       await import(pathToFileURL(path.join(process.argv[1], entry)).href);
+    const { installedMcpCli } = await import(pathToFileURL(path.join(process.argv[1], 'scripts/playwright-mcp.mjs')).href);
+    await import('node:fs/promises').then(fs => fs.access(installedMcpCli()));
     console.log('packaged runtime imports passed');`;
   const output = await new Promise((resolve, reject) => {
     const child = spawn(node, ['--input-type=module', '--eval', code, product], {

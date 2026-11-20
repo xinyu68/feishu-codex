@@ -36,22 +36,30 @@ async function fixture(t) {
   await fs.writeFile(path.join(dataDir, 'desktop/deployment.json'), JSON.stringify({ state: 'active', productRoot: root }));
   for (const [name, value] of [['bridge', services[0]], ['relay', services[1]], ['runtime', runtime], ['desktop', desktop]]) await fs.writeFile(path.join(dataDir, 'desktop', `${name}-identity.json`), JSON.stringify(value));
   let source = sourceOne, incomplete = false, active = 0, unknown = false, host, stops = [], launches = [];
+  let preparationGate, releasePreparation;
   const snapshot = () => ({ processes: [own, ...services, desktop, ...(runtime ? [runtime] : [])], desktopRoots: [desktop], unknownDesktop: false,
     nativeCodexPath: source, desktopRuntimePath: source, desktopPackagePath: desktop.exe,
     connections: [{ pid: bridgePid, state: 'Listen', localAddress: '127.0.0.1', localPort: bridgePort },
       { pid: desktop.pid, remoteAddress: '127.0.0.1', remotePort: runtimePort },
       ...(runtime ? [{ pid: runtime.pid, state: 'Listen', localAddress: '127.0.0.1', localPort: runtimePort }] : [])] });
   t.after(async () => {
+    releasePreparation?.();
     if (host) { await close(host.server); await host.whenIdle(); } await close(bridge); await close(relay);
     assert.equal(path.dirname(directory), os.tmpdir()); assert.ok(path.basename(directory).startsWith('feishu-runtime-upgrade-')); await fs.rm(directory, { recursive: true, force: true });
   });
   host = await startHost({ root, dataDir, codexHome: path.join(directory, 'codex'), port, bridgePort, wsUrl: `ws://127.0.0.1:${runtimePort}`, pollMs: 40,
     inspector: async () => snapshot(),
-    prepareRuntime: async selected => { if (incomplete) throw Error('Codex 运行文件尚未准备完整'); return { exe: selected === sourceOne ? pinnedOne : pinnedTwo, sourcePath: selected }; },
+    prepareRuntime: async selected => {
+      if (incomplete) throw Error('Codex 运行文件尚未准备完整');
+      if (selected === sourceTwo) await preparationGate;
+      return { exe: selected === sourceOne ? pinnedOne : pinnedTwo, sourcePath: selected };
+    },
     runtimeProbe: async (_url, options) => { if (options?.idle && unknown) throw Error('Task status unavailable'); return { ready: true, ...(options?.idle ? { active } : {}) }; },
     stopRuntimeForUpgrade: async ({ identity }) => { assert.equal(identity.pid, oldPid); assert.equal(runtime.pid, oldPid); stops.push(identity); runtime = null; },
     spawnProcess: (exe, args) => {
       assert.equal(exe, pinnedTwo); assert.ok(args.includes(`ws://127.0.0.1:${runtimePort}`)); launches.push({ exe, args });
+      assert.ok(args.includes(`mcp_servers.feishu_browser.command=${JSON.stringify(process.execPath)}`));
+      assert.ok(args.includes(`mcp_servers.feishu_browser.args=${JSON.stringify([path.join(root, 'scripts/playwright-mcp.mjs'), '--data-dir', dataDir])}`));
       runtime = { pid: newPid, exe, parentPid: process.pid, startedAt: new Date().toISOString(), commandLine: 'codex.exe app-server' };
       const child = Object.assign(new EventEmitter(), { pid: newPid, exitCode: null, signalCode: null }); queueMicrotask(() => child.emit('spawn')); return child;
     },
@@ -59,6 +67,21 @@ async function fixture(t) {
   const status = () => fetch(`http://127.0.0.1:${port}/status`).then(response => response.json());
   await until(async () => (await status()).canWrite);
   return { status, stops, launches, oldPid, newPid, bridgePid, relayPid, desktop, pinnedTwo,
+    pausePreparation() {
+      preparationGate = new Promise(resolve => { releasePreparation = resolve; });
+      return releasePreparation;
+    },
+    async retry() {
+      const { token } = JSON.parse(await fs.readFile(path.join(dataDir, 'desktop/host-control.json'), 'utf8'));
+      const response = await fetch(`http://127.0.0.1:${port}/control`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Host-Token': token },
+        body: JSON.stringify({ action: 'retry' }),
+        signal: AbortSignal.timeout(1_000),
+      });
+      assert.equal(response.status, 200);
+      return response.json();
+    },
     upgrade: () => { source = sourceTwo; }, incomplete: value => { incomplete = value; }, active: value => { active = value; }, unknown: () => { unknown = true; } };
 }
 
@@ -82,4 +105,24 @@ test('unknown task state never authorizes ending an existing backend', async t =
   const f = await fixture(t); f.unknown(); f.upgrade();
   await until(async () => Boolean((await f.status()).codexUpdate));
   await wait(150); assert.equal(f.stops.length, 0); assert.equal(f.launches.length, 0);
+});
+
+test('slow bundle preparation keeps status fresh and coalesces manual retry', async t => {
+  const f = await fixture(t);
+  const finishPreparation = f.pausePreparation();
+  f.upgrade();
+  await until(async () => (await f.status()).runtime.state === 'preparing');
+  const first = await f.status();
+  await until(async () => (await f.status()).updatedAt > first.updatedAt);
+  const current = await f.retry();
+  assert.equal(current.runtime.state, 'preparing');
+  assert.match(current.reason, /正在准备 Codex 运行文件/);
+  assert.equal(current.canWrite, false);
+  assert.equal(f.stops.length, 0);
+  assert.equal(f.launches.length, 0);
+
+  finishPreparation();
+  await until(async () => f.launches.length === 1 && (await f.status()).canWrite);
+  assert.equal((await f.status()).runtime.pid, f.newPid);
+  assert.equal(f.stops.length, 1);
 });

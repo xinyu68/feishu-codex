@@ -17,6 +17,7 @@ import { inspectTask } from './runtime-task-state.mjs';
 import { forceQuitOwnedServices, stopOwnedRuntimeForUpgrade } from './force-quit.mjs';
 import { CodexUpdateRecovery } from './update-recovery.mjs';
 import { RuntimeBundles } from './runtime-bundle.mjs';
+import { playwrightMcpOverrides } from './playwright-mcp.mjs';
 
 export async function runtimeProbe(url, { idle = false, account = false, details = false, timeout = 5_000 } = {}) {
   const socket = new WebSocket(url, { handshakeTimeout: timeout, maxPayload: 2 * 1024 * 1024 });
@@ -159,7 +160,13 @@ export async function startHost(options = {}) {
   let updateState = updateRecovery.observe(snapshot, desktop, launchedDesktop);
   let lastNativeCodexPath = snapshot.nativeCodexPath;
   const runtimeBundles = new RuntimeBundles(dataDir);
-  const prepareRuntime = options.prepareRuntime || (source => runtimeBundles.prepare(source));
+  const prepareBundle = options.prepareRuntime || (source => runtimeBundles.prepare(source));
+  let runtimePreparation;
+  async function prepareRuntime(source) {
+    runtimePreparation = { announced: false };
+    try { return await prepareBundle(source); }
+    finally { runtimePreparation = undefined; }
+  }
   let runtimeBundle, runtimeUpgrade, runtimePreparationError = '', lastRuntimeError = '', lastRuntimePrune = 0;
   let endpointChange, endpointDesktop, endpointRecoveryError = '';
   let publicState;
@@ -194,6 +201,12 @@ export async function startHost(options = {}) {
     if (recovery && !stopping) Object.assign(publicState, { state: 'paused', codexUpdate: recovery, canWrite: false, reason: recovery.message });
     if ((endpointChange || endpointDesktop || endpointRecoveryError) && !stopping) Object.assign(publicState, { state: 'paused', canWrite: false,
       reason: endpointRecoveryError || 'Codex 连接端口被占用，正在自动更换端口并恢复连接。' });
+    if (runtimePreparation?.announced && !stopping) {
+      publicState.runtime.state = 'preparing';
+      publicState.state = 'paused';
+      publicState.canWrite = false;
+      publicState.reason = '正在准备 Codex 运行文件，请稍候。';
+    }
     if (persist) await persistState(publicState);
     return publicState;
   }
@@ -211,6 +224,7 @@ export async function startHost(options = {}) {
         '-c', `mcp_servers.feishu_completion.args=${JSON.stringify([notifyServer])}`,
         '-c', 'mcp_servers.feishu_completion.tool_timeout_sec=1830',
         '-c', `mcp_servers.feishu_completion.env.FEISHU_CODEX_PORT=${JSON.stringify(String(bridgePort))}`,
+        ...playwrightMcpOverrides({ root, nodePath: notifyCommand, dataDir }),
         '--listen', wsUrl, '--analytics-default-enabled', '-c', 'plugins.codex-app-tools@openai-bundled.mcp_servers.codex_app.enabled=true'], port: Number(ws.port), entry: null };
     }
     const entry = path.join(root, 'build', 'server', name === 'bridge' ? 'server.js' : 'desktop-tools-relay.js');
@@ -278,6 +292,7 @@ export async function startHost(options = {}) {
       if (item.budget.blocked) { item.state = 'blocked'; item.error = '5 分钟内连续退出 5 次，已停止重试。修复后点击“重试连接”。'; return; }
       if (!item.budget.ready) { item.state = 'backoff'; return; }
       item.state = 'starting'; item.error = '';
+      if (name === 'runtime' && publicState.runtime.state === 'preparing') await publish();
       const env = canonicalEnvironment(process.env, { CODEX_HOME: codexHome, FEISHU_CODEX_DATA_DIR: dataDir, FEISHU_CODEX_PORT: bridgePort,
         FEISHU_CODEX_WS_URL: wsUrl, FEISHU_CODEX_DESKTOP_HOST: '1', FEISHU_CODEX_WRITE_GATE_FILE: path.join(directory, 'host-state.json'),
         FEISHU_CODEX_UI_DIR: path.join(root, 'build', 'ui'), CODEX_APP_TOOLS_PIPE_PATH: stablePipe,
@@ -627,6 +642,11 @@ export async function startHost(options = {}) {
     return { needsConfirmation: true, detail: '将强制结束本应用的服务及关联 Codex，运行中的任务会中断。' };
   }
 
+  function resetRetryBudgets() {
+    updateRecovery.retry();
+    for (const item of Object.values(components)) item.budget.reset();
+  }
+
   async function shutdown({ closeDesktop = false, uninstall = false, confirmed = false } = {}) {
     if (confirmed) {
       stopping = true; exitFailure = ''; clearInterval(interval);
@@ -777,6 +797,12 @@ export async function startHost(options = {}) {
       // A read-only freshness check need not wait behind slow component health
       // probes. The shared inspection coalesces simultaneous bridge checks.
       if (action === 'checkWrite') { reply(200, await checkWrite()); return; }
+      if (action === 'retry' && runtimePreparation && !stopping) {
+        resetRetryBudgets();
+        runtimePreparation.announced = true;
+        reply(200, await publish({ persist: false }));
+        return;
+      }
       if (action === 'prepareQuit') { reply(200, await prepareQuit()); return; }
       if (action === 'shutdownConfirmed') {
         if (confirmed !== true) throw new Error('请先确认退出全部服务。');
@@ -786,7 +812,12 @@ export async function startHost(options = {}) {
         if (action === 'openCodex') return openCodex();
         if (action === 'prepareSwitch') return prepareSwitch();
         if (action === 'switchToShared') return switchToShared(expectedDesktop, confirmed);
-        if (action === 'retry') { stopping = false; exitFailure = ''; updateRecovery.retry(); for (const item of Object.values(components)) item.budget.reset(); return tick(); }
+        if (action === 'retry') {
+          stopping = false;
+          exitFailure = '';
+          resetRetryBudgets();
+          return tick();
+        }
         if (action === 'prepareQuit') return prepareQuit();
         if (action === 'shutdownConfirmed') {
           if (confirmed !== true) throw new Error('请先确认退出全部服务。');
@@ -805,6 +836,13 @@ export async function startHost(options = {}) {
   await atomicJson(path.join(directory, 'host-control.json'), { port, token, pid: process.pid, root, dataDir });
   await log('桌面后台已启动；不会在 Windows 登录时自动启动。');
   const interval = setInterval(() => {
+    // A file copy or checksum can outlast several polls. Keep reporting
+    // preparation while the serialized tick still owns the operation.
+    if (busy && runtimePreparation && !stopping) {
+      runtimePreparation.announced = true;
+      void publish().catch(() => {});
+      return;
+    }
     if (!busy && stopping && exitFailure) { void publish().catch(() => {}); return; }
     if (!busy && !stopping) void serialized(tick).catch(async error => {
       publicState = { ...publicState, state: 'paused', canWrite: false, reason: '无法读取系统状态，已暂停发送。', updatedAt: new Date().toISOString() };

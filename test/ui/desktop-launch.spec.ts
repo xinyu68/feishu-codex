@@ -13,6 +13,22 @@ test('Codex package update recovery replaces the independent-mode warning and ex
   await page.getByRole('button', { name: '重试连接', exact: true }).click();
   expect(await page.evaluate(() => (window as unknown as { nativeCalls: string[] }).nativeCalls)).toContain('retry');
 });
+
+test('runtime preparation shows progress and restores the connection action when ready', async ({ page }) => {
+  const independent: DesktopStatus = { ...ready, canWrite: false, desktop: { mode: 'independent' } };
+  await fixture(page, {
+    ...independent,
+    state: 'paused',
+    runtime: { state: 'preparing' },
+    reason: '正在准备 Codex 运行文件，请稍候。',
+  });
+  await expect(page.getByRole('status').filter({ hasText: '正在准备 Codex 运行文件，请稍候。' })).toBeVisible();
+  await expect(page.getByRole('button', { name: '连接飞书', exact: true })).toBeDisabled();
+  await page.evaluate(value => (window as unknown as { updateNative(status: DesktopStatus): void }).updateNative(value), independent);
+  await expect(page.getByText('正在准备 Codex 运行文件，请稍候。')).toHaveCount(0);
+  await expect(page.locator('.desktop-guidance').getByRole('button', { name: '连接飞书', exact: true })).toBeEnabled();
+});
+
 async function fixture(page: Page, status: DesktopStatus = ready, native = true, connection = 'connected') {
   await page.addInitScript(({ initial, native }) => {
     class QuietEventSource extends EventTarget { onmessage = null; onopen = null; close() {} }
@@ -241,12 +257,22 @@ for (const [name, status, connection] of [
 
 test('bootstrap exposes the same confirm-and-connect flow before the workbench is ready', async ({ page }) => {
   await page.setViewportSize({ width: 1024, height: 680 });
-  await fixture(page, { ...ready, state: 'paused', canWrite: false, desktop: { mode: 'independent' } });
+  const independent: DesktopStatus = { ...ready, state: 'paused', canWrite: false, desktop: { mode: 'independent' } };
+  await fixture(page, independent);
   for (const [name, contentType] of [['html', 'text/html'], ['js', 'text/javascript'], ['css', 'text/css']]) {
     const body = await readFile(new URL(`../../desktop/bootstrap.${name}`, import.meta.url));
     await page.route(`**/bootstrap.${name}`, route => route.fulfill({ body, contentType }));
   }
   await page.goto('/bootstrap.html');
+  await page.evaluate(value => (window as unknown as { updateNative(status: DesktopStatus): void }).updateNative(value), {
+    ...independent,
+    runtime: { state: 'preparing' },
+    reason: '正在准备 Codex 运行文件，请稍候。',
+  });
+  await expect(page.locator('#runtimeLabel')).toHaveText('准备运行文件');
+  await expect(page.locator('#description')).toHaveText('正在准备 Codex 运行文件，请稍候。');
+  await expect(page.getByRole('button', { name: '重试连接', exact: true })).toHaveCount(0);
+  await page.evaluate(value => (window as unknown as { updateNative(status: DesktopStatus): void }).updateNative(value), independent);
   await expect(page.getByText('Codex 已打开，但尚未连接飞书', { exact: true })).toBeVisible();
   await page.evaluate(() => (window as unknown as { cancelNativeSwitch: () => void }).cancelNativeSwitch());
   await page.getByRole('button', { name: '连接飞书', exact: true }).click();

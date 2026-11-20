@@ -1,6 +1,6 @@
 {
   "name": "feishu-codex",
-  "version": "1.0.9",
+  "version": "1.0.11",
   "private": true,
   "type": "module",
   "description": "Continue the same Codex conversation between your Windows desktop and Feishu",
@@ -37,6 +37,7 @@
     "typecheck": "tsc --noEmit && tsc -p tsconfig.ui.json --noEmit",
     "test": "node --test --test-concurrency=4 --import tsx test/*.test.ts test/*.test.mjs",
     "test:ui": "playwright test",
+    "verify:browser": "node scripts/verify-playwright-mcp.mjs",
     "package:prepare": "node scripts/prepare-desktop-package.mjs",
     "package:dir": "npm run build && npm run package:prepare && electron-builder --dir --win --x64 --publish never",
     "package:win": "npm run build && npm run package:prepare && electron-builder --win nsis --x64 --publish never"
@@ -46,16 +47,13 @@
   },
   "dependencies": {
     "@larksuiteoapi/node-sdk": "1.72.0",
+    "@playwright/mcp": "0.0.85",
     "electron-updater": "6.8.9",
     "ws": "8.21.3",
     "yaml": "2.8.2"
   },
   "devDependencies": {
-    "lucide-react": "1.48.0",
-    "react": "19.3.0",
-    "react-dom": "19.3.0",
-    "react-markdown": "10.1.0",
-    "remark-gfm": "4.0.1",
+    "@modelcontextprotocol/sdk": "1.32.2",
     "@playwright/test": "1.63.0",
     "@types/node": "22.19.15",
     "@types/react": "19.3.0",
@@ -64,6 +62,11 @@
     "@vitejs/plugin-react": "6.1.1",
     "electron": "44.4.5",
     "electron-builder": "26.15.3",
+    "lucide-react": "1.48.0",
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "react-markdown": "10.1.0",
+    "remark-gfm": "4.0.1",
     "tsx": "4.21.0",
     "typescript": "5.8.3",
     "vite": "8.3.1"
